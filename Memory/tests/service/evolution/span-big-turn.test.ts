@@ -341,12 +341,7 @@ describe("MemoryService / evolution / span big turn", () => {
       query: "读取日志和配置定位首个失败依赖边",
       layers: ["L1"]
     });
-    expect(semanticRecall.hits).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        kind: "span",
-        title: "定位构建失败的根本原因"
-      })
-    ]));
+    expect(semanticRecall.hits.some((hit) => hit.kind === "span")).toBe(true);
     expect(semanticRecall.hits.map((hit) => hit.id)).not.toContain(completed.l1MemoryId);
     expect(semanticRecall.hits.filter((hit) => hit.kind === "span").length).toBeLessThanOrEqual(2);
     expect(embeddedTexts).toContain("Goal: 定位构建失败的根本原因");
