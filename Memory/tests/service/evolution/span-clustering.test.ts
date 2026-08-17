@@ -218,7 +218,7 @@ describe("span clustering", () => {
     db.close();
   });
 
-  it("associates a new Span to an existing promoted bucket policy without signatures", async () => {
+  it("audits an expanded promoted bucket before associating new members to the existing policy", async () => {
     const { db, service } = createTestService({
       config: {
         ...DEFAULT_MEMMY_CONFIG,
@@ -227,7 +227,12 @@ describe("span clustering", () => {
           spanClustering: {
             ...DEFAULT_MEMMY_CONFIG.algorithm.spanClustering,
             enabled: true,
-            minDistinctSources: 2
+            goalSimilarityThreshold: 0.5,
+            policySimilarityThreshold: 0.5,
+            minDistinctSources: 2,
+            auditMinMembers: 3,
+            auditCohesionThreshold: 0.85,
+            auditWeakPairLimit: 1
           }
         }
       }
@@ -247,7 +252,23 @@ describe("span clustering", () => {
       }],
       at: "2026-08-14T00:00:00.000Z"
     });
-    repos.memories.insert(vectorSpanMemory("span-c", "trace-c", [0.9, 0.1], [0.9, 0.1]));
+    repos.runtime.insertTracePolicyLink({
+      userId: "user-cluster",
+      l1MemoryId: "span-a",
+      l2MemoryId: "policy-existing",
+      relation: "supports_span_cluster",
+      strength: 1,
+      createdAt: "2026-08-14T00:00:00.000Z"
+    });
+    repos.runtime.insertTracePolicyLink({
+      userId: "user-cluster",
+      l1MemoryId: "span-b",
+      l2MemoryId: "policy-existing",
+      relation: "supports_span_cluster",
+      strength: 1,
+      createdAt: "2026-08-14T00:00:00.000Z"
+    });
+    repos.memories.insert(vectorSpanMemory("span-c", "trace-c", [0.5, 0.8660254], [0.5, 0.8660254]));
     repos.runtime.enqueueJob({
       id: "job-span-cluster-promoted",
       jobType: "span_cluster",
@@ -268,6 +289,15 @@ describe("span clustering", () => {
         promotedPolicyId: "policy-existing",
         memberCount: 3
       });
+    const auditJobs = db.db.prepare(
+      `SELECT payload_json FROM evolution_jobs WHERE job_type = 'span_cluster_audit'`
+    ).all() as Array<{ payload_json: string }>;
+    expect(auditJobs.map((job) => JSON.parse(job.payload_json) as Record<string, unknown>)).toEqual([
+      expect.objectContaining({
+        reason: "span_cluster.low_cohesion",
+        clusterId: "span_cluster_span-cluster.v1_user-cluster:codex:jiang_span-a"
+      })
+    ]);
     expect(db.db.prepare(
       `SELECT l1_memory_id, l2_memory_id, relation
        FROM trace_policy_links
@@ -275,8 +305,7 @@ describe("span clustering", () => {
        ORDER BY l1_memory_id`
     ).all()).toEqual([
       { l1_memory_id: "span-a", l2_memory_id: "policy-existing", relation: "supports_span_cluster" },
-      { l1_memory_id: "span-b", l2_memory_id: "policy-existing", relation: "supports_span_cluster" },
-      { l1_memory_id: "span-c", l2_memory_id: "policy-existing", relation: "supports_span_cluster" }
+      { l1_memory_id: "span-b", l2_memory_id: "policy-existing", relation: "supports_span_cluster" }
     ]);
     expect(db.db.prepare(`SELECT COUNT(*) AS count FROM evolution_jobs WHERE job_type = 'l2_induction'`).get())
       .toEqual({ count: 0 });

@@ -116,11 +116,6 @@ export class SpanClusteringPipeline {
         at: job.updatedAt
       });
       for (const cluster of clusters) {
-        if (cluster.status === "promoted" && cluster.promotedPolicyId) {
-          this.associateClusterMembers(cluster.id, cluster.promotedPolicyId, job.updatedAt);
-          continue;
-        }
-        if (cluster.status !== "ready") continue;
         const auditCandidate = auditCandidates.find((candidate) => candidate.clusterId === cluster.id);
         if (auditCandidate) {
           this.deps.enqueueJob({
@@ -140,6 +135,11 @@ export class SpanClusteringPipeline {
           });
           continue;
         }
+        if (cluster.status === "promoted" && cluster.promotedPolicyId) {
+          this.associateClusterMembers(cluster.id, cluster.promotedPolicyId, job.updatedAt);
+          continue;
+        }
+        if (cluster.status !== "ready") continue;
         this.deps.enqueueJob({
           jobType: "l2_induction",
           userId: job.userId,
