@@ -105,6 +105,24 @@ describe("span clustering", () => {
     });
   });
 
+  it("keeps a Span out when centroid similarity passes but pairwise similarity would drift", () => {
+    const clusters = buildSpanPartition({
+      scopeId: "scope-a",
+      spans: [
+        span("anchor", "trace-a", unit(0), unit(0), 1),
+        span("near-anchor", "trace-b", unit(25), unit(25), 2),
+        span("centroid-near-drift", "trace-c", unit(38), unit(38), 3)
+      ],
+      goalThreshold: 0.9,
+      policyThreshold: 0.9
+    });
+
+    expect(clusters.map((cluster) => cluster.members.map((member) => member.spanId))).toEqual([
+      ["anchor", "near-anchor"],
+      ["centroid-near-drift"]
+    ]);
+  });
+
   it("reports cohesion and flags large low-cohesion buckets for audit", () => {
     const tight = buildSpanPartition({
       scopeId: "scope-a",
@@ -456,6 +474,11 @@ function span(
     vecGoal,
     vecPolicy
   };
+}
+
+function unit(degrees: number): number[] {
+  const radians = degrees * Math.PI / 180;
+  return [Math.cos(radians), Math.sin(radians)];
 }
 
 function vectorSpanMemory(

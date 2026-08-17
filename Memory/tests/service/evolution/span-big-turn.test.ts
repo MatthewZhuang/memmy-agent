@@ -552,7 +552,7 @@ describe("MemoryService / evolution / span big turn", () => {
     ]);
     for (const payload of payloads) {
       expect(payload.structuredTrajectory?.every((event) =>
-        event.range[1] >= payload.segment!.start && event.range[0] <= payload.segment!.end
+        event.range[0] >= payload.segment!.start && event.range[1] <= payload.segment!.end
       )).toBe(true);
     }
     const spans = service.panelItems({ namespace, layer: "L1" }).items.filter(

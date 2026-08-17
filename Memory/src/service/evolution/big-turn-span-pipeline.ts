@@ -402,9 +402,33 @@ function eventsForToolCallRange(
   trajectory: readonly SpanTrajectoryEvent[],
   segment: Pick<SpanSegment, "start" | "end">
 ): SpanTrajectoryEvent[] {
-  return trajectory.filter((event) =>
-    event.range[1] >= segment.start && event.range[0] <= segment.end
-  );
+  return trajectory
+    .filter((event) => event.range[1] >= segment.start && event.range[0] <= segment.end)
+    .map((event) => {
+      const range: [number, number] = [
+        Math.max(event.range[0], segment.start),
+        Math.min(event.range[1], segment.end)
+      ];
+      const callCount = range[1] - range[0] + 1;
+      return {
+        ...event,
+        index: range[0],
+        range,
+        callCount,
+        evidence: event.repeated
+          ? replaceEvidenceRepeatRange(event.evidence, callCount, range)
+          : event.evidence
+      };
+    });
+}
+
+function replaceEvidenceRepeatRange(
+  evidence: string | undefined,
+  callCount: number,
+  range: [number, number]
+): string | undefined {
+  if (!evidence) return evidence;
+  return evidence.replace(/repeat=\d+ calls range=\d+-\d+/u, `repeat=${callCount} calls range=${range[0]}-${range[1]}`);
 }
 
 function resolveWindowOverlaps(spans: readonly SpanDraft[]): SpanDraft[] {

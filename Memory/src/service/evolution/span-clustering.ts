@@ -199,7 +199,11 @@ export function buildSpanPartition(input: {
       })
       .filter((item) =>
         item.goalSimilarity >= input.goalThreshold &&
-        item.policySimilarity >= input.policyThreshold
+        item.policySimilarity >= input.policyThreshold &&
+        spanPassesPairwiseThresholds(span, item.cluster, {
+          goalThreshold: input.goalThreshold,
+          policyThreshold: input.policyThreshold
+        })
       )
       .sort((a, b) =>
         Math.min(b.goalSimilarity, b.policySimilarity) - Math.min(a.goalSimilarity, a.policySimilarity) ||
@@ -266,6 +270,20 @@ export function buildSpanPartition(input: {
       members
     };
   });
+}
+
+function spanPassesPairwiseThresholds(
+  span: ClusterableSpan,
+  cluster: WorkingCluster,
+  input: {
+    goalThreshold: number;
+    policyThreshold: number;
+  }
+): boolean {
+  return cluster.members.every((member) =>
+    cosine(span.vecGoal, member.vecGoal) >= input.goalThreshold &&
+    cosine(span.vecPolicy, member.vecPolicy) >= input.policyThreshold
+  );
 }
 
 export function findSpanClusterAuditCandidates(
