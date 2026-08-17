@@ -321,6 +321,10 @@ describe("MemoryService / evolution / policy induction", () => {
             useLlm: true,
             minEpisodesForInduction: 2
           },
+          spanClustering: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.spanClustering,
+            enabled: false
+          },
           l3Abstraction: {
             ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
             useLlm: false
@@ -453,6 +457,10 @@ describe("MemoryService / evolution / policy induction", () => {
             useLlm: true,
             minEpisodesForInduction: 2
           },
+          spanClustering: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.spanClustering,
+            enabled: false
+          },
           l3Abstraction: {
             ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
             useLlm: false
@@ -557,6 +565,10 @@ describe("MemoryService / evolution / policy induction", () => {
           l2Induction: {
             ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
             minGain: 0.99
+          },
+          spanClustering: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.spanClustering,
+            enabled: false
           }
         }
       }
@@ -648,6 +660,10 @@ describe("MemoryService / evolution / policy induction", () => {
           l2Induction: {
             ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
             traceCharCap: 700
+          },
+          spanClustering: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.spanClustering,
+            enabled: false
           },
           l3Abstraction: {
             ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
@@ -900,6 +916,10 @@ describe("MemoryService / evolution / policy induction", () => {
             ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
             traceCharCap: 700
           },
+          spanClustering: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.spanClustering,
+            enabled: false
+          },
           l3Abstraction: {
             ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
             useLlm: false
@@ -1029,6 +1049,10 @@ describe("MemoryService / evolution / policy induction", () => {
           l2Induction: {
             ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
             traceCharCap: 700
+          },
+          spanClustering: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.spanClustering,
+            enabled: false
           },
           l3Abstraction: {
             ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,

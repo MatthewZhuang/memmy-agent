@@ -32,7 +32,17 @@ describe("MemoryService / evolution / orchestration", () => {
   it("adds feedback and evolves L2/L3/Skill memories with the worker", async () => {
     const { db, service } = createTestService({
       skillLlm: createNoToolSkillLlm(),
-      embedder: createCapturingEmbedder([])
+      embedder: createCapturingEmbedder([]),
+      config: {
+        ...DEFAULT_MEMMY_CONFIG,
+        algorithm: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          spanClustering: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.spanClustering,
+            enabled: false
+          }
+        }
+      }
     });
     const session = service.openSession({
       namespace: {
@@ -527,7 +537,18 @@ describe("MemoryService / evolution / orchestration", () => {
   });
 
   it("queues L3 abstraction and skill crystallization when L2 association activates a candidate policy", async () => {
-    const { db, service } = createTestService();
+    const { db, service } = createTestService({
+      config: {
+        ...DEFAULT_MEMMY_CONFIG,
+        algorithm: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          spanClustering: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.spanClustering,
+            enabled: false
+          }
+        }
+      }
+    });
     const session = service.openSession({
       namespace: {
         source: "codex",
@@ -817,6 +838,10 @@ describe("MemoryService / evolution / orchestration", () => {
           l2Induction: {
             ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
             traceCharCap: 700
+          },
+          spanClustering: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.spanClustering,
+            enabled: false
           },
           l3Abstraction: {
             ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,

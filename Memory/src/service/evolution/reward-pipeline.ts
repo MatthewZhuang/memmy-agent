@@ -295,7 +295,13 @@ export class RewardPipeline {
           createdAt: at
         });
       }
-      if (job.payload.downstreamScheduled !== true && savedTrace && this.deps.isTraceEligibleForL2(savedTrace)) {
+      const legacyL2Enabled = !this.deps.config.algorithm.spanClustering.enabled;
+      if (
+        legacyL2Enabled &&
+        job.payload.downstreamScheduled !== true &&
+        savedTrace &&
+        this.deps.isTraceEligibleForL2(savedTrace)
+      ) {
         this.deps.recordCandidatePoolTrace(savedTrace, signatureFromTrace(savedTrace), at);
         l2Eligible.push({ memory: saved, trace: savedTrace });
         this.deps.enqueueJob({

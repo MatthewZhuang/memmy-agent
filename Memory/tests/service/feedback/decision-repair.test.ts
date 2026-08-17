@@ -84,7 +84,19 @@ function createDecisionRepairLlm(
 
 describe("MemoryService / feedback / decision repair", () => {
   it("creates decision repairs from actionable feedback and throttles repeat context", async () => {
-    const { db, service } = createTestService({ skillLlm: createDecisionRepairEvolutionLlm() });
+    const { db, service } = createTestService({
+      skillLlm: createDecisionRepairEvolutionLlm(),
+      config: {
+        ...DEFAULT_MEMMY_CONFIG,
+        algorithm: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          spanClustering: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.spanClustering,
+            enabled: false
+          }
+        }
+      }
+    });
     const session = service.openSession({
       namespace: {
         source: "codex",

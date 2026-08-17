@@ -200,7 +200,7 @@ export function buildSpanPartition(input: {
       .filter((item) =>
         item.goalSimilarity >= input.goalThreshold &&
         item.policySimilarity >= input.policyThreshold &&
-        spanPassesPairwiseThresholds(span, item.cluster, {
+        spanHasNeighborSupport(span, item.cluster, {
           goalThreshold: input.goalThreshold,
           policyThreshold: input.policyThreshold
         })
@@ -272,7 +272,7 @@ export function buildSpanPartition(input: {
   });
 }
 
-function spanPassesPairwiseThresholds(
+function spanHasNeighborSupport(
   span: ClusterableSpan,
   cluster: WorkingCluster,
   input: {
@@ -280,7 +280,7 @@ function spanPassesPairwiseThresholds(
     policyThreshold: number;
   }
 ): boolean {
-  return cluster.members.every((member) =>
+  return cluster.members.some((member) =>
     cosine(span.vecGoal, member.vecGoal) >= input.goalThreshold &&
     cosine(span.vecPolicy, member.vecPolicy) >= input.policyThreshold
   );

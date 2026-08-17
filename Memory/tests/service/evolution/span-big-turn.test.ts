@@ -877,9 +877,9 @@ describe("MemoryService / evolution / span big turn", () => {
     db.close();
   });
 
-  it("uses the evolution LLM, not the summary LLM, for Span splitting", async () => {
+  it("uses the summary LLM for Span splitting so deployments can choose its model independently", async () => {
     const calls: Array<{ messages: LlmMessage[]; options: LlmCompletionOptions }> = [];
-    const evolutionLlm = createSpanBigTurnLlm(calls, {
+    const summaryLlm = createSpanBigTurnLlm(calls, {
       spans: [{
         start: 0,
         end: 10,
@@ -888,11 +888,11 @@ describe("MemoryService / evolution / span big turn", () => {
         summary: "从长工具轨迹中抽取出一个可复用策略片段"
       }]
     });
-    const unconfiguredSummaryLlm: LlmClient = {
-      ...evolutionLlm,
-      config: { ...evolutionLlm.config, model: "summary-unconfigured" },
-      isConfigured() {
-        return false;
+    const evolutionLlm: LlmClient = {
+      ...summaryLlm,
+      config: { ...summaryLlm.config, model: "evolution-unconfigured" },
+      async completeJson<T extends Record<string, unknown>>(): Promise<T> {
+        throw new Error("span splitting should not call evolution LLM");
       }
     };
     const config = {
@@ -911,7 +911,7 @@ describe("MemoryService / evolution / span big turn", () => {
     };
     const { db, service } = createTestService({
       config,
-      llm: unconfiguredSummaryLlm,
+      llm: summaryLlm,
       skillLlm: evolutionLlm
     });
     const namespace = {

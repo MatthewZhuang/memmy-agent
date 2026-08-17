@@ -7,8 +7,10 @@ import {
 } from "../../../src/index.js";
 import {
   createBatchReflectionLlm,
-  createMemoryServiceFixture
+  createMemoryServiceFixture,
+  runWorkerRounds
 } from "../../fixtures/memory-service-fixture.js";
+import { makeTraceEligibleForL2 } from "../../fixtures/evolution-fixture.js";
 
 const {
   cleanup,
@@ -376,6 +378,113 @@ describe("MemoryService / evolution / reward", () => {
          AND job_type IN ('l2_association', 'l2_induction')`
     ).get(complete.episodeId) as { count: number };
     expect(l2Jobs.count).toBe(0);
+    db.close();
+  });
+
+  it("routes positive long traces to Span clustering by default without scheduling legacy signature L2", async () => {
+    const { db, service } = createTestService();
+    const namespace = {
+      source: "codex",
+      profileId: "jiang",
+      userId: "user-span-default-routing"
+    };
+    const session = service.openSession({ namespace });
+    const toolCalls = Array.from({ length: 11 }, (_, index) => ({
+      id: `tool-${index}`,
+      name: index < 6 ? "read_file" : "run_tests",
+      input: { index }
+    }));
+    const complete = service.completeTurn("turn-span-default-routing", {
+      namespace,
+      sessionId: session.sessionId,
+      query: "修复构建失败并验证测试",
+      answer: "已定位问题并验证通过。",
+      toolCalls,
+      toolResults: toolCalls.map((call, index) => ({
+        toolCallId: call.id,
+        name: call.name,
+        output: { ok: true, index }
+      }))
+    });
+    makeTraceEligibleForL2(db, complete.l1MemoryId);
+
+    await service.feedback({
+      namespace,
+      sessionId: session.sessionId,
+      episodeId: complete.episodeId,
+      l1MemoryId: complete.l1MemoryId,
+      channel: "explicit",
+      polarity: "positive",
+      magnitude: 1,
+      rationale: "任务完成"
+    });
+    service.closeSession(session.sessionId);
+    await runWorkerRounds(service, 8);
+
+    const queuedJobs = db.db.prepare(
+      `SELECT job_type
+       FROM evolution_jobs
+       WHERE episode_id = ?
+       ORDER BY id`
+    ).all(complete.episodeId) as Array<{ job_type: string }>;
+    expect(queuedJobs.map((job) => job.job_type)).toContain("span_big_turn");
+    expect(queuedJobs.map((job) => job.job_type)).not.toContain("l2_association");
+    expect(queuedJobs.map((job) => job.job_type)).not.toContain("l2_induction");
+    db.close();
+  });
+
+  it("keeps legacy signature L2 scheduling available when Span clustering is disabled", async () => {
+    const config = {
+      ...DEFAULT_MEMMY_CONFIG,
+      algorithm: {
+        ...DEFAULT_MEMMY_CONFIG.algorithm,
+        spanClustering: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.spanClustering,
+          enabled: false
+        }
+      }
+    };
+    const { db, service } = createTestService({ config });
+    const namespace = {
+      source: "codex",
+      profileId: "jiang",
+      userId: "user-signature-routing"
+    };
+    const session = service.openSession({ namespace });
+    const complete = service.completeTurn("turn-signature-routing", {
+      namespace,
+      sessionId: session.sessionId,
+      query: "修复构建失败并验证测试",
+      answer: "已定位问题并验证通过。",
+      toolCalls: Array.from({ length: 11 }, (_, index) => ({
+        id: `tool-${index}`,
+        name: index < 6 ? "read_file" : "run_tests",
+        input: { index }
+      }))
+    });
+    makeTraceEligibleForL2(db, complete.l1MemoryId);
+
+    await service.feedback({
+      namespace,
+      sessionId: session.sessionId,
+      episodeId: complete.episodeId,
+      l1MemoryId: complete.l1MemoryId,
+      channel: "explicit",
+      polarity: "positive",
+      magnitude: 1,
+      rationale: "任务完成"
+    });
+    service.closeSession(session.sessionId);
+    await runWorkerRounds(service, 8);
+
+    const queuedJobs = db.db.prepare(
+      `SELECT job_type
+       FROM evolution_jobs
+       WHERE episode_id = ?
+       ORDER BY id`
+    ).all(complete.episodeId) as Array<{ job_type: string }>;
+    expect(queuedJobs.map((job) => job.job_type)).toContain("l2_association");
+    expect(queuedJobs.map((job) => job.job_type)).toContain("l2_induction");
     db.close();
   });
 

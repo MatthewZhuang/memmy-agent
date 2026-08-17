@@ -105,7 +105,7 @@ describe("span clustering", () => {
     });
   });
 
-  it("keeps a Span out when centroid similarity passes but pairwise similarity would drift", () => {
+  it("allows centroid-matched Spans with nearest-neighbor support instead of requiring every pair to pass", () => {
     const clusters = buildSpanPartition({
       scopeId: "scope-a",
       spans: [
@@ -118,8 +118,7 @@ describe("span clustering", () => {
     });
 
     expect(clusters.map((cluster) => cluster.members.map((member) => member.spanId))).toEqual([
-      ["anchor", "near-anchor"],
-      ["centroid-near-drift"]
+      ["anchor", "centroid-near-drift", "near-anchor"]
     ]);
   });
 
