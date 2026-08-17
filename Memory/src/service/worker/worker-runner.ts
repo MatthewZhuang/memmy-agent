@@ -24,10 +24,12 @@ import type {
   PreparedEmbeddingJob
 } from "../embedding/embedding-job-processor.js";
 import {
-  embeddingTextForMemory,
+  embeddingRetrySourceText,
   embeddingRetryBackoffMs,
-  embeddingRetryToRunItem
+  embeddingRetryToRunItem,
+  spanEmbeddingSourceHash
 } from "../embedding/embedding-pipeline.js";
+import { spanPayload } from "../evolution/span-model.js";
 import { memoryHasImportPipeline } from "../import/import-job-processor.js";
 import {
   classifyProcessingError,
@@ -595,19 +597,27 @@ export class WorkerRunner {
     if (!memory) {
       throw new Error(`embedding retry target not found: ${retry.targetKind}:${retry.targetId}`);
     }
-    if ((memory.memoryLayer === "Skill" || memory.memoryLayer === "L3") && embeddingTextForMemory(memory) !== retry.sourceText) {
+    const currentSourceText = embeddingRetrySourceText(memory, retry.vectorField);
+    const shouldCheckSourceText = Boolean(
+      spanPayload(memory) ||
+      memory.memoryLayer === "Skill" ||
+      memory.memoryLayer === "L3"
+    );
+    if (shouldCheckSourceText && currentSourceText !== retry.sourceText) {
       const completed = this.deps.repos.runtime.markEmbeddingRetrySucceededClaimed(retry.id, {
         ...claim,
         now: this.nowMs()
       });
       if (completed) this.deps.appendEmbeddingRetryChange(completed, "succeeded", retry);
-      const replacement = this.deps.enqueueEmbeddingRetry(
-        memory,
-        embeddingTextForMemory(memory),
-        this.deps.nowIso(),
-        retry.vectorField
-      );
-      this.deps.appendEmbeddingRetryChange(replacement, "queued");
+      if (currentSourceText) {
+        const replacement = this.deps.enqueueEmbeddingRetry(
+          memory,
+          currentSourceText,
+          this.deps.nowIso(),
+          retry.vectorField
+        );
+        this.deps.appendEmbeddingRetryChange(replacement, "queued");
+      }
       return { succeeded: 0, failed: 0, item: completed ? embeddingRetryToRunItem(completed) : null };
     }
     let completed: EmbeddingRetryRecord | undefined;
@@ -617,9 +627,13 @@ export class WorkerRunner {
       vector,
       attemptCount: retry.attempts + 1,
       source: "worker.embedding_retry",
-      sourceHash: memory.memoryLayer === "Skill" || memory.memoryLayer === "L3"
-        ? retrievalDocumentSourceHash(memory)
-        : undefined,
+      sourceHash: spanPayload(memory)
+        ? (retry.vectorField === "vec_goal" || retry.vectorField === "vec_policy"
+          ? spanEmbeddingSourceHash(memory, retry.vectorField)
+          : undefined)
+        : memory.memoryLayer === "Skill" || memory.memoryLayer === "L3"
+          ? retrievalDocumentSourceHash(memory)
+          : undefined,
       allowedProcessingStates: ["embedding_pending", "embedding"],
       finalize: () => {
         completed = this.deps.repos.runtime.markEmbeddingRetrySucceededClaimed(retry.id, {

@@ -1,5 +1,5 @@
 import type { MemoryRow } from "../../types.js";
-import { attachMemoryVector } from "../../storage/memory-vector-state.js";
+import { attachMemoryVector, memoryVector } from "../../storage/memory-vector-state.js";
 import type {
   EmbeddingRetryRecord,
   EmbeddingRetryTargetKind,
@@ -15,10 +15,14 @@ import {
 } from "../../algorithm/plugin-algorithms.js";
 import { isRecord } from "../../utils/json.js";
 import { clip } from "../../utils/text.js";
+import { stableHash } from "../../utils/id.js";
+import { spanPayload } from "../evolution/span-model.js";
 
 const EMBEDDING_RETRY_BASE_BACKOFF_MS = 60_000;
 const EMBEDDING_RETRY_MAX_BACKOFF_MS = 60 * 60_000;
 const NEGATIVE_POLICY_EMBEDDING_TOKEN_LIMIT = 2_048;
+
+export type SpanEmbeddingVectorField = "vec_goal" | "vec_policy";
 
 export interface EmbeddingRetryRunItem {
   id: string;
@@ -97,7 +101,45 @@ export function traceSummaryEmbeddingText(memory: MemoryRow): string | undefined
   ].join("\n\n");
 }
 
+export function spanEmbeddingText(
+  memory: MemoryRow,
+  field: SpanEmbeddingVectorField
+): string | undefined {
+  const span = spanPayload(memory);
+  if (!span) return undefined;
+  return field === "vec_goal"
+    ? `Goal: ${span.goal}`
+    : `Policy: ${span.policy}`;
+}
+
+export function spanEmbeddingSourceHash(
+  memory: MemoryRow,
+  field: SpanEmbeddingVectorField
+): string | undefined {
+  const text = spanEmbeddingText(memory, field);
+  return text ? stableHash({ field, text }) : undefined;
+}
+
+export function embeddingRetrySourceText(
+  memory: MemoryRow,
+  vectorField: EmbeddingRetryVectorField
+): string | undefined {
+  if (spanPayload(memory)) {
+    return vectorField === "vec_goal" || vectorField === "vec_policy"
+      ? spanEmbeddingText(memory, vectorField)
+      : undefined;
+  }
+  return memory.memoryLayer === "Skill" || memory.memoryLayer === "L3"
+    ? embeddingTextForMemory(memory)
+    : undefined;
+}
+
+export function spanHasBothEmbeddings(memory: MemoryRow): boolean {
+  return Boolean(spanPayload(memory) && memoryVector(memory, "vec_goal") && memoryVector(memory, "vec_policy"));
+}
+
 export function embeddingRetryTargetKindForMemory(memory: MemoryRow): EmbeddingRetryTargetKind {
+  if (spanPayload(memory)) return "span";
   if (memory.memoryLayer === "L1") return "trace";
   if (memory.memoryLayer === "L2") return "policy";
   if (memory.memoryLayer === "L3") return "world_model";
@@ -105,6 +147,7 @@ export function embeddingRetryTargetKindForMemory(memory: MemoryRow): EmbeddingR
 }
 
 export function embeddingRetryVectorFieldForMemory(memory: MemoryRow): EmbeddingRetryVectorField {
+  if (spanPayload(memory)) return "vec_goal";
   return memory.memoryLayer === "L1" ? "vec_summary" : "vec";
 }
 

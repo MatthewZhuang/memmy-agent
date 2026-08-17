@@ -30,9 +30,14 @@ import { namespaceForMemory } from "../namespace/namespace-scope.js";
 import { processingJobMatchesMemory } from "../worker/job-handlers.js";
 import {
   embeddingTextForMemory,
+  spanEmbeddingSourceHash,
+  spanEmbeddingText,
+  spanHasBothEmbeddings,
+  type SpanEmbeddingVectorField,
   traceSummaryEmbeddingText,
   updateMemoryVectorField
 } from "./embedding-pipeline.js";
+import { spanPayload } from "../evolution/span-model.js";
 
 type TraceMeta = NonNullable<ReturnType<typeof traceMetaFromMemory>>;
 
@@ -131,6 +136,19 @@ export class EmbeddingJobProcessor {
     if (!memory) throw new Error(`embedding target not found: ${job.targetMemoryId ?? "unknown"}`);
     if (!processingJobMatchesMemory(job, memory)) return null;
 
+    const span = spanPayload(memory);
+    if (span) {
+      const vectorField = spanVectorFieldFromPayload(job.payload.vectorField);
+      if (!vectorField) {
+        throw new Error(`span embedding job missing vector field: ${job.id}`);
+      }
+      const text = spanEmbeddingText(memory, vectorField);
+      const sourceHash = spanEmbeddingSourceHash(memory, vectorField);
+      if (!text || !sourceHash) return null;
+      if (typeof job.payload.sourceHash === "string" && job.payload.sourceHash !== sourceHash) return null;
+      return { job, memory, text, role: "document", vectorField, sourceHash };
+    }
+
     if (memory.memoryLayer === "L1") {
       if (memoryNeedsImportSummary(memory)) {
         this.deps.enqueueImportSummaryIfMissing(memory, this.deps.nowIso());
@@ -161,7 +179,10 @@ export class EmbeddingJobProcessor {
     const current = this.deps.repos.memories.get(item.memory.id);
     if (!current) throw new Error(`embedding target not found: ${item.memory.id}`);
     if (!processingJobMatchesMemory(item.job, current)) return;
-    if (item.sourceHash && retrievalDocumentSourceHash(current) !== item.sourceHash) return;
+    const span = spanPayload(current);
+    const spanField = spanVectorFieldFromPayload(item.vectorField);
+    if (span && spanField && item.sourceHash && spanEmbeddingSourceHash(current, spanField) !== item.sourceHash) return;
+    if (!span && item.sourceHash && retrievalDocumentSourceHash(current) !== item.sourceHash) return;
     this.persistEmbeddingVector({
       memoryId: current.id,
       vectorField: item.vectorField,
@@ -170,8 +191,9 @@ export class EmbeddingJobProcessor {
       source: "worker.embedding",
       sourceHash: item.sourceHash,
       allowedProcessingStates: ["embedding_pending", "embedding"],
-      finalize: (_saved, hadProcessing, at) => {
+      finalize: (saved, hadProcessing, at) => {
         if (hadProcessing) this.deps.repos.runtime.completeJob(item.job.id, at);
+        this.enqueueSpanClusterIfReady(saved, item.job, at);
       }
     });
   }
@@ -189,7 +211,9 @@ export class EmbeddingJobProcessor {
         sourceHash: input.sourceHash
       });
       saved = this.deps.repos.memories.updateMaintenance(
-        current.memoryLayer === "L1" ? updateImportPipelineStatus(vectorized, "indexed", at) : vectorized
+        current.memoryLayer === "L1" && !spanPayload(current)
+          ? updateImportPipelineStatus(vectorized, "indexed", at)
+          : vectorized
       );
       const hadProcessing = Boolean(this.deps.repos.processing.get(saved.id));
       if (hadProcessing) {
@@ -317,6 +341,24 @@ export class EmbeddingJobProcessor {
     });
   }
 
+  private enqueueSpanClusterIfReady(memory: MemoryRow, sourceJob: EvolutionJobRecord, at: string): void {
+    if (!spanHasBothEmbeddings(memory)) return;
+    const scopeId = namespaceIdFromMemory(memory);
+    this.deps.enqueueJob({
+      jobType: "span_cluster",
+      userId: memory.userId,
+      sessionId: memory.sessionId,
+      episodeId: sourceJob.episodeId,
+      payload: {
+        reason: "span.embeddings.ready",
+        sourceJobId: sourceJob.id,
+        scopeId,
+        algorithmVersion: "span-cluster.v1"
+      },
+      createdAt: at
+    });
+  }
+
   private markReadyTextOnly(memory: MemoryRow, attemptCount: number, at: string, allowedStates?: MemoryProcessingState[]): void {
     this.deps.repos.processing.update(memory.id, {
       state: "ready_text_only", stage: null, activeJobId: null, attemptCount, retryAction: "retry",
@@ -337,6 +379,10 @@ export class EmbeddingJobProcessor {
       entityId: after.id, userId: after.userId, changeType: "update", before, after, source, createdAt
     });
   }
+}
+
+function spanVectorFieldFromPayload(value: unknown): SpanEmbeddingVectorField | undefined {
+  return value === "vec_goal" || value === "vec_policy" ? value : undefined;
 }
 
 export function updateTraceSummary(memory: MemoryRow, input: { summary: string; updatedAt: string }): MemoryRow {

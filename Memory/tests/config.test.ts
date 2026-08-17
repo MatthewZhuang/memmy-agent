@@ -66,9 +66,45 @@ describe("memmy memory config", () => {
       failureRTaskThreshold: -0.15,
       implicitConfidenceCap: 0.65
     });
+    expect(loadMemmyConfig(configPath).config.algorithm.spanClustering).toMatchObject({
+      enabled: true,
+      goalSimilarityThreshold: 0.9,
+      policySimilarityThreshold: 0.78,
+      minDistinctSources: 2,
+      auditMinMembers: 5,
+      auditCohesionThreshold: 0.85,
+      auditWeakPairLimit: 5
+    });
     expect(loadMemmyConfig(configPath).config.algorithm.retrieval.llmFilterEnabled).toBe(true);
     expect(loadMemmyConfig(configPath).config.domain).toBe("");
     expect(loadMemmyConfig(configPath).config.algorithm.retrieval.readOnlyInjectionProfile).toBe("all");
+  });
+
+  it("reads partial span clustering overrides", () => {
+    const root = tempRoot();
+    const configPath = join(root, "config.yaml");
+    writeFileSync(configPath, YAML.stringify({
+      memmyMemory: {
+        algorithm: {
+          spanClustering: {
+            goalSimilarityThreshold: 0.8,
+            auditMinMembers: 8,
+            auditCohesionThreshold: 0.9,
+            auditWeakPairLimit: 3
+          }
+        }
+      }
+    }));
+
+    expect(loadMemmyConfig(configPath).config.algorithm.spanClustering).toMatchObject({
+      enabled: true,
+      goalSimilarityThreshold: 0.8,
+      policySimilarityThreshold: 0.78,
+      minDistinctSources: 2,
+      auditMinMembers: 8,
+      auditCohesionThreshold: 0.9,
+      auditWeakPairLimit: 3
+    });
   });
 
   it("keeps summary thinking off and defaults evolution thinking on", () => {

@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 4;
-export const SCHEMA_MIGRATION_ID = "004_memory_processing_state";
+export const SCHEMA_VERSION = 5;
+export const SCHEMA_MIGRATION_ID = "005_span_embedding_vectors";
 const API_LOG_SOURCE_AGENT_MIGRATION_FROM_VERSION = 2;
 const PROCESSING_TAGS = new Set([
   "摘要排队中",
@@ -72,7 +72,7 @@ const statements = [
   `CREATE TABLE IF NOT EXISTS memory_vector_entries (
     id INTEGER PRIMARY KEY,
     memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    vector_field TEXT NOT NULL CHECK (vector_field IN ('vec_summary', 'vec_action', 'vec')),
+    vector_field TEXT NOT NULL CHECK (vector_field IN ('vec_summary', 'vec_action', 'vec', 'vec_goal', 'vec_policy')),
     embedding_model TEXT,
     embedding_provider TEXT,
     embedding_dim INTEGER NOT NULL,
@@ -255,6 +255,41 @@ const statements = [
   `CREATE INDEX IF NOT EXISTS idx_trace_policy_links_l2
     ON trace_policy_links (user_id, l2_memory_id, created_at DESC)`,
 
+  `CREATE TABLE IF NOT EXISTS span_clusters (
+    id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('forming', 'ready', 'promoted', 'stale')),
+    goal_threshold REAL NOT NULL,
+    policy_threshold REAL NOT NULL,
+    goal_centroid_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(goal_centroid_json)),
+    policy_centroid_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(policy_centroid_json)),
+    member_count INTEGER NOT NULL DEFAULT 0,
+    distinct_source_count INTEGER NOT NULL DEFAULT 0,
+    membership_version TEXT NOT NULL,
+    promoted_policy_id TEXT,
+    anchor_span_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_span_clusters_scope_status
+    ON span_clusters (scope_id, algorithm_version, status, updated_at DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS span_cluster_members (
+    cluster_id TEXT NOT NULL REFERENCES span_clusters(id) ON DELETE CASCADE,
+    span_id TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    source_trace_id TEXT NOT NULL,
+    goal_similarity REAL NOT NULL,
+    policy_similarity REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (cluster_id, span_id)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_span_cluster_member_active_algorithm
+    ON span_cluster_members (span_id, algorithm_version)`,
+  `CREATE INDEX IF NOT EXISTS idx_span_cluster_members_cluster
+    ON span_cluster_members (cluster_id, span_id)`,
+
   `CREATE TABLE IF NOT EXISTS skill_trials (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -374,9 +409,9 @@ const statements = [
 
   `CREATE TABLE IF NOT EXISTS embedding_retry_queue (
     id TEXT PRIMARY KEY,
-    target_kind TEXT NOT NULL CHECK (target_kind IN ('trace', 'policy', 'world_model', 'skill')),
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('trace', 'span', 'policy', 'world_model', 'skill')),
     target_id TEXT NOT NULL,
-    vector_field TEXT NOT NULL CHECK (vector_field IN ('vec_summary', 'vec_action', 'vec')),
+    vector_field TEXT NOT NULL CHECK (vector_field IN ('vec_summary', 'vec_action', 'vec', 'vec_goal', 'vec_policy')),
     source_text TEXT NOT NULL,
     embed_role TEXT NOT NULL DEFAULT 'document' CHECK (embed_role IN ('document', 'query')),
     status TEXT NOT NULL DEFAULT 'pending'
@@ -462,7 +497,7 @@ export function migrate(db: Database.Database): void {
   const hasMemories = tableExists(db, "memories");
   const version = currentSchemaVersion(db);
 
-  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3) {
+  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4) {
     throw new Error(
       `Unsupported memory database schema version ${version}; the database was left unchanged`
     );
@@ -483,6 +518,7 @@ export function migrate(db: Database.Database): void {
       for (const statement of statements) {
         db.prepare(statement).run();
       }
+      ensureSpanEmbeddingVectorSchema(db);
       db.prepare(
         `CREATE UNIQUE INDEX IF NOT EXISTS uq_evolution_jobs_active_dedupe
          ON evolution_jobs (dedupe_key)
@@ -519,6 +555,85 @@ function columnExists(db: Database.Database, table: string, column: string): boo
   if (!tableExists(db, table)) return false;
   return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
     .some((item) => item.name === column);
+}
+
+function ensureSpanEmbeddingVectorSchema(db: Database.Database): void {
+  if (!tableSqlContains(db, "memory_vector_entries", "vec_policy")) {
+    db.exec(`
+      ALTER TABLE memory_vector_entries RENAME TO memory_vector_entries_legacy_span_vectors;
+      CREATE TABLE memory_vector_entries (
+        id INTEGER PRIMARY KEY,
+        memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+        vector_field TEXT NOT NULL CHECK (vector_field IN ('vec_summary', 'vec_action', 'vec', 'vec_goal', 'vec_policy')),
+        embedding_model TEXT,
+        embedding_provider TEXT,
+        embedding_dim INTEGER NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (memory_id, vector_field)
+      );
+      INSERT INTO memory_vector_entries (
+        id, memory_id, vector_field, embedding_model, embedding_provider, embedding_dim, updated_at
+      )
+      SELECT id, memory_id, vector_field, embedding_model, embedding_provider, embedding_dim, updated_at
+      FROM memory_vector_entries_legacy_span_vectors;
+      DROP TABLE memory_vector_entries_legacy_span_vectors;
+    `);
+  }
+  db.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_memory_vector_entries_field_updated
+     ON memory_vector_entries (vector_field, updated_at DESC, id DESC)`
+  ).run();
+
+  if (!tableSqlContains(db, "embedding_retry_queue", "'span'")) {
+    db.exec(`
+      ALTER TABLE embedding_retry_queue RENAME TO embedding_retry_queue_legacy_span_vectors;
+      CREATE TABLE embedding_retry_queue (
+        id TEXT PRIMARY KEY,
+        target_kind TEXT NOT NULL CHECK (target_kind IN ('trace', 'span', 'policy', 'world_model', 'skill')),
+        target_id TEXT NOT NULL,
+        vector_field TEXT NOT NULL CHECK (vector_field IN ('vec_summary', 'vec_action', 'vec', 'vec_goal', 'vec_policy')),
+        source_text TEXT NOT NULL,
+        embed_role TEXT NOT NULL DEFAULT 'document' CHECK (embed_role IN ('document', 'query')),
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (status IN ('pending', 'in_progress', 'failed', 'succeeded')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 6,
+        next_attempt_at INTEGER NOT NULL,
+        claimed_by TEXT,
+        lease_until INTEGER,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE (target_kind, target_id, vector_field)
+      );
+      INSERT INTO embedding_retry_queue (
+        id, target_kind, target_id, vector_field, source_text, embed_role,
+        status, attempts, max_attempts, next_attempt_at, claimed_by,
+        lease_until, last_error, created_at, updated_at
+      )
+      SELECT
+        id, target_kind, target_id, vector_field, source_text, embed_role,
+        status, attempts, max_attempts, next_attempt_at, claimed_by,
+        lease_until, last_error, created_at, updated_at
+      FROM embedding_retry_queue_legacy_span_vectors;
+      DROP TABLE embedding_retry_queue_legacy_span_vectors;
+    `);
+  }
+  db.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_embedding_retry_due
+     ON embedding_retry_queue (status, next_attempt_at)`
+  ).run();
+  db.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_embedding_retry_target
+     ON embedding_retry_queue (target_kind, target_id)`
+  ).run();
+}
+
+function tableSqlContains(db: Database.Database, table: string, fragment: string): boolean {
+  const row = db.prepare(
+    `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`
+  ).get(table) as { sql?: string } | undefined;
+  return Boolean(row?.sql?.includes(fragment));
 }
 
 function backfillMemoryProcessingState(db: Database.Database, now: string): void {

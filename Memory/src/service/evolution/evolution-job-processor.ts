@@ -31,6 +31,9 @@ import {
   type DecisionRepairSummary
 } from "./reward-pipeline.js";
 import { SkillPipeline } from "./skill-pipeline.js";
+import { SpanClusteringPipeline } from "./span-clustering.js";
+import { SpanClusterAuditPipeline } from "./span-cluster-audit.js";
+import { SpanPolicyInductionPipeline } from "./span-policy-induction.js";
 import { SpanPipeline } from "./span-pipeline.js";
 import { WorldModelPipeline } from "./world-model-pipeline.js";
 
@@ -75,6 +78,9 @@ export class EvolutionJobProcessor {
   private readonly reward: RewardPipeline;
   private readonly skill: SkillPipeline;
   private readonly span: SpanPipeline;
+  private readonly spanClustering: SpanClusteringPipeline;
+  private readonly spanClusterAudit: SpanClusterAuditPipeline;
+  private readonly spanPolicy: SpanPolicyInductionPipeline;
   private readonly bigTurnSpan: BigTurnSpanPipeline;
   private readonly worldModel: WorldModelPipeline;
 
@@ -136,6 +142,26 @@ export class EvolutionJobProcessor {
       namespaceIdFromMemory: deps.namespaceIdFromMemory,
       embedAfterCapture: () => owner.deps.config.algorithm.capture.embedAfterCapture
     });
+    this.spanClustering = new SpanClusteringPipeline({
+      repos: deps.repos,
+      get config() { return owner.deps.config; },
+      enqueueJob: deps.enqueueJob
+    });
+    this.spanClusterAudit = new SpanClusterAuditPipeline({
+      get config() { return owner.deps.config; },
+      repos: deps.repos,
+      get skillLlm() { return owner.deps.skillLlm; },
+      enqueueJob: deps.enqueueJob
+    });
+    this.spanPolicy = new SpanPolicyInductionPipeline({
+      get config() { return owner.deps.config; },
+      repos: deps.repos,
+      buildMemory: deps.buildMemory,
+      upsertEvolutionMemory: this.upsertEvolutionMemory.bind(this),
+      enqueueJob: deps.enqueueJob,
+      enqueueChange: deps.repos.runtime.appendChange.bind(deps.repos.runtime),
+      namespaceIdFromMemory: deps.namespaceIdFromMemory
+    });
     this.reward = new RewardPipeline({
       get config() { return owner.deps.config; },
       repos: deps.repos,
@@ -164,6 +190,10 @@ export class EvolutionJobProcessor {
   }
 
   induceL2(job: EvolutionJobRecord): Promise<void> {
+    if (typeof job.payload.clusterId === "string") {
+      this.spanPolicy.induce(job);
+      return Promise.resolve();
+    }
     return this.policy.induceL2(job);
   }
 
@@ -189,6 +219,14 @@ export class EvolutionJobProcessor {
 
   splitBigTurn(job: EvolutionJobRecord): Promise<void> {
     return this.bigTurnSpan.splitAndStore(job);
+  }
+
+  clusterSpans(job: EvolutionJobRecord): void {
+    return this.spanClustering.rebuildScope(job);
+  }
+
+  auditSpanCluster(job: EvolutionJobRecord): Promise<void> {
+    return this.spanClusterAudit.audit(job);
   }
 
   materializeNegativeExperience(job: EvolutionJobRecord): void {

@@ -215,6 +215,38 @@ export function polardbMigrationSql(): string[] {
       ON trace_policy_links (user_id, l1_memory_id, created_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_trace_policy_links_l2
       ON trace_policy_links (user_id, l2_memory_id, created_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS span_clusters (
+      id TEXT PRIMARY KEY,
+      scope_id TEXT NOT NULL,
+      algorithm_version TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('forming', 'ready', 'promoted', 'stale')),
+      goal_threshold DOUBLE PRECISION NOT NULL,
+      policy_threshold DOUBLE PRECISION NOT NULL,
+      goal_centroid JSONB NOT NULL DEFAULT '[]'::jsonb,
+      policy_centroid JSONB NOT NULL DEFAULT '[]'::jsonb,
+      member_count INTEGER NOT NULL DEFAULT 0,
+      distinct_source_count INTEGER NOT NULL DEFAULT 0,
+      membership_version TEXT NOT NULL,
+      promoted_policy_id TEXT,
+      anchor_span_id TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_span_clusters_scope_status
+      ON span_clusters (scope_id, algorithm_version, status, updated_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS span_cluster_members (
+      cluster_id TEXT NOT NULL REFERENCES span_clusters(id) ON DELETE CASCADE,
+      span_id TEXT NOT NULL,
+      algorithm_version TEXT NOT NULL,
+      source_trace_id TEXT NOT NULL,
+      goal_similarity DOUBLE PRECISION NOT NULL,
+      policy_similarity DOUBLE PRECISION NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY (cluster_id, span_id),
+      UNIQUE (span_id, algorithm_version)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_span_cluster_members_cluster
+      ON span_cluster_members (cluster_id, span_id)`,
     `CREATE TABLE IF NOT EXISTS skill_trials (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -311,9 +343,9 @@ export function polardbMigrationSql(): string[] {
       WHERE dedupe_key IS NOT NULL AND status IN ('queued', 'leased', 'failed')`,
     `CREATE TABLE IF NOT EXISTS embedding_retry_queue (
       id TEXT PRIMARY KEY,
-      target_kind TEXT NOT NULL CHECK (target_kind IN ('trace', 'policy', 'world_model', 'skill')),
+      target_kind TEXT NOT NULL CHECK (target_kind IN ('trace', 'span', 'policy', 'world_model', 'skill')),
       target_id TEXT NOT NULL,
-      vector_field TEXT NOT NULL CHECK (vector_field IN ('vec_summary', 'vec_action', 'vec')),
+      vector_field TEXT NOT NULL CHECK (vector_field IN ('vec_summary', 'vec_action', 'vec', 'vec_goal', 'vec_policy')),
       source_text TEXT NOT NULL,
       embed_role TEXT NOT NULL DEFAULT 'document' CHECK (embed_role IN ('document', 'query')),
       status TEXT NOT NULL DEFAULT 'pending'

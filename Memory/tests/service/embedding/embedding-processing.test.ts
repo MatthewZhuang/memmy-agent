@@ -12,8 +12,12 @@ import {
 } from "../../../src/algorithm/plugin-algorithms.js";
 import {
   embeddingTextForMemory,
+  embeddingRetrySourceText,
+  spanEmbeddingText,
+  spanHasBothEmbeddings,
   updateMemoryVectorField
 } from "../../../src/service/embedding/embedding-pipeline.js";
+import { attachMemoryVector } from "../../../src/storage/memory-vector-state.js";
 import { Repositories } from "../../../src/storage/repositories.js";
 import {
   createBatchReflectionLlm,
@@ -32,6 +36,114 @@ const {
 afterEach(cleanup);
 
 describe("MemoryService / embedding / processing", () => {
+  it("embeds Span goals and observed policies as separate document fields", () => {
+    const span = spanMemory();
+
+    expect(spanEmbeddingText(span, "vec_goal")).toBe("Goal: diagnose build failure");
+    expect(spanEmbeddingText(span, "vec_policy")).toBe("Policy: trace the first failing dependency edge");
+    expect(spanEmbeddingText(span, "vec_goal")).not.toMatch(/Policy:|Summary:/);
+    expect(spanEmbeddingText(span, "vec_policy")).not.toMatch(/Goal:|Summary:/);
+  });
+
+  it("derives retry source text from the current Span field", () => {
+    const span = spanMemory();
+
+    expect(embeddingRetrySourceText(span, "vec_goal")).toBe(
+      "Goal: diagnose build failure"
+    );
+    expect(embeddingRetrySourceText(span, "vec_policy")).toBe(
+      "Policy: trace the first failing dependency edge"
+    );
+  });
+
+  it("does not persist stale Span retry vectors after the Span text changes", async () => {
+    const { db, service } = createTestService();
+    const repos = new Repositories(db.db);
+    repos.memories.insert(spanMemory());
+    repos.runtime.enqueueEmbeddingRetry({
+      id: "retry-stale-span-goal",
+      targetKind: "span",
+      targetId: "span_embedding_text",
+      vectorField: "vec_goal",
+      sourceText: "Goal: old span goal",
+      now: Date.now()
+    });
+    const current = repos.memories.get("span_embedding_text");
+    expect(current).toBeTruthy();
+    const currentSpan = current!.properties.internal_info.span as Record<string, unknown>;
+    repos.memories.update({
+      ...current!,
+      memoryValue: [
+        "Goal: refined build failure diagnosis",
+        "Policy: trace the first failing dependency edge",
+        "Summary: isolated an incompatible dependency constraint"
+      ].join("\n"),
+      properties: {
+        ...current!.properties,
+        internal_info: {
+          ...current!.properties.internal_info,
+          span: {
+            ...currentSpan,
+            goal: "refined build failure diagnosis"
+          }
+        }
+      },
+      updatedAt: "2026-08-14T00:01:00.000Z"
+    });
+
+    const staleRun = await service.runWorkerOnce(1);
+
+    expect(staleRun.embeddingRetries).toMatchObject({
+      leased: 1,
+      succeeded: 0,
+      failed: 0
+    });
+    expect(repos.memories.hasVector("span_embedding_text", "vec_goal")).toBe(false);
+    expect(repos.runtime.getEmbeddingRetryByTarget("span", "span_embedding_text", "vec_goal"))
+      .toMatchObject({
+        status: "pending",
+        attempts: 0,
+        sourceText: "Goal: refined build failure diagnosis"
+      });
+
+    const freshRun = await service.runWorkerOnce(1);
+
+    expect(freshRun.embeddingRetries).toMatchObject({
+      leased: 1,
+      succeeded: 1,
+      failed: 0
+    });
+    expect(repos.memories.hasVector("span_embedding_text", "vec_goal")).toBe(true);
+    expect(repos.runtime.getEmbeddingRetryByTarget("span", "span_embedding_text", "vec_goal"))
+      .toMatchObject({ status: "succeeded" });
+    db.close();
+  });
+
+  it("requires both Span embedding vectors before clustering", () => {
+    const onlyGoal = attachMemoryVector(spanMemory(), {
+      vectorField: "vec_goal",
+      vector: [1, 0, 0],
+      embeddingModel: "test",
+      embeddingProvider: "test"
+    });
+    expect(spanHasBothEmbeddings(spanMemory())).toBe(false);
+    expect(spanHasBothEmbeddings(onlyGoal)).toBe(false);
+
+    const both = attachMemoryVector(attachMemoryVector(spanMemory(), {
+      vectorField: "vec_goal",
+      vector: [1, 0, 0],
+      embeddingModel: "test",
+      embeddingProvider: "test"
+    }), {
+      vectorField: "vec_policy",
+      vector: [0, 1, 0],
+      embeddingModel: "test",
+      embeddingProvider: "test"
+    });
+
+    expect(spanHasBothEmbeddings(both)).toBe(true);
+  });
+
   it("embeds Skill retrieval metadata instead of the full SKILL.md when short metadata exists", () => {
     const text = embeddingTextForMemory(skillMemory({
       retrievalBlurb: "Use for safe SQLite schema migrations.",
@@ -304,6 +416,49 @@ describe("MemoryService / embedding / processing", () => {
     db.close();
   });
 });
+
+function spanMemory(): MemoryRow {
+  const now = "2026-08-14T00:00:00.000Z";
+  return {
+    id: "span_embedding_text",
+    timeline: now,
+    userId: "span-embedding-user",
+    memoryType: "LongTermMemory",
+    status: "activated",
+    visibility: "private",
+    memoryKey: "diagnose build failure",
+    memoryValue: [
+      "Goal: diagnose build failure",
+      "Policy: trace the first failing dependency edge",
+      "Summary: isolated an incompatible dependency constraint"
+    ].join("\n"),
+    tags: ["span", "big-turn", "derived"],
+    info: {},
+    properties: {
+      internal_info: {
+        memory_layer: "L1",
+        memory_kind: "span",
+        span: {
+          schema_version: "span.v2",
+          source_trace_id: "trace-embedding-text",
+          raw_turn_id: "raw-turn-embedding-text",
+          span_index: 0,
+          tool_call_start: 0,
+          tool_call_end: 3,
+          tool_call_count: 4,
+          goal: "diagnose build failure",
+          policy: "trace the first failing dependency edge",
+          summary: "isolated an incompatible dependency constraint",
+          derived: true
+        }
+      }
+    },
+    memoryLayer: "L1",
+    version: 1,
+    createdAt: now,
+    updatedAt: now
+  };
+}
 
 function negativePolicyMemory(title: string, trigger: string): MemoryRow {
   const now = "2026-07-24T00:00:00.000Z";

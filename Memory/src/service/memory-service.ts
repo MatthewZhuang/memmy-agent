@@ -278,7 +278,9 @@ export class MemoryService {
           abstractL3: (job) => this.evolutionJobs.abstractL3(job),
           crystallizeSkill: (job) => this.evolutionJobs.crystallizeSkill(job),
           associateL2: (job) => this.evolutionJobs.associateL2(job),
-          splitBigTurn: (job) => this.evolutionJobs.splitBigTurn(job)
+          splitBigTurn: (job) => this.evolutionJobs.splitBigTurn(job),
+          clusterSpans: (job) => this.evolutionJobs.clusterSpans(job),
+          auditSpanCluster: (job) => this.evolutionJobs.auditSpanCluster(job)
         },
         feedback: {
           applyReward: (job) => this.evolutionJobs.applyReward(job),
@@ -2264,7 +2266,13 @@ function importedMemoryVectors(value: unknown): SerializedMemoryVector[] {
   return value.map((item) => {
     if (!isRecord(item)) throw new Error("memory_vectors rows must be objects");
     const vectorField = item.vector_field;
-    if (vectorField !== "vec" && vectorField !== "vec_summary" && vectorField !== "vec_action") {
+    if (
+      vectorField !== "vec" &&
+      vectorField !== "vec_summary" &&
+      vectorField !== "vec_action" &&
+      vectorField !== "vec_goal" &&
+      vectorField !== "vec_policy"
+    ) {
       throw new Error("memory_vectors.vector_field is invalid");
     }
     if (

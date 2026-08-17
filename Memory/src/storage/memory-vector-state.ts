@@ -1,6 +1,11 @@
 import type { MemoryRow } from "../types.js";
 
-export type MemoryVectorField = "vec_summary" | "vec_action" | "vec";
+export type MemoryVectorField =
+  | "vec_summary"
+  | "vec_action"
+  | "vec"
+  | "vec_goal"
+  | "vec_policy";
 
 export interface MemoryVectorValue {
   vectorField: MemoryVectorField;

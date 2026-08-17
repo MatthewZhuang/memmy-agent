@@ -33,6 +33,7 @@ import {
   VECTOR_SEARCH_WINDOW,
   type VectorSearchCandidate
 } from "./sqlite-vec-store.js";
+import { SpanClusterRepository } from "./span-cluster-repository.js";
 
 type SqlValue = string | number | Buffer | null;
 const BUNDLE_TABLES = [
@@ -222,7 +223,7 @@ export interface EvolutionJobRecord {
   updatedAt: string;
 }
 
-export type EmbeddingRetryTargetKind = "trace" | "policy" | "world_model" | "skill";
+export type EmbeddingRetryTargetKind = "trace" | "span" | "policy" | "world_model" | "skill";
 export type EmbeddingRetryVectorField = MemoryVectorField;
 export type EmbeddingRetryStatus = "pending" | "in_progress" | "failed" | "succeeded";
 
@@ -864,6 +865,31 @@ export class MemoryRepository {
        LIMIT 1`
     ).get(memoryId, vectorField) as { ok: number } | undefined;
     return Boolean(row);
+  }
+
+  listReadySpanV2(limit = 10000): MemoryRow[] {
+    const rows = this.db.prepare(
+      `SELECT *
+       FROM memories
+       WHERE deleted_at IS NULL
+         AND status != 'deleted'
+         AND memory_layer = 'L1'
+         AND json_extract(properties_json, '$.internal_info.memory_kind') = 'span'
+         AND json_extract(properties_json, '$.internal_info.span.schema_version') = 'span.v2'
+         AND EXISTS (
+           SELECT 1 FROM memory_vector_entries
+           WHERE memory_vector_entries.memory_id = memories.id
+             AND memory_vector_entries.vector_field = 'vec_goal'
+         )
+         AND EXISTS (
+           SELECT 1 FROM memory_vector_entries
+           WHERE memory_vector_entries.memory_id = memories.id
+             AND memory_vector_entries.vector_field = 'vec_policy'
+         )
+       ORDER BY created_at ASC, id ASC
+       LIMIT ?`
+    ).all(limit) as MemorySqlRow[];
+    return this.hydrateMany(rows.map(memoryFromSql));
   }
 
   searchFtsIds(ftsMatch: string | null | undefined, filter: MemoryFilter = {}, limit = 20): MemorySearchIdHit[] {
@@ -3531,12 +3557,14 @@ export class Repositories {
   readonly processing: MemoryProcessingRepository;
   readonly runtime: RuntimeRepository;
   readonly vectors: SqliteVecStore;
+  readonly spanClusters: SpanClusterRepository;
 
   constructor(readonly db: Database.Database) {
     this.vectors = new SqliteVecStore(db);
     this.memories = new MemoryRepository(db, this.vectors);
     this.processing = new MemoryProcessingRepository(db);
     this.runtime = new RuntimeRepository(db);
+    this.spanClusters = new SpanClusterRepository(db);
   }
 
   transaction<T>(fn: () => T): T {
@@ -4137,7 +4165,7 @@ function prepareMemoryForStorage(memory: MemoryRow): {
   if (ownerValue && typeof ownerValue === "object" && !Array.isArray(ownerValue)) {
     const owner = { ...ownerValue as Record<string, unknown> };
     const fields: EmbeddingRetryVectorField[] = memory.memoryLayer === "L1"
-      ? ["vec_summary", "vec_action"]
+      ? ["vec_summary", "vec_action", "vec_goal", "vec_policy"]
       : ["vec"];
     for (const vectorField of fields) {
       const vector = finiteVector(owner[vectorField]);

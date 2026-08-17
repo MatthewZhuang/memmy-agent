@@ -50,10 +50,23 @@ describe("MemoryService / lifecycle / governance", () => {
     const exportedMemory = (redactedBundle.tables.memories as Array<Record<string, unknown>>)
       .find((row) => row.id === complete.l1MemoryId);
     expect(exportedMemory).toBeTruthy();
-    const exportedVector = (redactedBundle.tables.memory_vectors as Array<Record<string, unknown>>)
+    const memoryVectors = redactedBundle.tables.memory_vectors as Array<Record<string, unknown>>;
+    const exportedVector = memoryVectors
       .find((row) => row.memory_id === complete.l1MemoryId && row.vector_field === "vec_summary");
     expect(exportedVector).toBeTruthy();
     exportedVector!.embedding_model = "foreign-embedding-model";
+    memoryVectors.push(
+      {
+        ...exportedVector,
+        vector_field: "vec_goal",
+        updated_at: "2026-08-17T00:00:00.000Z"
+      },
+      {
+        ...exportedVector,
+        vector_field: "vec_policy",
+        updated_at: "2026-08-17T00:00:00.000Z"
+      }
+    );
     for (const row of redactedBundle.tables.sessions as Array<Record<string, unknown>>) {
       delete row.last_seen_at;
     }

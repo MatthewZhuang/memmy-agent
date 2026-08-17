@@ -75,6 +75,8 @@ describe("repository sqlite schema contract", () => {
         "decision_repairs",
         "l2_candidate_pool",
         "trace_policy_links",
+        "span_clusters",
+        "span_cluster_members",
         "skill_trials",
         "recall_events",
         "memory_change_log",
@@ -101,6 +103,34 @@ describe("repository sqlite schema contract", () => {
         .prepare(`PRAGMA table_info(memory_vector_entries)`)
         .all() as Array<{ name: string }>;
       expect(vectorEntryColumns.map((column) => column.name)).not.toContain("embedding");
+      db.db.prepare(
+        `INSERT INTO memories (
+          id, timeline, user_id, memory_type, memory_value, tags_json, info_json,
+          properties_json, memory_layer, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        "schema-vector-field-span",
+        "2026-08-14T00:00:00.000Z",
+        "schema-user",
+        "LongTermMemory",
+        "schema vector field span",
+        "[]",
+        "{}",
+        JSON.stringify({ internal_info: { memory_layer: "L1", memory_kind: "span" } }),
+        "L1",
+        "2026-08-14T00:00:00.000Z",
+        "2026-08-14T00:00:00.000Z"
+      );
+      db.db.prepare(
+        `INSERT INTO memory_vector_entries (
+          memory_id, vector_field, embedding_model, embedding_provider, embedding_dim, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)`
+      ).run("schema-vector-field-span", "vec_goal", "test", "test", 3, "2026-08-14T00:00:00.000Z");
+      db.db.prepare(
+        `INSERT INTO memory_vector_entries (
+          memory_id, vector_field, embedding_model, embedding_provider, embedding_dim, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)`
+      ).run("schema-vector-field-span", "vec_policy", "test", "test", 3, "2026-08-14T00:00:00.000Z");
       const tableNames = new Set(tables.map((table) => table.name));
       expect([...tableNames].some((name) => name.startsWith("cloud_"))).toBe(false);
 
@@ -213,6 +243,25 @@ describe("repository sqlite schema contract", () => {
         "idx_embedding_retry_due",
         "idx_embedding_retry_target"
       ]));
+      db.db.prepare(
+        `INSERT INTO embedding_retry_queue (
+          id, target_kind, target_id, vector_field, source_text, embed_role,
+          status, attempts, max_attempts, next_attempt_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        "retry-span-goal",
+        "span",
+        "schema-vector-field-span",
+        "vec_goal",
+        "Goal: schema accepts span goal embeddings",
+        "document",
+        "pending",
+        0,
+        5,
+        0,
+        0,
+        "2026-08-14T00:00:00.000Z"
+      );
       const apiLogColumns = db.db.prepare(`PRAGMA table_info(api_logs)`).all() as Array<{ name: string }>;
       expect(apiLogColumns.map((column) => column.name)).toContain("source_agent");
       const apiLogIndexes = db.db.prepare(`PRAGMA index_list(api_logs)`).all() as Array<{ name: string }>;

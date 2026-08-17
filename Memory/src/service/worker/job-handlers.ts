@@ -63,6 +63,8 @@ export interface WorkerJobProcessors {
     crystallizeSkill(job: EvolutionJobRecord): MaybePromise<void>;
     associateL2(job: EvolutionJobRecord): MaybePromise<void>;
     splitBigTurn(job: EvolutionJobRecord): MaybePromise<void>;
+    clusterSpans(job: EvolutionJobRecord): MaybePromise<void>;
+    auditSpanCluster(job: EvolutionJobRecord): MaybePromise<void>;
   };
   feedback: {
     applyReward(job: EvolutionJobRecord): MaybePromise<void>;
@@ -237,6 +239,12 @@ export async function processJob(
       return;
     case "span_big_turn":
       await deps.processors.evolution.splitBigTurn(job);
+      return;
+    case "span_cluster":
+      await deps.processors.evolution.clusterSpans(job);
+      return;
+    case "span_cluster_audit":
+      await deps.processors.evolution.auditSpanCluster(job);
       return;
     case "embedding":
       await deps.processors.embedding.embedMemory(job);
@@ -521,7 +529,9 @@ export function evolutionJobDedupeKey(input: Pick<EnqueueJobInput, "jobType" | "
         ? `episode_idle_close:${input.episodeId}:${payloadString("triggerRawTurnId") ?? "turn"}`
         : undefined;
     case "embedding":
-      return target ? `embedding:${target}:${payloadString("contentHash") ?? "current"}` : undefined;
+      return target
+        ? `embedding:${target}:${payloadString("vectorField") ?? "vec"}:${payloadString("sourceHash") ?? payloadString("contentHash") ?? "current"}`
+        : undefined;
     case "trace_summary":
       return target ? `trace_summary:${target}:${payloadString("contentHash") ?? "current"}` : undefined;
     case "import_summary":
@@ -532,6 +542,10 @@ export function evolutionJobDedupeKey(input: Pick<EnqueueJobInput, "jobType" | "
       return input.episodeId ? `reward:${input.episodeId}` : target ? `reward:${target}` : undefined;
     case "span_big_turn":
       return target ? `span_big_turn:${target}` : undefined;
+    case "span_cluster":
+      return payloadString("scopeId")
+        ? `span_cluster:${payloadString("scopeId")}:${payloadString("algorithmVersion") ?? "span-cluster.v1"}`
+        : undefined;
     case "negative_experience": {
       const source = payloadString("source");
       const sourceEventId = payloadString("sourceEventId");

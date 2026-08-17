@@ -171,6 +171,15 @@ export interface AlgorithmConfig {
     maxSourceIds: number;
     implicitConfidenceCap: number;
   };
+  spanClustering: {
+    enabled: boolean;
+    goalSimilarityThreshold: number;
+    policySimilarityThreshold: number;
+    minDistinctSources: number;
+    auditMinMembers: number;
+    auditCohesionThreshold: number;
+    auditWeakPairLimit: number;
+  };
   l2Induction: {
     useLlm: boolean;
     minEpisodesForInduction: number;
@@ -390,6 +399,15 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
       maxPreferences: 3,
       maxSourceIds: 20,
       implicitConfidenceCap: 0.65
+    },
+    spanClustering: {
+      enabled: true,
+      goalSimilarityThreshold: 0.9,
+      policySimilarityThreshold: 0.78,
+      minDistinctSources: 2,
+      auditMinMembers: 5,
+      auditCohesionThreshold: 0.85,
+      auditWeakPairLimit: 5
     },
     l2Induction: {
       useLlm: true,
@@ -893,6 +911,7 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
   const reward = asRecord(input.reward);
   const feedback = asRecord(input.feedback);
   const negativeExperience = asRecord(input.negativeExperience);
+  const spanClustering = asRecord(input.spanClustering);
   const l2 = asRecord(input.l2Induction);
   const l3 = asRecord(input.l3Abstraction);
   const skill = asRecord(input.skill);
@@ -993,6 +1012,36 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
         negativeExperience.implicitConfidenceCap,
         DEFAULT_MEMMY_CONFIG.algorithm.negativeExperience.implicitConfidenceCap
       )
+    },
+    spanClustering: {
+      enabled: booleanValue(
+        spanClustering.enabled,
+        DEFAULT_MEMMY_CONFIG.algorithm.spanClustering.enabled
+      ),
+      goalSimilarityThreshold: clamp01(numberValue(
+        spanClustering.goalSimilarityThreshold,
+        DEFAULT_MEMMY_CONFIG.algorithm.spanClustering.goalSimilarityThreshold
+      )),
+      policySimilarityThreshold: clamp01(numberValue(
+        spanClustering.policySimilarityThreshold,
+        DEFAULT_MEMMY_CONFIG.algorithm.spanClustering.policySimilarityThreshold
+      )),
+      minDistinctSources: Math.max(1, Math.floor(numberValue(
+        spanClustering.minDistinctSources,
+        DEFAULT_MEMMY_CONFIG.algorithm.spanClustering.minDistinctSources
+      ))),
+      auditMinMembers: Math.max(2, Math.floor(numberValue(
+        spanClustering.auditMinMembers,
+        DEFAULT_MEMMY_CONFIG.algorithm.spanClustering.auditMinMembers
+      ))),
+      auditCohesionThreshold: clamp01(numberValue(
+        spanClustering.auditCohesionThreshold,
+        DEFAULT_MEMMY_CONFIG.algorithm.spanClustering.auditCohesionThreshold
+      )),
+      auditWeakPairLimit: Math.max(1, Math.floor(numberValue(
+        spanClustering.auditWeakPairLimit,
+        DEFAULT_MEMMY_CONFIG.algorithm.spanClustering.auditWeakPairLimit
+      )))
     },
     l2Induction: {
       useLlm: booleanValue(l2.useLlm, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.useLlm),
@@ -1298,6 +1347,10 @@ function expandEnvString(value: string): string {
 
 function numberValue(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
 }
 
 function booleanValue(value: unknown, fallback: boolean): boolean {

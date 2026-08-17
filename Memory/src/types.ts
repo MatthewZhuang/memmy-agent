@@ -46,6 +46,8 @@ export type JobType =
   | "embedding"
   | "reward"
   | "span_big_turn"
+  | "span_cluster"
+  | "span_cluster_audit"
   | "negative_experience"
   | "l2_association"
   | "l2_induction"

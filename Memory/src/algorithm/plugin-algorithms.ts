@@ -4875,6 +4875,8 @@ export type RetrievalChannel =
   | "vec"
   | "vec_summary"
   | "vec_action"
+  | "vec_goal"
+  | "vec_policy"
   | "fts"
   | "pattern"
   | "structural";
@@ -5262,7 +5264,7 @@ function renderEpisodeRollupSnippet(traces: TraceMemoryMeta[], totalTraceCount: 
 }
 
 function assignCandidateChannelRanks(candidates: RankedMemoryCandidate[]): void {
-  const channels: RetrievalChannel[] = ["vec", "vec_summary", "vec_action", "fts", "pattern", "structural"];
+  const channels: RetrievalChannel[] = ["vec", "vec_summary", "vec_action", "vec_goal", "vec_policy", "fts", "pattern", "structural"];
   const tiers: RankedMemoryCandidate["tier"][] = ["tier1", "tier2", "tier3"];
   for (const tier of tiers) {
     for (const channel of channels) {
