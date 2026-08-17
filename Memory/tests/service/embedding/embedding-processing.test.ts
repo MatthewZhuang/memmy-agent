@@ -144,6 +144,42 @@ describe("MemoryService / embedding / processing", () => {
     expect(spanHasBothEmbeddings(both)).toBe(true);
   });
 
+  it("queues Span clustering after an embedding retry completes both Span vectors", async () => {
+    const { db, service } = createTestService();
+    const repos = new Repositories(db.db);
+    const span = attachMemoryVector(spanMemory(), {
+      vectorField: "vec_goal",
+      vector: [1, 0, 0],
+      embeddingModel: "test",
+      embeddingProvider: "test"
+    });
+    repos.memories.insert(span);
+    repos.runtime.enqueueEmbeddingRetry({
+      id: "retry-span-policy-ready-for-cluster",
+      targetKind: "span",
+      targetId: span.id,
+      vectorField: "vec_policy",
+      sourceText: "Policy: trace the first failing dependency edge",
+      now: Date.now()
+    });
+
+    const run = await service.runWorkerOnce(1);
+
+    expect(run.embeddingRetries).toMatchObject({
+      leased: 1,
+      succeeded: 1,
+      failed: 0
+    });
+    expect(repos.runtime.listJobs(undefined, 10).filter((job) => job.jobType === "span_cluster").map((job) => job.payload))
+      .toEqual([
+        expect.objectContaining({
+          reason: "span.embeddings.ready",
+          scopeId: "span-embedding-user:unknown:default"
+        })
+      ]);
+    db.close();
+  });
+
   it("embeds Skill retrieval metadata instead of the full SKILL.md when short metadata exists", () => {
     const text = embeddingTextForMemory(skillMemory({
       retrievalBlurb: "Use for safe SQLite schema migrations.",

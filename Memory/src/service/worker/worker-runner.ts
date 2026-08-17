@@ -27,6 +27,7 @@ import {
   embeddingRetrySourceText,
   embeddingRetryBackoffMs,
   embeddingRetryToRunItem,
+  spanHasBothEmbeddings,
   spanEmbeddingSourceHash
 } from "../embedding/embedding-pipeline.js";
 import { spanPayload } from "../evolution/span-model.js";
@@ -635,11 +636,12 @@ export class WorkerRunner {
           ? retrievalDocumentSourceHash(memory)
           : undefined,
       allowedProcessingStates: ["embedding_pending", "embedding"],
-      finalize: () => {
+      finalize: (saved, _hadProcessing, at) => {
         completed = this.deps.repos.runtime.markEmbeddingRetrySucceededClaimed(retry.id, {
           ...claim,
           now: this.nowMs()
         });
+        this.enqueueSpanClusterIfReadyAfterRetry(saved, retry, at);
       }
     });
     if (completed) {
@@ -691,6 +693,26 @@ export class WorkerRunner {
 
   private nowMs(): number {
     return this.deps.nowMs?.() ?? Date.now();
+  }
+
+  private enqueueSpanClusterIfReadyAfterRetry(
+    memory: MemoryRow,
+    retry: EmbeddingRetryRecord,
+    at: string
+  ): void {
+    if (!spanHasBothEmbeddings(memory)) return;
+    this.deps.enqueueJob({
+      jobType: "span_cluster",
+      userId: memory.userId,
+      sessionId: memory.sessionId,
+      payload: {
+        reason: "span.embeddings.ready",
+        sourceRetryId: retry.id,
+        scopeId: this.deps.namespaceIdFromMemory(memory),
+        algorithmVersion: "span-cluster.v1"
+      },
+      createdAt: at
+    });
   }
 }
 
