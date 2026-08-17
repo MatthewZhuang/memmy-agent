@@ -136,7 +136,7 @@ export class EvolutionJobProcessor {
     });
     this.bigTurnSpan = new BigTurnSpanPipeline({
       repos: deps.repos,
-      get llm() { return owner.deps.llm; },
+      get llm() { return owner.deps.skillLlm; },
       buildMemory: deps.buildMemory,
       enqueueJob: deps.enqueueJob,
       namespaceIdFromMemory: deps.namespaceIdFromMemory,

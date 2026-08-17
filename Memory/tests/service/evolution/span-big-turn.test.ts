@@ -876,4 +876,87 @@ describe("MemoryService / evolution / span big turn", () => {
     );
     db.close();
   });
+
+  it("uses the evolution LLM, not the summary LLM, for Span splitting", async () => {
+    const calls: Array<{ messages: LlmMessage[]; options: LlmCompletionOptions }> = [];
+    const evolutionLlm = createSpanBigTurnLlm(calls, {
+      spans: [{
+        start: 0,
+        end: 10,
+        goal: "拆分长工具轨迹中的局部策略",
+        policy: "使用结构化工具轨迹和边界规则抽取连续策略片段",
+        summary: "从长工具轨迹中抽取出一个可复用策略片段"
+      }]
+    });
+    const unconfiguredSummaryLlm: LlmClient = {
+      ...evolutionLlm,
+      config: { ...evolutionLlm.config, model: "summary-unconfigured" },
+      isConfigured() {
+        return false;
+      }
+    };
+    const config = {
+      ...DEFAULT_MEMMY_CONFIG,
+      algorithm: {
+        ...DEFAULT_MEMMY_CONFIG.algorithm,
+        capture: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+          alphaScoring: false
+        },
+        reward: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.reward,
+          llmScoring: false
+        }
+      }
+    };
+    const { db, service } = createTestService({
+      config,
+      llm: unconfiguredSummaryLlm,
+      skillLlm: evolutionLlm
+    });
+    const namespace = {
+      source: "codex",
+      profileId: "jiang",
+      userId: "span-big-turn-evolution-llm"
+    };
+    const session = service.openSession({ namespace });
+    const toolCalls = Array.from({ length: 11 }, (_, index) => ({
+      id: `evolution-llm-tool-${index}`,
+      name: "task_step",
+      input: { index }
+    }));
+    const completed = service.completeTurn("span-big-turn-evolution-llm", {
+      namespace,
+      sessionId: session.sessionId,
+      query: "执行一个需要拆分 span 的长任务",
+      answer: "长任务已经完成。",
+      toolCalls,
+      toolResults: toolCalls.map((call, index) => ({
+        toolCallId: call.id,
+        name: call.name,
+        output: { ok: true, index }
+      }))
+    });
+    service.closeSession(session.sessionId);
+    await service.feedback({
+      namespace,
+      sessionId: session.sessionId,
+      episodeId: completed.episodeId,
+      l1MemoryId: completed.l1MemoryId,
+      channel: "explicit",
+      polarity: "positive",
+      magnitude: 1,
+      rationale: "长任务结果正确"
+    });
+    await runWorkerRounds(service, 8);
+
+    expect(calls.some((call) => call.options.operation === "span.big_turn.v1")).toBe(true);
+    expect(service.panelItems({ namespace, layer: "L1" }).items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "span",
+        title: "拆分长工具轨迹中的局部策略"
+      })
+    ]));
+    db.close();
+  });
 });
