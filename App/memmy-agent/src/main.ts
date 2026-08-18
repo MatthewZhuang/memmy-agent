@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Must load first: inject MEMMY_CLOUD_SERVICE from the repository root .env into process.env for later module evaluation.
+// Must load first: resolve MEMMY_CLOUD_SERVICE from external env, packaged manifest, or development .env.
 import "./load-env.js";
 import { main } from "./entrypoints/cli/commands.js";
 import { ConfigError } from "./config/loader.js";

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# auto-release-mac.sh —— daily schedule: pull latest dev → bump version +1 → build signed Mac packages (cn+intl)
+# auto-release-mac.sh —— daily schedule: pull latest branch → verify its declared version → build signed Mac packages (cn+intl)
 #                        → upload & release (website download button takes effect automatically) → DingTalk notification
 #
 # Design notes:
-#   * Version = latest version from the online latest/list +1 (does not touch package.json in git, reset-safe)
+#   * Version = the checked-out source version; packaging never invents or rewrites release metadata
 #   * cn / intl share the same upload backend, distinguished by cn/intl in platformType
 #   * Upload takes effect immediately: the website reads /api/memmy/desktop/latest/list live, no redeploy needed
 #   * Any failed step → DingTalk alert and exit (set -e + trap)
@@ -18,12 +18,12 @@ set -euo pipefail
 # 1. Configuration (★ the two placeholder items must be filled first, or the script refuses to run)
 # ============================================================
 REPO_DIR="/Users/zongy/Documents/MemTensor/Memmy-agent"
-BRANCH="dev"
+BRANCH="${MEMMY_RELEASE_BRANCH:-}"
 
 # Backend for upload + querying the download list (cn/intl share the same one)
 API_BASE="https://memmy-api.memtensor.cn"
 
-# Cloud service address each version of the App connects to (written into .env as MEMMY_CLOUD_SERVICE at build time)
+# Public cloud-service origin embedded through the allowlisted runtime manifest.
 CN_CLOUD_SERVICE="https://memmy-api.memtensor.cn"
 INTL_CLOUD_SERVICE="https://memmy-api.memtensor.cn"
 
@@ -65,6 +65,16 @@ on_error() {
 trap on_error ERR
 
 cd "$REPO_DIR"
+if [ -z "$BRANCH" ]; then
+  BRANCH="$(git branch --show-current)"
+fi
+case "$BRANCH" in
+  release/v*.*.*)
+    ;;
+  *)
+    die "Packaging requires a release/vX.Y.Z branch; set MEMMY_RELEASE_BRANCH explicitly"
+    ;;
+esac
 
 # ============================================================
 # 2. Pull the latest dev
@@ -74,55 +84,53 @@ log "$CURRENT_STEP"
 git fetch origin "$BRANCH"
 git checkout "$BRANCH"
 git reset --hard "origin/$BRANCH"
-log "dev current commit: $(git rev-parse --short HEAD) — $(git log -1 --pretty=%s)"
+log "$BRANCH current commit: $(git rev-parse --short HEAD) — $(git log -1 --pretty=%s)"
 
-# Dependencies may change with dev, make sure they are in place
+# Dependencies may change with the release branch, make sure they are in place
 CURRENT_STEP="Install dependencies"
 log "$CURRENT_STEP"
 npm install
 
 # ============================================================
-# 3. Compute the new version = latest online version +1
+# 3. Verify the source-declared release version is newer than the online version
 # ============================================================
-CURRENT_STEP="Compute new version"
+CURRENT_STEP="Verify source release version"
 log "$CURRENT_STEP"
-# Query the largest version in the cn online list, patch +1; fall back to package.json if none found
 ONLINE_JSON="$(curl -sS -m 20 "$API_BASE/api/memmy/desktop/latest/list?edition=cn" || echo '')"
 NEW_VERSION="$(node - "$ONLINE_JSON" <<'NODE'
 const raw = process.argv[2] || "";
 let online = [];
 try { const p = JSON.parse(raw); online = Array.isArray(p.data) ? p.data : []; } catch {}
 const pkg = require("./App/shell/desktop/package.json");
-// Collect all known versions (online + local package.json) and take the largest
 const vers = online.map(x => x.version).filter(Boolean);
-vers.push(pkg.version);
 const cmp = (a, b) => {
   const pa = a.split(".").map(Number), pb = b.split(".").map(Number);
   for (let i = 0; i < 3; i++) { if ((pa[i]||0) !== (pb[i]||0)) return (pa[i]||0) - (pb[i]||0); }
   return 0;
 };
-const latest = vers.sort(cmp).at(-1);
-const parts = latest.split(".").map(Number);
-parts[2] = (parts[2] || 0) + 1;                     // patch +1
-process.stdout.write(parts.join("."));
+const latestOnline = vers.sort(cmp).at(-1);
+if (latestOnline && cmp(pkg.version, latestOnline) <= 0) {
+  throw new Error("Source package version must be newer than the latest online version");
+}
+process.stdout.write(pkg.version);
 NODE
 )"
-[ -n "$NEW_VERSION" ] || die "Cannot compute new version"
-log "Latest online → new version: $NEW_VERSION"
+[ -n "$NEW_VERSION" ] || die "Cannot read the source release version"
+log "Verified source release version: $NEW_VERSION"
 
 # ============================================================
 # 4. Domestic network: local binaries, avoid GitHub downloads
 # ============================================================
 export MEMMY_ELECTRON_DIST="$REPO_DIR/App/shell/desktop/node_modules/electron/dist"
 export CUSTOM_DMGBUILD_PATH="$(find "$HOME/Library/Caches/electron-builder" -name dmgbuild -type f 2>/dev/null | head -1)"
-export MEMMY_DESKTOP_VERSION="$NEW_VERSION"          # the packaging script names artifacts from this, does not touch git
+export MEMMY_DESKTOP_VERSION="$NEW_VERSION"
 
 RELEASE_DIR="$REPO_DIR/App/shell/desktop/release"
 
-# ---- Common: switch .env → build → upload ----
+# ---- Common: configure public runtime origin → build → upload ----
 set_cloud_service() {
-  sed -i '' "s#^MEMMY_CLOUD_SERVICE=.*#MEMMY_CLOUD_SERVICE=$1#" "$REPO_DIR/.env"
-  grep MEMMY_CLOUD_SERVICE "$REPO_DIR/.env"
+  export MEMMY_CLOUD_SERVICE="$1"
+  echo "Cloud service configured for packaging."
 }
 
 upload_pkg() {

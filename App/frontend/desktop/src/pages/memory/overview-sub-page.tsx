@@ -15,11 +15,14 @@ import { type RemoteData, toErrorMessage } from "./remote-state.js";
 
 interface OverviewCountCard {
   id: "memories" | "skills" | "experiences" | "worldModels";
+  targetPage: OverviewCountTargetPage;
   labelKey: MessageKey;
   value: number;
   hintKey: MessageKey;
   icon: ReactNode;
 }
+
+type OverviewCountTargetPage = "memories" | "policies" | "world-model" | "skills";
 
 interface DailyActivityCell {
   date: string;
@@ -56,6 +59,7 @@ interface ActivityGridLayout {
 
 export interface OverviewSubPageProps {
   client: MemoryRuntimeClient | null;
+  onNavigate: (page: OverviewCountTargetPage) => void;
 }
 
 export function loadOverviewData(client: MemoryRuntimeClient): Promise<PanelOverviewOutput> {
@@ -90,10 +94,13 @@ export function OverviewSubPage(props: OverviewSubPageProps) {
     };
   }, [props.client, t]);
 
-  return <OverviewSubPageView state={state} />;
+  return <OverviewSubPageView state={state} onNavigate={props.onNavigate} />;
 }
 
-export function OverviewSubPageView(props: { state: RemoteData<PanelOverviewOutput> }) {
+export function OverviewSubPageView(props: {
+  state: RemoteData<PanelOverviewOutput>;
+  onNavigate: (page: OverviewCountTargetPage) => void;
+}) {
   const { t } = useTranslation();
 
   return (
@@ -107,12 +114,15 @@ export function OverviewSubPageView(props: { state: RemoteData<PanelOverviewOutp
 
       {props.state.status === "loading" && <StateBox message={t("memory.overview.loading")} />}
       {props.state.status === "error" && <StateBox message={props.state.message} tone="error" />}
-      {props.state.status === "ready" && <OverviewContent data={props.state.data} />}
+      {props.state.status === "ready" && <OverviewContent data={props.state.data} onNavigate={props.onNavigate} />}
     </section>
   );
 }
 
-function OverviewContent(props: { data: PanelOverviewOutput }) {
+function OverviewContent(props: {
+  data: PanelOverviewOutput;
+  onNavigate: (page: OverviewCountTargetPage) => void;
+}) {
   const countCards = buildCountCards(props.data);
 
   return (
@@ -123,7 +133,7 @@ function OverviewContent(props: { data: PanelOverviewOutput }) {
         style={{ gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 150px), 1fr))" }}
       >
         {countCards.map((item) => (
-          <CountCard key={item.id} item={item} />
+          <CountCard key={item.id} item={item} onNavigate={props.onNavigate} />
         ))}
       </div>
 
@@ -135,18 +145,27 @@ function OverviewContent(props: { data: PanelOverviewOutput }) {
 
 function buildCountCards(data: PanelOverviewOutput): OverviewCountCard[] {
   return [
-    { id: "memories", labelKey: "memory.overview.memories", value: data.counts.memories, hintKey: "memory.overview.memoriesHint", icon: <BrainCircuit size={18} /> },
-    { id: "experiences", labelKey: "memory.overview.policies", value: data.counts.experiences, hintKey: "memory.overview.policiesHint", icon: <Sparkles size={18} /> },
-    { id: "worldModels", labelKey: "memory.overview.worldModels", value: data.counts.worldModels, hintKey: "memory.overview.worldModelsHint", icon: <Globe2 size={18} /> },
-    { id: "skills", labelKey: "memory.overview.skills", value: data.counts.skills, hintKey: "memory.overview.skillsHint", icon: <Wand2 size={18} /> }
+    { id: "memories", targetPage: "memories", labelKey: "memory.overview.memories", value: data.counts.memories, hintKey: "memory.overview.memoriesHint", icon: <BrainCircuit size={18} /> },
+    { id: "experiences", targetPage: "policies", labelKey: "memory.overview.policies", value: data.counts.experiences, hintKey: "memory.overview.policiesHint", icon: <Sparkles size={18} /> },
+    { id: "worldModels", targetPage: "world-model", labelKey: "memory.overview.worldModels", value: data.counts.worldModels, hintKey: "memory.overview.worldModelsHint", icon: <Globe2 size={18} /> },
+    { id: "skills", targetPage: "skills", labelKey: "memory.overview.skills", value: data.counts.skills, hintKey: "memory.overview.skillsHint", icon: <Wand2 size={18} /> }
   ];
 }
 
-function CountCard(props: { item: OverviewCountCard }) {
+function CountCard(props: {
+  item: OverviewCountCard;
+  onNavigate: (page: OverviewCountTargetPage) => void;
+}) {
   const { t } = useTranslation();
 
   return (
-    <article className="bg-background-paper border-content-panel rounded-card p-4 flex flex-col justify-between" style={{ minHeight: 132 }}>
+    <button
+      type="button"
+      data-overview-target={props.item.targetPage}
+      onClick={() => props.onNavigate(props.item.targetPage)}
+      className="w-full bg-background-paper border-content-panel rounded-card p-4 flex flex-col justify-between text-left transition-all cursor-pointer hover:bg-canvas-oat/25 hover:border-action-sky/30 active:scale-[0.99] outline-none focus-visible:ring-2 focus-visible:ring-action-sky/25"
+      style={{ minHeight: 132 }}
+    >
       <div className="flex items-start justify-between gap-3">
         <div className="text-xs text-text-ink/60">{t(props.item.labelKey)}</div>
         <span className="w-8 h-8 rounded-card bg-action-sky/10 text-action-sky flex items-center justify-center shrink-0">
@@ -157,7 +176,7 @@ function CountCard(props: { item: OverviewCountCard }) {
         <div className="text-2xl font-extrabold text-text-ink tabular-nums">{formatInteger(props.item.value)}</div>
         <div className="mt-1 text-[11px] leading-snug text-text-ink/45">{t(props.item.hintKey)}</div>
       </div>
-    </article>
+    </button>
   );
 }
 

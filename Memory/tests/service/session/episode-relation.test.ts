@@ -912,6 +912,115 @@ describe("MemoryService / session / episode relation", () => {
     db.close();
   });
 
+  it("runs memory retrieval while the relation classifier is still pending", async () => {
+    let signalRelationStarted: (() => void) | undefined;
+    let releaseRelation: (() => void) | undefined;
+    const relationStarted = new Promise<void>((resolve) => {
+      signalRelationStarted = resolve;
+    });
+    const relationRelease = new Promise<void>((resolve) => {
+      releaseRelation = resolve;
+    });
+    let retrievalExtractStarted = false;
+    const llm: LlmClient = {
+      config: {
+        ...DEFAULT_MEMMY_CONFIG.summary,
+        provider: "host",
+        endpoint: "http://127.0.0.1/parallel-turn-start",
+        model: "parallel-turn-start"
+      },
+      isConfigured() {
+        return true;
+      },
+      async complete() {
+        return "{}";
+      },
+      async completeJson<T extends Record<string, unknown>>(
+        _messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+        options: { operation: string }
+      ): Promise<T> {
+        if (options.operation === "relation.classify.v1") {
+          signalRelationStarted?.();
+          await relationRelease;
+          return {
+            relation: "new_task",
+            confidence: 0.95,
+            reason: "the database task is unrelated to nginx"
+          } as unknown as T;
+        }
+        if (options.operation === "retrieval.retrieval.query.extract.v2") {
+          retrievalExtractStarted = true;
+          return {
+            queryVecText: "database certificate rotation",
+            keywords: ["database", "certificate"]
+          } as unknown as T;
+        }
+        return { ranked: [1], sufficient: true } as unknown as T;
+      },
+      status() {
+        return {
+          provider: "host",
+          model: "parallel-turn-start",
+          configured: true,
+          remote: true
+        };
+      }
+    };
+    const config = {
+      ...DEFAULT_MEMMY_CONFIG,
+      algorithm: {
+        ...DEFAULT_MEMMY_CONFIG.algorithm,
+        retrieval: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.retrieval,
+          llmFilterEnabled: false
+        }
+      }
+    };
+    const { db, service } = createTestService({ llm, config });
+    const session = service.openSession({
+      namespace: {
+        source: "codex",
+        profileId: "jiang",
+        userId: "user-parallel-turn-start"
+      }
+    });
+    const first = service.completeTurn("turn-parallel-first", {
+      sessionId: session.sessionId,
+      query: "Configure nginx TLS for the service",
+      answer: "Use port 443 and verify the certificate chain."
+    });
+
+    const startPromise = service.startTurn({
+      turnId: "turn-parallel-next",
+      sessionId: session.sessionId,
+      query: "Database certificate rotation details please"
+    });
+    await relationStarted;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const retrievalStartedBeforeRelationCompleted = retrievalExtractStarted;
+    releaseRelation?.();
+    const started = await startPromise;
+
+    expect(retrievalStartedBeforeRelationCompleted).toBe(true);
+    const recall = db.db.prepare(
+      "SELECT request_json FROM recall_events WHERE id = ?"
+    ).get(started.searchEventId) as { request_json: string };
+    expect(JSON.parse(recall.request_json)).toMatchObject({
+      routeProposal: {
+        action: "split",
+        baseEpisodeId: first.episodeId,
+        relationDecision: { relation: "new_task" }
+      }
+    });
+
+    const completed = service.completeTurn("turn-parallel-next", {
+      sessionId: session.sessionId,
+      query: "Database certificate rotation details please",
+      answer: "Rotate the database certificate and reload the client."
+    });
+    expect(completed.episodeId).not.toBe(first.episodeId);
+  });
+
   it("uses the account summary model for relation classification", async () => {
     const root = createTestRoot("mindock-memory-account-relation-");
     const db = new MemoryDb({

@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const checkOnly = process.argv.includes("--check");
+const checkOnly = process.argv.includes("--check") || process.env.MEMMY_VERSION_SYNC_CHECK_ONLY === "1";
 const rootManifestPath = join(root, "package.json");
 const rootManifest = await readJson(rootManifestPath);
 const version = rootManifest.version;

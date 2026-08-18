@@ -2,7 +2,7 @@
 import { fileURLToPath } from "node:url";
 import type { AliasOptions, UserConfig } from "vite";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import viteConfig from "../../vite.config.js";
+import viteConfig, { PUBLIC_MEMMY_RENDERER_ENV_KEYS } from "../../vite.config.js";
 
 type AliasEntry = {
   /** Find. */
@@ -40,6 +40,18 @@ describe("vite workspace resolution", () => {
     vi.stubEnv("MEMMY_LEGAL_INTL_BASE_URL", "https://valid.test");
 
     expect(() => resolveConfig("development")).toThrow(/MEMMY_LEGAL_CN_BASE_URL/);
+  });
+
+  it("exposes only the explicit public MEMMY allowlist to renderer code", () => {
+    vi.stubEnv("MEMMY_PRIVATE_TOKEN", "must-not-be-rendered");
+    const config = resolveConfig("test");
+
+    expect(config.envPrefix).toEqual(["VITE_"]);
+    expect(Object.keys(config.define ?? {}).sort()).toEqual(
+      PUBLIC_MEMMY_RENDERER_ENV_KEYS.map((key) => `import.meta.env.${key}`).sort(),
+    );
+    expect(JSON.stringify(config.define)).not.toContain("MEMMY_PRIVATE_TOKEN");
+    expect(JSON.stringify(config.define)).not.toContain("must-not-be-rendered");
   });
 });
 

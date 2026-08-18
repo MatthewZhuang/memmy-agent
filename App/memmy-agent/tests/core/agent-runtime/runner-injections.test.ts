@@ -49,7 +49,9 @@ function drainArray(items: any[]): ({ limit }?: { limit?: number }) => any[] {
   return ({ limit = MAX_INJECTIONS_PER_TURN } = {}) => items.splice(0, limit);
 }
 
-async function waitUntil(predicate: () => boolean, timeout = 1000): Promise<void> {
+// Full-suite workers can spend more than one second initializing runtime tools
+// before the loop begins draining its already-buffered inbound queue.
+async function waitUntil(predicate: () => boolean, timeout = 5000): Promise<void> {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     if (predicate()) return;

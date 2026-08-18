@@ -6,6 +6,7 @@ DESKTOP_DIR="$ROOT_DIR/App/shell/desktop"
 AGENT_DIR="$ROOT_DIR/App/memmy-agent"
 MEMORY_DIR="$ROOT_DIR/Memory"
 MIGRATIONS_DIR="$ROOT_DIR/Migrations"
+LOCAL_API_CONTRACTS_DIR="$ROOT_DIR/App/backend/local-api-contracts"
 RUNTIME_DIR="$DESKTOP_DIR/dist/runtime"
 MIGRATIONS_STAGING_DIR="$DESKTOP_DIR/dist/Migrations"
 CLI_BIN_DIR="$RUNTIME_DIR/bin"
@@ -84,13 +85,11 @@ write_desktop_edition_manifest() {
       ;;
   esac
 
-  cat > "$DESKTOP_DIR/dist/main/desktop-edition.json" <<EOF
-{
-  "edition": "$edition",
-  "accountChannel": "$account_channel",
-  "signing": "$package_signing"
-}
-EOF
+  node "$ROOT_DIR/scripts/internal/shared/write-desktop-edition-manifest.mjs" \
+    --output "$DESKTOP_DIR/dist/main/desktop-edition.json" \
+    --edition "$edition" \
+    --account-channel "$account_channel" \
+    --signing "$package_signing"
 }
 
 # Resolves NSMicrophoneUsageDescription from the package edition (cn/intl).
@@ -316,20 +315,29 @@ EOF
 create_memory_runtime_manifest() {
   local output_dir="$1"
 
-  ROOT_DIR="$ROOT_DIR" MEMORY_DIR="$MEMORY_DIR" MEMORY_RUNTIME_DIR="$output_dir" node --input-type=module <<'NODE'
+  ROOT_DIR="$ROOT_DIR" MEMORY_DIR="$MEMORY_DIR" MEMORY_RUNTIME_DIR="$output_dir" \
+    LOCAL_API_CONTRACTS_DIR="$LOCAL_API_CONTRACTS_DIR" MIGRATIONS_DIR="$MIGRATIONS_DIR" \
+    node --input-type=module <<'NODE'
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const rootDir = requiredEnv("ROOT_DIR");
 const memoryDir = requiredEnv("MEMORY_DIR");
 const runtimeDir = requiredEnv("MEMORY_RUNTIME_DIR");
+const contractsDir = requiredEnv("LOCAL_API_CONTRACTS_DIR");
+const migrationsDir = requiredEnv("MIGRATIONS_DIR");
 const runtimeName = "memmy-memory-runtime";
 const projectPackage = JSON.parse(await readFile(join(rootDir, "package.json"), "utf8"));
 const runtimeVersion = projectPackage.version;
 
 const memoryPackage = JSON.parse(await readFile(join(memoryDir, "package.json"), "utf8"));
+const contractsPackage = JSON.parse(await readFile(join(contractsDir, "package.json"), "utf8"));
+const migrationsPackage = JSON.parse(await readFile(join(migrationsDir, "package.json"), "utf8"));
 const rootLock = JSON.parse(await readFile(join(rootDir, "package-lock.json"), "utf8"));
-const dependencies = memoryPackage.dependencies ?? {};
+const dependencies = { ...(memoryPackage.dependencies ?? {}) };
+delete dependencies["@memmy/local-api-contracts"];
+delete dependencies["@memmy/migrations"];
+Object.assign(dependencies, contractsPackage.dependencies, migrationsPackage.dependencies);
 const runtimePackage = {
   name: runtimeName,
   version: runtimeVersion,
@@ -586,6 +594,11 @@ verify_mac_agent_native_artifacts() {
   local target_cpu="$1"
   local node_pty_dir="$RUNTIME_DIR/memmy-agent/node_modules/openclaw/node_modules/@lydell/node-pty-darwin-$target_cpu/prebuilds/darwin-$target_cpu"
 
+  require_packaged_runtime_file "$RUNTIME_DIR/memmy-agent/node_modules/@memmy/local-api-contracts/dist/index.js"
+  if [ -L "$RUNTIME_DIR/memmy-agent/node_modules/@memmy/local-api-contracts" ]; then
+    echo "Packaged local API contracts must not be a symbolic link." >&2
+    exit 1
+  fi
   require_packaged_runtime_file "$node_pty_dir/pty.node"
   require_packaged_runtime_file "$node_pty_dir/spawn-helper"
   require_packaged_runtime_glob "$RUNTIME_DIR/memmy-agent/node_modules/openclaw/node_modules/sqlite-vec-darwin-$target_cpu/vec0.*"
@@ -610,6 +623,7 @@ verify_packaged_mac_unpacked_artifacts() {
   local packaged_embedding_model="$app_path/Contents/Resources/embedding-models/$EMBEDDING_MODEL_ID"
 
   require_packaged_runtime_file "$app_path/Contents/Resources/app.asar"
+  verify_packaged_runtime_config_boundary "$app_path/Contents/Resources"
   require_packaged_runtime_glob "$unpacked_runtime/memory/node_modules/onnxruntime-node/bin/napi-v3/darwin/$target_cpu/libonnxruntime*.dylib"
   require_packaged_runtime_glob "$unpacked_runtime/memory/node_modules/@img/sharp-libvips-darwin-$target_cpu/lib/libvips*.dylib"
   require_packaged_runtime_file "$unpacked_runtime/memmy-agent/node_modules/@memmy/migrations/dist/index.js"
@@ -623,11 +637,27 @@ verify_packaged_mac_unpacked_artifacts() {
   require_packaged_runtime_file "$unpacked_runtime/memmy-agent/node_modules/openclaw/node_modules/@lydell/node-pty-darwin-$target_cpu/prebuilds/darwin-$target_cpu/spawn-helper"
 }
 
+verify_packaged_runtime_config_boundary() {
+  local resources_root="$1"
+  local asar_file="$resources_root/app.asar"
+  local forbidden_env
+
+  forbidden_env="$(find "$resources_root" \( -type f -o -type l \) \( -name ".env" -o -name ".env.*" \) -print -quit)"
+  if [ -n "$forbidden_env" ]; then
+    echo "Packaged resources contain a forbidden environment file." >&2
+    exit 1
+  fi
+  node "$ROOT_DIR/scripts/internal/shared/verify-packaged-asar.mjs" \
+    --asar "$asar_file" \
+    --expected "$DESKTOP_VERSION"
+}
+
 prune_mac_runtime_artifacts() {
   local target_cpu="$1"
 
   echo "Pruning macOS runtime artifacts for darwin-$target_cpu."
   find "$RUNTIME_DIR" -type f -name "*.map" -delete
+  node "$ROOT_DIR/scripts/internal/shared/prune-runtime-env-files.mjs" "$RUNTIME_DIR"
   prune_node_modules_non_runtime_files "$RUNTIME_DIR"
   rm -f "$RUNTIME_DIR/memmy-agent/dist/skills/README.md"
 
@@ -641,7 +671,28 @@ prune_mac_runtime_artifacts() {
 }
 
 cd "$ROOT_DIR"
-node scripts/sync-project-version.mjs
+if [ -n "${MEMMY_DESKTOP_VERSION:-}" ]; then
+  DESKTOP_VERSION="$MEMMY_DESKTOP_VERSION"
+else
+  DESKTOP_VERSION="$(node -p "require('$DESKTOP_DIR/package.json').version")"
+fi
+node scripts/internal/shared/verify-package-version.mjs --expected "$DESKTOP_VERSION"
+export MEMMY_VERSION_SYNC_CHECK_ONLY=1
+
+for builder_arg in "$@"; do
+  case "$builder_arg" in
+    --config.extraMetadata.version="$DESKTOP_VERSION")
+      ;;
+    --config.extraMetadata.version|--config.extraMetadata.version=*)
+      echo "Desktop package version metadata must match $DESKTOP_VERSION." >&2
+      exit 1
+      ;;
+    --config|--config=*|--config.extraMetadata|--config.extraMetadata=*)
+      echo "Desktop package configuration is managed by the packaging scripts." >&2
+      exit 1
+      ;;
+  esac
+done
 
 BUILDER_CONFIG="electron-builder.yml"
 TARGET_CPU="$(resolve_target_cpu "$@")"
@@ -665,6 +716,9 @@ fi
 echo "Building migrations package."
 npm --prefix "$MIGRATIONS_DIR" run build
 
+echo "Building local API contracts package."
+npm run build -w @memmy/local-api-contracts
+
 echo "Installing memmy-agent dependencies."
 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --prefix "$AGENT_DIR"
 
@@ -685,6 +739,17 @@ cp -R "$MEMORY_DIR/dist/src" "$RUNTIME_DIR/memory/src"
 cp -R "$AGENT_DIR/dist" "$RUNTIME_DIR/memmy-agent/dist"
 create_memory_runtime_manifest "$RUNTIME_DIR/memory"
 npm ci --prefix "$RUNTIME_DIR/memory" --omit=dev --os=darwin --cpu="$TARGET_CPU"
+mkdir -p \
+  "$RUNTIME_DIR/memory/node_modules/@memmy/local-api-contracts" \
+  "$RUNTIME_DIR/memory/node_modules/@memmy/migrations"
+cp "$LOCAL_API_CONTRACTS_DIR/package.json" \
+  "$RUNTIME_DIR/memory/node_modules/@memmy/local-api-contracts/package.json"
+cp -R "$LOCAL_API_CONTRACTS_DIR/dist" \
+  "$RUNTIME_DIR/memory/node_modules/@memmy/local-api-contracts/dist"
+cp "$MIGRATIONS_STAGING_DIR/package.json" \
+  "$RUNTIME_DIR/memory/node_modules/@memmy/migrations/package.json"
+cp -R "$MIGRATIONS_STAGING_DIR/dist" \
+  "$RUNTIME_DIR/memory/node_modules/@memmy/migrations/dist"
 ELECTRON_VERSION="$(node -p "require('./App/shell/desktop/node_modules/electron/package.json').version")"
 node_modules/.bin/electron-rebuild \
   -f \
@@ -695,6 +760,19 @@ node_modules/.bin/electron-rebuild \
 cp "$AGENT_DIR/package.json" "$RUNTIME_DIR/memmy-agent/package.json"
 cp "$AGENT_DIR/package-lock.json" "$RUNTIME_DIR/memmy-agent/package-lock.json"
 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --prefix "$RUNTIME_DIR/memmy-agent" --omit=dev --os=darwin --cpu="$TARGET_CPU"
+RUNTIME_LOCAL_API_CONTRACTS_DIR="$RUNTIME_DIR/memmy-agent/node_modules/@memmy/local-api-contracts"
+rm -rf "$RUNTIME_LOCAL_API_CONTRACTS_DIR"
+mkdir -p "$RUNTIME_LOCAL_API_CONTRACTS_DIR"
+cp "$LOCAL_API_CONTRACTS_DIR/package.json" "$RUNTIME_LOCAL_API_CONTRACTS_DIR/package.json"
+cp -R "$LOCAL_API_CONTRACTS_DIR/dist" "$RUNTIME_LOCAL_API_CONTRACTS_DIR/dist"
+if [ -L "$RUNTIME_LOCAL_API_CONTRACTS_DIR" ]; then
+  echo "Packaged local API contracts must not be a symbolic link." >&2
+  exit 1
+fi
+if [ ! -f "$RUNTIME_LOCAL_API_CONTRACTS_DIR/dist/index.js" ]; then
+  echo "Packaged local API contracts entrypoint is missing." >&2
+  exit 1
+fi
 RUNTIME_MIGRATIONS_DIR="$RUNTIME_DIR/memmy-agent/node_modules/@memmy/migrations"
 rm -rf "$RUNTIME_MIGRATIONS_DIR"
 mkdir -p "$RUNTIME_MIGRATIONS_DIR"
@@ -719,7 +797,12 @@ fi
     import fs from "node:fs";
     import path from "node:path";
     import { createRequire } from "node:module";
-    import { runMigrations } from "@memmy/migrations";
+    import {
+      CURRENT_MIGRATION_STATE_FORMAT_VERSION,
+      SUPPORTED_MIGRATION_STATE_FORMAT_VERSIONS,
+      runMigrations,
+    } from "@memmy/migrations";
+    import { cloudServiceFromDesktopRuntimeManifest } from "@memmy/local-api-contracts";
     import { createConnection } from "@playwright/mcp";
     import { chromium } from "playwright";
     const require = createRequire(import.meta.url);
@@ -731,6 +814,8 @@ fi
     const playwrightPackage = require(playwrightPath);
     const corePackage = require(corePath);
     if (typeof runMigrations !== "function") throw new Error("Migrations runtime export is unavailable");
+    if (typeof cloudServiceFromDesktopRuntimeManifest !== "function") throw new Error("Local API contracts runtime export is unavailable");
+    if (CURRENT_MIGRATION_STATE_FORMAT_VERSION !== 2 || JSON.stringify(SUPPORTED_MIGRATION_STATE_FORMAT_VERSIONS) !== "[1,2]") throw new Error("Migrations runtime state compatibility mismatch");
     if (typeof createConnection !== "function" || typeof chromium?.executablePath !== "function") throw new Error("Playwright MCP runtime exports are unavailable");
     if (mcpPackage.version !== runtimePackage.dependencies["@playwright/mcp"]) throw new Error("Playwright MCP runtime version mismatch");
     if (playwrightPackage.version !== runtimePackage.dependencies.playwright || corePackage.version !== runtimePackage.dependencies.playwright) throw new Error("Playwright runtime version mismatch");
@@ -752,6 +837,9 @@ create_dmg_cli_installer_command "$DMG_HELPER_DIR/Install CLI.command"
 prune_mac_runtime_artifacts "$TARGET_CPU"
 verify_mac_memory_native_artifacts "$TARGET_CPU"
 verify_mac_agent_native_artifacts "$TARGET_CPU"
+node "$ROOT_DIR/scripts/internal/shared/verify-package-version.mjs" \
+  --expected "$DESKTOP_VERSION" \
+  --runtime-root "$RUNTIME_DIR"
 node "$ROOT_DIR/scripts/internal/shared/prepare-embedding-model.mjs" "$EMBEDDING_MODELS_DIR"
 
 if [ "${MEMMY_PACKAGE_PREPARE_ONLY:-}" = "1" ]; then

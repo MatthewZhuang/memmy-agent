@@ -10,6 +10,15 @@ const DEFAULT_MEMMY_AGENT_WEBUI_BASE_URL = "http://127.0.0.1:18980";
 const RUNTIME_CONFIG_ENDPOINT = "/__memmy_runtime_config";
 const LOCAL_API_CONTRACTS_SOURCE = fileURLToPath(new URL("../../backend/local-api-contracts/src/index.ts", import.meta.url));
 const LEGAL_BASE_URL_ENV_KEYS = ["MEMMY_LEGAL_CN_BASE_URL", "MEMMY_LEGAL_INTL_BASE_URL"] as const;
+export const PUBLIC_MEMMY_RENDERER_ENV_KEYS = [
+  "MEMMY_ACCOUNT_CHANNEL",
+  "MEMMY_APP_EDITION",
+  "MEMMY_CLOUD_SERVICE",
+  "MEMMY_GA4_MEASUREMENT_ID",
+  "MEMMY_LEGAL_CN_BASE_URL",
+  "MEMMY_LEGAL_INTL_BASE_URL",
+  "MEMMY_PACKAGE_SIGNING",
+] as const;
 // Definition for repo root dir.
 const REPO_ROOT_DIR = fileURLToPath(new URL("../../../", import.meta.url));
 
@@ -40,13 +49,20 @@ export default defineConfig(({ mode }) => {
   validateLegalEnv(validationEnv);
   const memmyAgentTarget = env.VITE_MEMMY_AGENT_WEBUI_URL?.trim() || DEFAULT_MEMMY_AGENT_WEBUI_BASE_URL;
   const memmyAgentWsTarget = memmyAgentTarget.replace(/^http/, "ws");
+  const publicMemmyEnv = Object.fromEntries(
+    PUBLIC_MEMMY_RENDERER_ENV_KEYS.map((key) => [
+      `import.meta.env.${key}`,
+      validationEnv[key] === undefined ? "undefined" : JSON.stringify(validationEnv[key]?.trim()),
+    ]),
+  );
 
   return {
     // Base.
     base: "./",
     // Env dir.
     envDir: REPO_ROOT_DIR,
-    envPrefix: ["VITE_", "MEMMY_"],
+    envPrefix: ["VITE_"],
+    define: publicMemmyEnv,
     plugins: [react(), memmyRuntimeConfigPlugin()],
     resolve: {
       alias: [

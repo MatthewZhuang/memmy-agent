@@ -20,6 +20,7 @@ import {
   resolveAgentSourceScanButtonState,
   resolveAgentSourceConnectionAction,
   resolveManagedAgentSourceSyncButtonState,
+  resolveMemoryDocsUrl,
   resolveAgentSourceStatusLabelKey,
   resolveScanContinueSourceId,
   MANUAL_AGENT_NAME_PRESETS,
@@ -96,6 +97,10 @@ describe("SourcesSubPage", () => {
     expect(html).toContain("发现新 Agent 时自动接入");
     expect(html).toContain("自动安装接入组件；关闭后只出现在下方列表，由你手动接入");
     expect(html).toContain("~/.local/bin/memmy-memory");
+    expect(html).toContain('aria-label="查看记忆服务文档"');
+    expect(html).toContain(">了解更多</span>");
+    expect(html).toContain("lucide-external-link");
+    expect(html).not.toContain('data-icon="codex-help-circle"');
     expect(html).not.toContain("或安装原生插件接入记忆");
     expect(html).toContain("memory-panel__header memory-panel__header--single-line");
     expect(html).toContain("memory-panel__title");
@@ -104,7 +109,8 @@ describe("SourcesSubPage", () => {
     expect(html).toContain("同步新增");
     expect(html).toContain("点击“同步新增”按钮后，只会读取上次同步后产生的新对话");
     expect(html).not.toContain("上次扫描水位");
-    expect(html).toContain("高级操作");
+    expect(html).toContain("高级");
+    expect(html).not.toContain("高级操作");
     expect(html).not.toContain("添加其他 Agent");
     expect(html).toContain("本地数据存储位置");
     expect(html).toContain("清除所有本地数据");
@@ -128,8 +134,10 @@ describe("SourcesSubPage", () => {
     expect(source).toContain('variant="soft"');
     expect(source).toContain("manual-source-modal__footer");
     expect(source).toContain("options={MANUAL_AGENT_NAME_PRESETS}");
-    expect(source).toContain('import { Select } from "../components/Select.js";');
-    expect(source).toContain('className="select-control--subtle"');
+    expect(source).toContain('role="combobox"');
+    expect(source).toContain('aria-autocomplete="list"');
+    expect(source).toContain("manual-agent-combobox__menu");
+    expect(source).not.toContain('import { Select } from "../components/Select.js";');
     expect(source).not.toContain("<datalist");
     expect(source).not.toContain("fixed inset-0 z-50 flex items-center justify-center bg-text-ink/25 backdrop-blur-sm");
   });
@@ -138,6 +146,16 @@ describe("SourcesSubPage", () => {
     expect(MANUAL_AGENT_NAME_PRESETS).toEqual(["kimi code", "zcode", "minimax code", "coder"]);
     expect(zhCNMessages["memory.addOtherAgentDescription"]).toContain("选择或输入");
     expect(enUSMessages["memory.addOtherAgentDescription"]).toContain("Choose or enter");
+  });
+
+  it("手动添加 Agent 可以提供可选的历史会话路径", () => {
+    const source = readFileSync(resolve(__dirname, "..", "..", "memory-sources-page.tsx"), "utf8");
+
+    expect(zhCNMessages["memory.manualHistoryPathLabel"]).toBe("历史会话路径（可选）");
+    expect(enUSMessages["memory.manualHistoryPathLabel"]).toBe("Conversation history path (optional)");
+    expect(source).toContain('id="manual-agent-history-path"');
+    expect(source).toContain("value={manualHistoryPath}");
+    expect(source).toContain('launchManagedAgentTask(source, "connect", userProvidedDataPath || undefined)');
   });
 
   it("新增 Agent 立即写入页面状态，并在重新进入页面时从后端刷新", () => {
@@ -165,6 +183,20 @@ describe("SourcesSubPage", () => {
     expect(prompt).not.toContain("sync_boundary_at");
   });
 
+  it("把用户填写的历史会话路径作为候选路径交给 Memmy 验证", () => {
+    const prompt = buildManagedAgentTaskPrompt({
+      sourceId: "manual-1",
+      displayName: "Aider",
+      dataPath: MANAGED_AGENT_DISCOVERY_PENDING_DATA_PATH
+    }, "connect", "  ~/.aider/history  ");
+
+    expect(prompt).toContain('"data_path": "~/.aider/history"');
+    expect(prompt).toContain("explicitly supplied by the user in the GUI");
+    expect(prompt).toContain("inspect this scoped candidate first, and verify it before use");
+    expect(prompt).toContain("ask for a corrected path instead of silently replacing it");
+    expect(prompt).not.toMatch(/[\u3400-\u9fff]/u);
+  });
+
   it("未知 Agent 后续同步直接调用后端配方，不再启动 Agent 会话", () => {
     const source = readFileSync(resolve(__dirname, "..", "..", "memory-sources-page.tsx"), "utf8");
 
@@ -180,6 +212,8 @@ describe("SourcesSubPage", () => {
       "memory.addTitle",
       "memory.confirmAndStart",
       "memory.manualAgentAiHint",
+      "memory.manualHistoryPathLabel",
+      "memory.manualPathHint",
       "memory.deleteAgent"
     ] as const;
 
@@ -235,6 +269,20 @@ describe("SourcesSubPage", () => {
     expect(formatMemoryServiceAddress(undefined)).toBeUndefined();
     expect(zhCNMessages["memory.restartService"]).toBe("重启服务");
     expect(zhCNMessages).not.toHaveProperty("memory.daemonAddress");
+  });
+
+  it("记忆服务帮助入口按应用版本打开对应官网文档", () => {
+    expect(resolveMemoryDocsUrl("intl")).toBe("https://memmy.bot/docs/memory/overview/");
+    expect(resolveMemoryDocsUrl("INTL")).toBe("https://memmy.bot/docs/memory/overview/");
+    expect(resolveMemoryDocsUrl("cn")).toBe("https://memmy.cn/docs/memory/overview/");
+    expect(resolveMemoryDocsUrl(undefined)).toBe("https://memmy.cn/docs/memory/overview/");
+
+    const source = readFileSync(resolve(__dirname, "..", "..", "memory-sources-page.tsx"), "utf8");
+    expect(source).toContain("openExternalUrl(resolveMemoryDocsUrl())");
+    expect(zhCNMessages["memory.openDocs"]).toBe("查看记忆服务文档");
+    expect(enUSMessages["memory.openDocs"]).toBe("View memory service documentation");
+    expect(zhCNMessages["memory.learnMore"]).toBe("了解更多");
+    expect(enUSMessages["memory.learnMore"]).toBe("Learn more");
   });
 
   it("接入源不可用时展示用户文案而不是 HTTP 调试信息", () => {

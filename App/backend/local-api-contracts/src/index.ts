@@ -6,6 +6,7 @@ export * from "./model-catalog-resolver.js";
 export * from "./memory-runtime.js";
 export * from "./endpoints.js";
 export * from "./cloud-service.js";
+export * from "./desktop-runtime-manifest.js";
 
 export const MANAGED_AGENT_DISCOVERY_PENDING_DATA_PATH = "memmy-agent://history-discovery-pending";
 

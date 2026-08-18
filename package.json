@@ -1,6 +1,6 @@
 {
   "name": "memmy-agent",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "private": true,
   "type": "module",
   "description": "Local-first agent memory substrate with desktop and CLI surfaces.",
@@ -24,8 +24,9 @@
     "build": "npm run memory:build && npm run workspace:build",
     "lint": "npm run memory:lint && npm run workspace:lint",
     "typecheck": "npm run memory:lint && npm run workspace:typecheck",
-    "test": "npm run test:release-workflow && npm run memory:test && npm run workspace:test && npm run agent:test:tui-cursor",
+    "test": "npm run test:release-workflow && npm run test:packaging-guards && npm run memory:test && npm run workspace:test && npm run agent:test:tui-cursor",
     "test:release-workflow": "vitest run tests/release-workflow.test.ts",
+    "test:packaging-guards": "vitest run tests/package-version-guard.test.mjs tests/packaged-runtime-config.test.mjs",
     "serve": "npm run memory:serve",
     "serve:local": "npm run memory:serve:local",
     "serve:dev": "npm run memory:serve:dev",
@@ -74,10 +75,12 @@
     "node": ">=20"
   },
   "devDependencies": {
+    "@electron/asar": "3.4.1",
     "@eslint/js": "^9.39.4",
     "@types/node": "^25.9.1",
     "@vitest/coverage-v8": "^4.1.7",
     "concurrently": "^9.2.1",
+    "dotenv": "^16.6.1",
     "eslint": "^9.39.4",
     "eslint-import-resolver-typescript": "^4.4.4",
     "eslint-plugin-import": "^2.32.0",

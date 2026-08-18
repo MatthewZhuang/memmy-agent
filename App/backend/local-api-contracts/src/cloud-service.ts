@@ -8,7 +8,7 @@ export function resolveCloudServiceBaseUrl(raw: string | undefined): string {
   const normalized = raw?.trim();
   if (!normalized) {
     throw new Error(
-      `${CLOUD_SERVICE_ENV_KEY} 未配置:网关地址唯一来源是仓库根 .env,请确认入口已加载该文件。`
+      `${CLOUD_SERVICE_ENV_KEY} 未配置:请确认外部环境、打包运行时清单或开发环境 .env 已提供网关地址。`
     );
   }
   return normalized;

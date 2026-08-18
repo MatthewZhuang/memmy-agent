@@ -9,13 +9,16 @@ import YAML from "yaml";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AgentGatewaySupervisor,
+  ensureMemoryService,
   preparePackagedBrowser,
   preparePackagedRuntimeConfig,
+  readLiveMemoryServerLock,
   resolvePackagedRuntimeMigrationTargets,
   runPackagedMigrationCommand,
   restartExternalMemoryService,
   spawnNodeService,
   startPackagedBrowserPreparation,
+  stopManagedChild,
   syncBundledAgentSkills,
   type ManagedChild,
   type PackagedRuntimeConfig,
@@ -302,6 +305,87 @@ describe("packaged desktop runtime config", () => {
     await expect(stat(join(memmyHome, "memory-service"))).resolves.toBeTruthy();
     expect(recordValue(recordValue(config, "agents"), "defaults")).not.toHaveProperty("model");
     expect(recordValue(recordValue(config, "agents"), "defaults")).not.toHaveProperty("provider");
+  });
+
+  it("recognizes a live Memory server lock for the configured sqlite database", async () => {
+    const root = await makeTempRoot();
+    const databasePath = join(root, "memory.sqlite");
+    await writeFile(`${databasePath}.server.lock`, JSON.stringify({
+      pid: process.pid,
+      host: "127.0.0.1",
+      port: 18960,
+      sqlitePath: databasePath
+    }));
+
+    expect(readLiveMemoryServerLock(databasePath)).toEqual({
+      pid: process.pid,
+      host: "127.0.0.1",
+      port: 18960,
+      sqlitePath: databasePath
+    });
+  });
+
+  it("ignores a Memory server lock that names another sqlite database", async () => {
+    const root = await makeTempRoot();
+    const databasePath = join(root, "memory.sqlite");
+    await writeFile(`${databasePath}.server.lock`, JSON.stringify({
+      pid: process.pid,
+      sqlitePath: join(root, "other.sqlite")
+    }));
+
+    expect(readLiveMemoryServerLock(databasePath)).toBeNull();
+  });
+
+  it("waits for and reuses a live locked Memory service instead of spawning another", async () => {
+    const root = await makeTempRoot();
+    const databasePath = join(root, "memory.sqlite");
+    const reservation = createServer();
+    await new Promise<void>((resolveListen) => reservation.listen(0, "127.0.0.1", resolveListen));
+    const address = reservation.address();
+    if (!address || typeof address === "string") throw new Error("expected TCP address");
+    const port = address.port;
+    await new Promise<void>((resolveClose) => reservation.close(() => resolveClose()));
+    await writeFile(`${databasePath}.server.lock`, JSON.stringify({
+      pid: process.pid,
+      host: "127.0.0.1",
+      port,
+      sqlitePath: databasePath
+    }));
+
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ ok: true }));
+    });
+    testServers.push(server);
+    setTimeout(() => server.listen(port, "127.0.0.1"), 100);
+    const children: ManagedChild[] = [];
+
+    await ensureMemoryService(
+      { memoryEntry: join(root, "missing-memory.js"), agentEntry: join(root, "missing-agent.js") },
+      {
+        configPath: join(root, "config.yaml"),
+        agentWorkspace: join(root, "workspace"),
+        memoryDatabasePath: databasePath,
+        memoryBaseUrl: `http://127.0.0.1:${port}`,
+        memoryToken: "",
+        memoryListenHost: "127.0.0.1",
+        memoryListenPort: port,
+        agentGatewayBaseUrl: "http://127.0.0.1:18980",
+        agentGatewayHealthHost: "127.0.0.1",
+        agentGatewayHealthPort: 18970,
+        agentGatewayBootstrapSecret: "secret"
+      },
+      children,
+      {
+        appPath: root,
+        appDatabaseFile: join(root, "app.sqlite"),
+        resourcesPath: root,
+        logDirectory: root,
+        logLevel: "info"
+      }
+    );
+
+    expect(children).toHaveLength(0);
   });
 
   it("rereads the migrated workspace instead of pinning the pre-migration legacy value", async () => {
@@ -988,6 +1072,25 @@ describe("spawnNodeService 落盘与 env 注入", () => {
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
 
     expect(await readFile(logFile, "utf8")).toContain("debug");
+  });
+
+  it("强杀后等待 Memory 子进程真正退出", async () => {
+    const root = await makeTempRoot();
+    const entry = join(root, "stubborn-memory.js");
+    await writeFile(entry, [
+      "process.on('SIGTERM', () => {});",
+      "process.stdout.write('ready\\n');",
+      "setInterval(() => {}, 1000);"
+    ].join("\n"));
+    const managed = spawnNodeService("memory", entry, [], {}, {
+      logFilePath: join(root, "stubborn-memory.log"),
+      logLevel: "info"
+    });
+    await new Promise<void>((ready) => managed.process.stdout?.once("data", () => ready()));
+
+    await stopManagedChild(managed);
+
+    expect(managed.exitDescription).toBe("signal SIGKILL");
   });
 });
 

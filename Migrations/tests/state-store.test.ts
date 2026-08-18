@@ -3,6 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  CURRENT_MIGRATION_STATE_FORMAT_VERSION,
+  SUPPORTED_MIGRATION_STATE_FORMAT_VERSIONS,
+} from "../src/index.js";
+import {
   emptyMigrationState,
   getMigrationStatePaths,
   readMigrationState,
@@ -46,6 +50,25 @@ afterEach(async () => {
 });
 
 describe("migration state store", () => {
+  it("declares the v1 and v2 compatibility required by packaged runtimes", () => {
+    expect(CURRENT_MIGRATION_STATE_FORMAT_VERSION).toBe(2);
+    expect([...SUPPORTED_MIGRATION_STATE_FORMAT_VERSIONS]).toEqual([1, 2]);
+    expect(
+      validateMigrationState(
+        {
+          formatVersion: 2,
+          scope: "agent-workspace",
+          applied: [],
+        },
+        definitions,
+      ),
+    ).toEqual({
+      formatVersion: 2,
+      scope: "agent-workspace",
+      applied: [],
+    });
+  });
+
   it("normalizes v1 records to v2 workspace targets", () => {
     expect(
       validateMigrationState(

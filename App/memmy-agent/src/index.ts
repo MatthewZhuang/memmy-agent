@@ -1,4 +1,4 @@
-// Must load first: inject MEMMY_CLOUD_SERVICE from the repository root .env into process.env for later module evaluation.
+// Must load first: resolve MEMMY_CLOUD_SERVICE from external env, packaged manifest, or development .env.
 import "./load-env.js";
 export * from "./memmy-agent.js";
 export * as agentRuntime from "./core/agent-runtime/index.js";

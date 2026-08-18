@@ -807,18 +807,19 @@ export class SessionTurnService {
     const turnId = request.turnId ?? newId("turn");
     const intentDecision = classifyIntent(request.query);
     const endTopicDecision = explicitEndTopicDecision(request.query);
-    const routeProposal = await this.proposeEpisodeRouteWithLlm(
-      session,
+    const latestEpisode = this.deps.repos.runtime.latestEpisodeForSession(session.id);
+    const routeProposalPromise = this.proposeEpisodeRouteWithLlm(
+      latestEpisode,
       request.query,
       endTopicDecision
     );
     const contextHints = turnStartContextHints(request);
-    const search = await this.deps.search({
+    const searchPromise = this.deps.search({
       requestId: request.requestId,
       adapterId: request.adapterId,
       namespace: namespaceForSession(session),
       sessionId: session.id,
-      episodeId: routeProposal.baseEpisodeId,
+      episodeId: latestEpisode?.id,
       turnId,
       query: buildSearchQuery({ ...request, contextHints }, this.deps.config.domain),
       layers: endTopicDecision
@@ -830,9 +831,10 @@ export class SessionTurnService {
       retrievalMode: "turn_start",
       contextHints,
       injectedContextQuery: request.query,
-      turnIntentDecision: intentDecision,
-      routeProposal
+      turnIntentDecision: intentDecision
     });
+    const [routeProposal, search] = await Promise.all([routeProposalPromise, searchPromise]);
+    this.persistTurnStartRouteProposal(search.searchEventId, routeProposal);
     const contextPacketId = turnContextPacketId(
       session.id,
       routeProposal.baseEpisodeId,
@@ -2209,11 +2211,10 @@ export class SessionTurnService {
   }
 
   private async proposeEpisodeRouteWithLlm(
-    session: SessionRecord,
+    latest: EpisodeRecord | undefined,
     userText: string,
     forcedDecision?: TurnRelationDecision
   ): Promise<TurnRouteProposal> {
-    const latest = this.deps.repos.runtime.latestEpisodeForSession(session.id);
     const relationContext = latest ? this.episodeRelationContext(latest) : undefined;
     if (forcedDecision || !latest || !relationContext?.prevUserText) {
       const decision = forcedDecision ?? classifyTurnRelation({
@@ -2239,6 +2240,16 @@ export class SessionTurnService {
       llm: this.deps.llm
     });
     return this.buildTurnRouteProposal(latest, decision, relationContext.lastTurnAtMs);
+  }
+
+  private persistTurnStartRouteProposal(searchEventId: string, routeProposal: TurnRouteProposal): void {
+    const recall = this.deps.repos.runtime.getRecallEvent(searchEventId);
+    if (!recall) return;
+    const request = isRecord(recall.request) ? recall.request : {};
+    this.deps.repos.runtime.updateRecallEventRequest(searchEventId, {
+      ...request,
+      routeProposal
+    });
   }
 
   private commitTurnRouteProposal(

@@ -1986,6 +1986,13 @@ export class RuntimeRepository {
     return row ? recallEventFromSql(row) : undefined;
   }
 
+  updateRecallEventRequest(id: string, request: unknown): RecallEventRecord | undefined {
+    this.db
+      .prepare(`UPDATE recall_events SET request_json = ? WHERE id = ?`)
+      .run(toJson(request), id);
+    return this.getRecallEvent(id);
+  }
+
   updateRecallEventOutcome(
     id: string,
     outcome: NonNullable<RecallEventRecord["outcome"]>

@@ -108,10 +108,10 @@ export function MemoryPage(props: MemoryPageProps) {
   const [referenceRequest, setReferenceRequest] = useState<(MemoryReferenceOpenRequest & { page: MemoryReferencePage }) | null>(null);
   const client = clients?.memoryRuntime ?? null;
 
-  function handleSubPageChange(page: MemorySubPageId) {
+  const handleSubPageChange = useCallback((page: MemorySubPageId) => {
     setReferenceRequest(null);
     setActivePage(page);
-  }
+  }, []);
 
   const handleOpenMemoryReference = useCallback<OpenMemoryReference>((id, fallbackPage) => {
     const page = resolveMemoryReferencePage(id, fallbackPage);
@@ -135,7 +135,7 @@ export function MemoryPage(props: MemoryPageProps) {
 
   const childByPage = useMemo<Record<MemorySubPageId, ReactNode>>(
     () => ({
-      overview: <OverviewSubPage client={client} />,
+      overview: <OverviewSubPage client={client} onNavigate={handleSubPageChange} />,
       memories: (
         <MemoriesSubPage
           client={client}
@@ -172,7 +172,7 @@ export function MemoryPage(props: MemoryPageProps) {
       logs: <LogsSubPage client={client} />,
       sources: <SourcesSubPage />
     }),
-    [client, dispatch, handleOpenMemoryReference, referenceRequest]
+    [client, dispatch, handleOpenMemoryReference, handleSubPageChange, referenceRequest]
   );
 
   useEffect(() => {

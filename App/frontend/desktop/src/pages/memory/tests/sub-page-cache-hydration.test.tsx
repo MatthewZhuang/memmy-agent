@@ -18,7 +18,7 @@ describe("memory sub page cache hydration", () => {
   });
 
   it.each([
-    ["overview", () => <OverviewSubPage client={null} />],
+    ["overview", () => <OverviewSubPage client={null} onNavigate={() => undefined} />],
     ["memories", () => <MemoriesSubPage client={null} />],
     ["tasks", () => <TasksSubPage client={null} />],
     ["policies", () => <PoliciesSubPage client={null} onOpenMemoryReference={() => undefined} />],

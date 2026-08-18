@@ -106,7 +106,7 @@ describe("OverviewSubPage", () => {
 function renderOverview(data = panelOverviewFixture): string {
   return renderToString(
     <I18nProvider language="zh-CN">
-      <OverviewSubPageView state={{ status: "ready", data }} />
+      <OverviewSubPageView state={{ status: "ready", data }} onNavigate={vi.fn()} />
     </I18nProvider>
   );
 }

@@ -6,6 +6,7 @@ DESKTOP_DIR="$ROOT_DIR/App/shell/desktop"
 AGENT_DIR="$ROOT_DIR/App/memmy-agent"
 MEMORY_DIR="$ROOT_DIR/Memory"
 MIGRATIONS_DIR="$ROOT_DIR/Migrations"
+LOCAL_API_CONTRACTS_DIR="$ROOT_DIR/App/backend/local-api-contracts"
 RUNTIME_DIR="$DESKTOP_DIR/dist/runtime"
 MIGRATIONS_STAGING_DIR="$DESKTOP_DIR/dist/Migrations"
 CLI_BIN_DIR="$RUNTIME_DIR/bin"
@@ -75,8 +76,27 @@ resolve_electron_dist() {
   fi
 }
 
-node "$ROOT_DIR/scripts/sync-project-version.mjs"
-DESKTOP_VERSION="${MEMMY_DESKTOP_VERSION:-$(read_package_version "$DESKTOP_DIR/package.json")}"
+if [ -n "${MEMMY_DESKTOP_VERSION:-}" ]; then
+  DESKTOP_VERSION="$MEMMY_DESKTOP_VERSION"
+else
+  DESKTOP_VERSION="$(read_package_version "$DESKTOP_DIR/package.json")"
+fi
+node "$ROOT_DIR/scripts/internal/shared/verify-package-version.mjs" --expected "$DESKTOP_VERSION"
+export MEMMY_VERSION_SYNC_CHECK_ONLY=1
+for builder_arg in "$@"; do
+  case "$builder_arg" in
+    --config.extraMetadata.version="$DESKTOP_VERSION")
+      ;;
+    --config.extraMetadata.version|--config.extraMetadata.version=*)
+      echo "Desktop package version metadata must match $DESKTOP_VERSION." >&2
+      exit 1
+      ;;
+    --config|--config=*|--config.extraMetadata|--config.extraMetadata=*)
+      echo "Desktop package configuration is managed by the packaging scripts." >&2
+      exit 1
+      ;;
+  esac
+done
 configure_npm_script_shell
 
 if [ "${MEMMY_SKIP_CODESIGN:-}" = "1" ]; then
@@ -143,6 +163,26 @@ require_packaged_runtime_glob() {
     echo "Missing required packaged runtime file matching: $required_pattern" >&2
     exit 1
   fi
+}
+
+verify_migration_state_compatibility_module() {
+  local module_path
+  module_path="$(to_node_readable_path "$1")"
+
+  MEMMY_MIGRATION_STATE_MODULE_PATH="$module_path" node --input-type=module --eval '
+    import { pathToFileURL } from "node:url";
+    const modulePath = process.env.MEMMY_MIGRATION_STATE_MODULE_PATH;
+    if (!modulePath) throw new Error("Migrations state-store path is unavailable");
+    const stateStore = await import(pathToFileURL(modulePath).href);
+    if (stateStore.CURRENT_MIGRATION_STATE_FORMAT_VERSION !== 2 || JSON.stringify(stateStore.SUPPORTED_MIGRATION_STATE_FORMAT_VERSIONS) !== "[1,2]") {
+      throw new Error("Migrations runtime state compatibility mismatch");
+    }
+    const legacyState = stateStore.validateMigrationState({ formatVersion: 1, scope: "agent-workspace", applied: [] }, []);
+    const currentState = stateStore.validateMigrationState({ formatVersion: 2, scope: "agent-workspace", applied: [] }, []);
+    if (legacyState.formatVersion !== 2 || currentState.formatVersion !== 2) {
+      throw new Error("Migrations runtime state behavior mismatch");
+    }
+  '
 }
 
 patch_electron_builder_nsis_refresh() {
@@ -282,13 +322,11 @@ write_desktop_edition_manifest() {
       ;;
   esac
 
-  cat > "$DESKTOP_DIR/dist/main/desktop-edition.json" <<EOF
-{
-  "edition": "$edition",
-  "accountChannel": "$account_channel",
-  "signing": "$PACKAGE_SIGNING"
-}
-EOF
+  node "$ROOT_DIR/scripts/internal/shared/write-desktop-edition-manifest.mjs" \
+    --output "$DESKTOP_DIR/dist/main/desktop-edition.json" \
+    --edition "$edition" \
+    --account-channel "$account_channel" \
+    --signing "$PACKAGE_SIGNING"
 }
 
 create_memory_runtime_lock() {
@@ -380,29 +418,69 @@ EOF
   exit 1
 }
 
-verify_windows_native_module() {
-  local better_sqlite_node="$RUNTIME_DIR/memory/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
+verify_windows_x64_native_module() {
+  local native_file="$1"
+  local description="$2"
 
-  require_packaged_runtime_file "$RUNTIME_DIR/memory/node_modules/@memmy/local-api-contracts/dist/index.js"
-  require_packaged_runtime_file "$RUNTIME_DIR/memory/node_modules/@memmy/migrations/dist/index.js"
-
-  if [ ! -f "$better_sqlite_node" ]; then
-    echo "Missing better-sqlite3 native module: $better_sqlite_node" >&2
-    exit 1
-  fi
-
+  require_packaged_runtime_file "$native_file"
   local file_description
-  file_description="$(file "$better_sqlite_node")"
+  file_description="$(file "$native_file")"
   echo "$file_description"
 
   case "$file_description" in
     *PE32+*x86-64* | *PE32+*AMD64*)
       ;;
     *)
-      echo "Expected a Windows x64 better-sqlite3 native module." >&2
+      echo "Expected a Windows x64 $description native module: $native_file" >&2
       exit 1
       ;;
   esac
+}
+
+verify_windows_better_sqlite3_runtime() {
+  local runtime_dir="$1"
+  local electron_executable="$DESKTOP_DIR/node_modules/electron/dist/electron.exe"
+  local node_runtime_dir
+  node_runtime_dir="$(to_node_readable_path "$runtime_dir")"
+
+  require_packaged_runtime_file "$electron_executable"
+  MEMMY_BETTER_SQLITE_RUNTIME_DIR="$node_runtime_dir" \
+    ELECTRON_RUN_AS_NODE=1 \
+    "$electron_executable" --input-type=module --eval '
+      import { createRequire } from "node:module";
+      import path from "node:path";
+      import { pathToFileURL } from "node:url";
+      const runtimeDir = process.env.MEMMY_BETTER_SQLITE_RUNTIME_DIR;
+      if (!runtimeDir) throw new Error("better-sqlite3 runtime directory is unavailable");
+      const require = createRequire(pathToFileURL(path.join(runtimeDir, "package.json")));
+      const Database = require("better-sqlite3");
+      const database = new Database(":memory:");
+      try {
+        const row = database.prepare("SELECT 1 AS ok").get();
+        if (row?.ok !== 1) throw new Error("better-sqlite3 smoke query failed");
+      } finally {
+        database.close();
+      }
+    '
+}
+
+verify_packaged_file_matches_runtime() {
+  local runtime_file="$1"
+  local packaged_file="$2"
+  local description="$3"
+
+  if ! cmp -s "$runtime_file" "$packaged_file"; then
+    echo "Packaged $description differs from the runtime artifact that passed smoke validation." >&2
+    exit 1
+  fi
+}
+
+verify_windows_native_module() {
+  require_packaged_runtime_file "$RUNTIME_DIR/memory/node_modules/@memmy/local-api-contracts/dist/index.js"
+  require_packaged_runtime_file "$RUNTIME_DIR/memory/node_modules/@memmy/migrations/dist/index.js"
+  verify_windows_x64_native_module \
+    "$RUNTIME_DIR/memory/node_modules/better-sqlite3/build/Release/better_sqlite3.node" \
+    "Memory better-sqlite3"
 }
 
 verify_windows_onnxruntime_module() {
@@ -442,6 +520,14 @@ verify_windows_sharp_module() {
 verify_windows_agent_native_artifacts() {
   local node_pty_dir="$RUNTIME_DIR/memmy-agent/node_modules/openclaw/node_modules/@lydell/node-pty-win32-x64/prebuilds/win32-x64"
 
+  require_packaged_runtime_file "$RUNTIME_DIR/memmy-agent/node_modules/@memmy/local-api-contracts/dist/index.js"
+  if [ -L "$RUNTIME_DIR/memmy-agent/node_modules/@memmy/local-api-contracts" ]; then
+    echo "Packaged local API contracts must not be a symbolic link." >&2
+    exit 1
+  fi
+  verify_windows_x64_native_module \
+    "$RUNTIME_DIR/memmy-agent/node_modules/better-sqlite3/build/Release/better_sqlite3.node" \
+    "memmy-agent better-sqlite3"
   require_packaged_runtime_file "$node_pty_dir/conpty.node"
   require_packaged_runtime_file "$node_pty_dir/conpty/conpty.dll"
   require_packaged_runtime_file "$node_pty_dir/conpty/OpenConsole.exe"
@@ -453,10 +539,28 @@ verify_packaged_windows_unpacked_artifacts() {
   local packaged_embedding_model="$DESKTOP_DIR/release/win-unpacked/resources/embedding-models/$EMBEDDING_MODEL_ID"
 
   require_packaged_runtime_file "$DESKTOP_DIR/release/win-unpacked/resources/app.asar"
+  verify_packaged_runtime_config_boundary "$DESKTOP_DIR/release/win-unpacked/resources"
+  verify_windows_x64_native_module \
+    "$unpacked_runtime/memory/node_modules/better-sqlite3/build/Release/better_sqlite3.node" \
+    "packaged Memory better-sqlite3"
+  verify_windows_x64_native_module \
+    "$unpacked_runtime/memmy-agent/node_modules/better-sqlite3/build/Release/better_sqlite3.node" \
+    "packaged memmy-agent better-sqlite3"
+  verify_packaged_file_matches_runtime \
+    "$RUNTIME_DIR/memory/node_modules/better-sqlite3/build/Release/better_sqlite3.node" \
+    "$unpacked_runtime/memory/node_modules/better-sqlite3/build/Release/better_sqlite3.node" \
+    "Memory better-sqlite3 module"
+  verify_packaged_file_matches_runtime \
+    "$RUNTIME_DIR/memmy-agent/node_modules/better-sqlite3/build/Release/better_sqlite3.node" \
+    "$unpacked_runtime/memmy-agent/node_modules/better-sqlite3/build/Release/better_sqlite3.node" \
+    "memmy-agent better-sqlite3 module"
   require_packaged_runtime_file "$unpacked_runtime/memory/node_modules/onnxruntime-node/bin/napi-v3/win32/x64/onnxruntime.dll"
   require_packaged_runtime_glob "$unpacked_runtime/memory/node_modules/onnxruntime-node/bin/napi-v3/win32/x64/*.dll"
   require_packaged_runtime_glob "$unpacked_runtime/memory/node_modules/@img/sharp-win32-x64/lib/libvips*.dll"
   require_packaged_runtime_file "$unpacked_runtime/memmy-agent/node_modules/@memmy/migrations/dist/index.js"
+  require_packaged_runtime_file "$unpacked_runtime/memmy-agent/node_modules/@memmy/migrations/dist/state-store.js"
+  verify_migration_state_compatibility_module \
+    "$unpacked_runtime/memmy-agent/node_modules/@memmy/migrations/dist/state-store.js"
   require_packaged_runtime_file "$packaged_embedding_model/config.json"
   require_packaged_runtime_file "$packaged_embedding_model/tokenizer.json"
   require_packaged_runtime_file "$packaged_embedding_model/onnx/model_quantized.onnx"
@@ -468,6 +572,21 @@ verify_packaged_windows_unpacked_artifacts() {
   require_packaged_runtime_file "$unpacked_runtime/memmy-agent/node_modules/openclaw/node_modules/@lydell/node-pty-win32-x64/prebuilds/win32-x64/conpty/OpenConsole.exe"
 }
 
+verify_packaged_runtime_config_boundary() {
+  local resources_root="$1"
+  local asar_file="$resources_root/app.asar"
+  local forbidden_env
+
+  forbidden_env="$(find "$resources_root" \( -type f -o -type l \) \( -name ".env" -o -name ".env.*" \) -print -quit)"
+  if [ -n "$forbidden_env" ]; then
+    echo "Packaged resources contain a forbidden environment file." >&2
+    exit 1
+  fi
+  node "$ROOT_DIR/scripts/internal/shared/verify-packaged-asar.mjs" \
+    --asar "$(to_node_readable_path "$asar_file")" \
+    --expected "$DESKTOP_VERSION"
+}
+
 npm_ci_win_x64() {
   local package_dir="$1"
 
@@ -475,11 +594,12 @@ npm_ci_win_x64() {
 }
 
 install_better_sqlite3_win_x64() {
+  local runtime_dir="$1"
   local electron_version
   electron_version="${MEMMY_ELECTRON_VERSION:-$(read_package_version "$DESKTOP_DIR/node_modules/electron/package.json")}"
 
   (
-    cd "$RUNTIME_DIR/memory/node_modules/better-sqlite3"
+    cd "$runtime_dir/node_modules/better-sqlite3"
     run_with_retries 3 ../.bin/prebuild-install --platform win32 --arch x64 --runtime electron --target "$electron_version" ||
       install_better_sqlite3_prebuild_with_download_fallback "$electron_version"
   )
@@ -535,8 +655,9 @@ cp "$ROOT_DIR/App/backend/local-api-contracts/package.json" "$RUNTIME_DIR/memory
 cp -R "$ROOT_DIR/App/backend/local-api-contracts/dist" "$RUNTIME_DIR/memory/node_modules/@memmy/local-api-contracts/dist"
 cp "$MIGRATIONS_STAGING_DIR/package.json" "$RUNTIME_DIR/memory/node_modules/@memmy/migrations/package.json"
 cp -R "$MIGRATIONS_STAGING_DIR/dist" "$RUNTIME_DIR/memory/node_modules/@memmy/migrations/dist"
-install_better_sqlite3_win_x64
+install_better_sqlite3_win_x64 "$RUNTIME_DIR/memory"
 verify_windows_native_module
+verify_windows_better_sqlite3_runtime "$RUNTIME_DIR/memory"
 verify_windows_onnxruntime_module
 verify_windows_sharp_module
 
@@ -546,6 +667,20 @@ cp "$AGENT_DIR/package-lock.json" "$RUNTIME_DIR/memmy-agent/package-lock.json"
 
 log "Installing Windows x64 memmy-agent runtime dependencies"
 npm_ci_win_x64 "$RUNTIME_DIR/memmy-agent"
+install_better_sqlite3_win_x64 "$RUNTIME_DIR/memmy-agent"
+RUNTIME_LOCAL_API_CONTRACTS_DIR="$RUNTIME_DIR/memmy-agent/node_modules/@memmy/local-api-contracts"
+rm -rf "$RUNTIME_LOCAL_API_CONTRACTS_DIR"
+mkdir -p "$RUNTIME_LOCAL_API_CONTRACTS_DIR"
+cp "$LOCAL_API_CONTRACTS_DIR/package.json" "$RUNTIME_LOCAL_API_CONTRACTS_DIR/package.json"
+cp -R "$LOCAL_API_CONTRACTS_DIR/dist" "$RUNTIME_LOCAL_API_CONTRACTS_DIR/dist"
+if [ -L "$RUNTIME_LOCAL_API_CONTRACTS_DIR" ]; then
+  echo "Packaged local API contracts must not be a symbolic link." >&2
+  exit 1
+fi
+if [ ! -f "$RUNTIME_LOCAL_API_CONTRACTS_DIR/dist/index.js" ]; then
+  echo "Packaged local API contracts entrypoint is missing." >&2
+  exit 1
+fi
 RUNTIME_MIGRATIONS_DIR="$RUNTIME_DIR/memmy-agent/node_modules/@memmy/migrations"
 rm -rf "$RUNTIME_MIGRATIONS_DIR"
 mkdir -p "$RUNTIME_MIGRATIONS_DIR"
@@ -565,13 +700,19 @@ if [ -e "$MIGRATIONS_STAGING_DIR" ]; then
   exit 1
 fi
 verify_windows_agent_native_artifacts
+verify_windows_better_sqlite3_runtime "$RUNTIME_DIR/memmy-agent"
 (
   cd "$RUNTIME_DIR/memmy-agent"
   node --input-type=module --eval '
     import fs from "node:fs";
     import path from "node:path";
     import { createRequire } from "node:module";
-    import { runMigrations } from "@memmy/migrations";
+    import {
+      CURRENT_MIGRATION_STATE_FORMAT_VERSION,
+      SUPPORTED_MIGRATION_STATE_FORMAT_VERSIONS,
+      runMigrations,
+    } from "@memmy/migrations";
+    import { cloudServiceFromDesktopRuntimeManifest } from "@memmy/local-api-contracts";
     import { createConnection } from "@playwright/mcp";
     import { chromium } from "playwright";
     const require = createRequire(import.meta.url);
@@ -583,6 +724,8 @@ verify_windows_agent_native_artifacts
     const playwrightPackage = require(playwrightPath);
     const corePackage = require(corePath);
     if (typeof runMigrations !== "function") throw new Error("Migrations runtime export is unavailable");
+    if (typeof cloudServiceFromDesktopRuntimeManifest !== "function") throw new Error("Local API contracts runtime export is unavailable");
+    if (CURRENT_MIGRATION_STATE_FORMAT_VERSION !== 2 || JSON.stringify(SUPPORTED_MIGRATION_STATE_FORMAT_VERSIONS) !== "[1,2]") throw new Error("Migrations runtime state compatibility mismatch");
     if (typeof createConnection !== "function" || typeof chromium?.executablePath !== "function") throw new Error("Playwright MCP runtime exports are unavailable");
     if (mcpPackage.version !== runtimePackage.dependencies["@playwright/mcp"]) throw new Error("Playwright MCP runtime version mismatch");
     if (playwrightPackage.version !== runtimePackage.dependencies.playwright || corePackage.version !== runtimePackage.dependencies.playwright) throw new Error("Playwright runtime version mismatch");
@@ -591,6 +734,12 @@ verify_windows_agent_native_artifacts
     if (!fs.readFileSync(commandEntrypoint, "utf8").includes("browser-prepare")) throw new Error("browser-prepare command is missing");
   '
 )
+
+node "$ROOT_DIR/scripts/internal/shared/prune-runtime-env-files.mjs" "$RUNTIME_DIR"
+RUNTIME_NODE_DIR="$(to_node_readable_path "$RUNTIME_DIR")"
+node "$ROOT_DIR/scripts/internal/shared/verify-package-version.mjs" \
+  --expected "$DESKTOP_VERSION" \
+  --runtime-root "$RUNTIME_NODE_DIR"
 
 log "Creating Windows CLI launchers"
 create_windows_cli_launcher "$CLI_BIN_DIR/memmy-memory.cmd" "dist\\runtime\\memory\\src\\cli\\index.js"

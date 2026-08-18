@@ -1,7 +1,6 @@
 #!/usr/bin/env node
-// Must load first: inject MEMMY_CLOUD_SERVICE from a nearby .env for analytics.
-import { loadCloudServiceEnv } from "./load-env.js";
-loadCloudServiceEnv();
+// Must load first: resolve MEMMY_CLOUD_SERVICE from external env, packaged manifest, or development .env.
+import "./load-env.js";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {

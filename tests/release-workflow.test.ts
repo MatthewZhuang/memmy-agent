@@ -101,14 +101,24 @@ describe("Memmy release workflow metadata", () => {
     expect(result.status).toBe(1);
   });
 
-  it("embeds the repository .env required by packaged desktop runtimes", () => {
+  it("keeps repository and dependency env files outside packaged desktop artifacts", () => {
     for (const config of packagingConfigs) {
       const packagingSource = readFileSync(
         resolve(repoRoot, `App/shell/desktop/${config}`),
         "utf8",
       );
-      expect(packagingSource).toMatch(/from:\s+\.\.\/\.\.\/\.\.\/\.env(?:\s|$)/);
-      expect(packagingSource).toMatch(/to:\s+\.env(?:\s|$)/);
+      expect(packagingSource).not.toMatch(/from:\s+\.\.\/\.\.\/\.\.\/\.env(?:\s|$)/);
+      expect(packagingSource).not.toMatch(/to:\s+\.env(?:\s|$)/);
+      expect(packagingSource).toContain('- "!**/.env"');
+      expect(packagingSource).toContain('- "!**/.env.*"');
+    }
+
+    const macSource = readFileSync(resolve(repoRoot, "scripts/internal/mac/build-dmg.sh"), "utf8");
+    const winSource = readFileSync(resolve(repoRoot, "scripts/internal/win/build-nsis.sh"), "utf8");
+    for (const source of [macSource, winSource]) {
+      expect(source).toContain("write-desktop-edition-manifest.mjs");
+      expect(source).toContain("prune-runtime-env-files.mjs");
+      expect(source).toContain("verify-package-version.mjs");
     }
   });
 });

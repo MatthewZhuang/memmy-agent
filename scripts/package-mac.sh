@@ -139,6 +139,20 @@ if [ -z "$VERSION" ]; then
   exit 1
 fi
 
+if [ "${#PASSTHROUGH_ARGS[@]}" -gt 0 ]; then
+  for passthrough_arg in "${PASSTHROUGH_ARGS[@]}"; do
+    case "$passthrough_arg" in
+      --config|--config=*|--config.extraMetadata|--config.extraMetadata=*|--config.extraMetadata.version|--config.extraMetadata.version=*)
+        echo "Desktop package configuration and version are managed by this wrapper and cannot be overridden." >&2
+        exit 1
+        ;;
+    esac
+  done
+fi
+
+node "$ROOT_DIR/scripts/internal/shared/verify-package-version.mjs" --expected "$VERSION"
+export MEMMY_VERSION_SYNC_CHECK_ONLY=1
+
 if [ -z "$ARCH" ]; then
   ARCH="$(infer_arch)"
 fi

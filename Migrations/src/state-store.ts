@@ -8,6 +8,9 @@ import {
   type MigrationScope,
 } from "./types.js";
 
+export const CURRENT_MIGRATION_STATE_FORMAT_VERSION = 2 as const;
+export const SUPPORTED_MIGRATION_STATE_FORMAT_VERSIONS = Object.freeze([1, 2] as const);
+
 export type AppliedMigrationTarget =
   | { type: "agent-workspace" }
   | { type: "runtime-config"; key: string }
@@ -21,7 +24,7 @@ export type AppliedMigrationRecord = {
 };
 
 export type MigrationState = {
-  formatVersion: 2;
+  formatVersion: typeof CURRENT_MIGRATION_STATE_FORMAT_VERSION;
   scope: "agent-workspace";
   applied: AppliedMigrationRecord[];
 };
@@ -213,7 +216,7 @@ export function isMigrationApplied(
 
 export function emptyMigrationState(): MigrationState {
   return {
-    formatVersion: 2,
+    formatVersion: CURRENT_MIGRATION_STATE_FORMAT_VERSION,
     scope: "agent-workspace",
     applied: [],
   };
@@ -233,14 +236,16 @@ export function validateMigrationState(
   if (value.formatVersion === 1) {
     const legacy = value as unknown as LegacyMigrationState;
     return {
-      formatVersion: 2,
+      formatVersion: CURRENT_MIGRATION_STATE_FORMAT_VERSION,
       scope: "agent-workspace",
       applied: validateAppliedRecords(legacy.applied, definitions, true),
     };
   }
-  if (value.formatVersion !== 2) throw stateError("Unsupported migration state format");
+  if (value.formatVersion !== CURRENT_MIGRATION_STATE_FORMAT_VERSION) {
+    throw stateError("Unsupported migration state format");
+  }
   return {
-    formatVersion: 2,
+    formatVersion: CURRENT_MIGRATION_STATE_FORMAT_VERSION,
     scope: "agent-workspace",
     applied: validateAppliedRecords(value.applied, definitions, false),
   };

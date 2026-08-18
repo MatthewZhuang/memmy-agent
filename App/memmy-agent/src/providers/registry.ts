@@ -3,7 +3,7 @@ import { resolveMemmyAccountHeaders } from "./memmy-account.js";
 type Dict<T = any> = Record<string, T>;
 type ProviderHeaders = Record<string, string>;
 
-// Memmy Account gateway API base: the gateway domain comes only from MEMMY_CLOUD_SERVICE in the repository root .env.
+// Memmy Account gateway API base: the gateway domain comes from the already resolved MEMMY_CLOUD_SERVICE.
 // Resolution is deferred to actual memmy_account usage (see memmyAccountApiBase below) instead of module
 // evaluation, so importing this module never throws for BYOK users who don't configure it.
 /**
@@ -16,7 +16,7 @@ export function memmyAccountApiBase(): string {
   const cloudService = process.env.MEMMY_CLOUD_SERVICE?.trim();
   if (!cloudService) {
     throw new Error(
-      "MEMMY_CLOUD_SERVICE 未配置:网关地址唯一来源是仓库根 .env,请确认入口已加载该文件。",
+      "MEMMY_CLOUD_SERVICE 未配置:请确认外部环境、打包运行时清单或开发环境 .env 已提供网关地址。",
     );
   }
   return `${cloudService}/api/agentExternal/v1`;
