@@ -5,12 +5,14 @@ import {
   worldModelMetaFromMemory
 } from "../../algorithm/plugin-algorithms.js";
 import type { MemmyConfig } from "../../config/index.js";
-import type { LlmClient } from "../../model/types.js";
+import type { Embedder, LlmClient } from "../../model/types.js";
 import type {
   EpisodeRecord,
   EvolutionJobRecord,
   Repositories
 } from "../../storage/repositories.js";
+import type { SaveEpisodeProceduralPathResult } from
+  "../../storage/procedural-path-repository.js";
 import type { MemoryRow,ToolCallPayload } from "../../types.js";
 import { newId } from "../../utils/id.js";
 import { nowIso } from "../../utils/time.js";
@@ -27,6 +29,7 @@ import type { EnqueueJobInput } from "../worker/job-handlers.js";
 import { NegativeExperiencePipeline } from "./negative-experience-pipeline.js";
 import { BigTurnSpanPipeline } from "./big-turn-span-pipeline.js";
 import { PolicyInductionEngine } from "./policy-induction.js";
+import { ProceduralPolicyInductionPipeline } from "./procedural-policy-induction.js";
 import {
   RewardPipeline,
   type DecisionRepairSummary
@@ -38,6 +41,22 @@ import { SpanPolicyInductionPipeline } from "./span-policy-induction.js";
 import { SpanPipeline } from "./span-pipeline.js";
 import type { TurnMemoryCaptureDecision } from "./span-pipeline.js";
 import { WorldModelPipeline } from "./world-model-pipeline.js";
+import { SpanCreditPipeline } from "./span-credit-pipeline.js";
+import { EpisodeProceduralReconstructor } from "./episode-procedural-reconstructor.js";
+import { EpisodeProceduralPathPersistencePipeline } from "./episode-procedural-path-pipeline.js";
+import { ProceduralSpanSemanticClusteringPipeline } from "./procedural-span-clustering.js";
+import { EpisodePolicyProjectionPipeline } from "./episode-policy-projection.js";
+import {
+  PolicySequenceMiningPipeline,
+  enqueuePolicySequenceMining
+} from "./policy-sequence-mining.js";
+import {
+  ProceduralSequenceSkillCompilationPipeline
+} from "./procedural-sequence-skill-compilation.js";
+import {
+  Trace2SkillReplayService,
+  type Trace2SkillReplayResultV1
+} from "./trace2skill-replay.js";
 
 type TraceMeta = NonNullable<ReturnType<typeof traceMetaFromMemory>>;
 type PolicyMeta = NonNullable<ReturnType<typeof policyMetaFromMemory>>;
@@ -54,6 +73,7 @@ export interface EvolutionJobProcessorDeps {
   config: MemmyConfig;
   llm: LlmClient;
   skillLlm: LlmClient;
+  embedder: Embedder;
   traceMeta(memory: MemoryRow | undefined | null): TraceMeta | null;
   namespaceIdFromMemory(memory: MemoryRow): string;
   buildMemory(input: Record<string, unknown>): MemoryRow;
@@ -90,6 +110,13 @@ export class EvolutionJobProcessor {
   private readonly spanClustering: SpanClusteringPipeline;
   private readonly spanClusterAudit: SpanClusterAuditPipeline;
   private readonly spanPolicy: SpanPolicyInductionPipeline;
+  private readonly proceduralSpanPolicy: ProceduralPolicyInductionPipeline;
+  private readonly proceduralPath: EpisodeProceduralPathPersistencePipeline;
+  private readonly spanCredit: SpanCreditPipeline;
+  private readonly proceduralSpanClustering: ProceduralSpanSemanticClusteringPipeline;
+  private readonly episodePolicyProjection: EpisodePolicyProjectionPipeline;
+  private readonly policySequenceMining: PolicySequenceMiningPipeline;
+  private readonly proceduralSequenceSkill: ProceduralSequenceSkillCompilationPipeline;
   private readonly bigTurnSpan: BigTurnSpanPipeline;
   private readonly worldModel: WorldModelPipeline;
 
@@ -171,6 +198,49 @@ export class EvolutionJobProcessor {
       enqueueChange: deps.repos.runtime.appendChange.bind(deps.repos.runtime),
       namespaceIdFromMemory: deps.namespaceIdFromMemory
     });
+    this.proceduralSpanPolicy = new ProceduralPolicyInductionPipeline({
+      repos: deps.repos,
+      get skillLlm() { return owner.deps.skillLlm; },
+      buildMemory: deps.buildMemory,
+      upsertEvolutionMemory: this.upsertEvolutionMemory.bind(this),
+      enqueueChange: deps.repos.runtime.appendChange.bind(deps.repos.runtime),
+      enqueueJob: deps.enqueueJob,
+      get enableThinking() { return owner.deps.config.evolution.enableThinking; }
+    });
+    this.proceduralPath = new EpisodeProceduralPathPersistencePipeline({
+      repos: deps.repos,
+      reconstructor: new EpisodeProceduralReconstructor({
+        get llm() { return owner.deps.skillLlm; }
+      }),
+      enqueueJob: deps.enqueueJob
+    });
+    this.spanCredit = new SpanCreditPipeline({
+      repos: deps.repos,
+      get skillLlm() { return owner.deps.skillLlm; },
+      get enableThinking() { return owner.deps.config.evolution.enableThinking; },
+      enqueueJob: deps.enqueueJob
+    });
+    this.proceduralSpanClustering = new ProceduralSpanSemanticClusteringPipeline({
+      repos: deps.repos,
+      get config() { return owner.deps.config; },
+      get embedder() { return owner.deps.embedder; },
+      enqueueJob: deps.enqueueJob
+    });
+    this.episodePolicyProjection = new EpisodePolicyProjectionPipeline({
+      repos: deps.repos
+    });
+    this.policySequenceMining = new PolicySequenceMiningPipeline({
+      repos: deps.repos,
+      get embedder() { return owner.deps.embedder; }
+    });
+    this.proceduralSequenceSkill = new ProceduralSequenceSkillCompilationPipeline({
+      repos: deps.repos,
+      get config() { return owner.deps.config; },
+      get skillLlm() { return owner.deps.skillLlm; },
+      buildMemory: deps.buildMemory,
+      upsertEvolutionMemory: this.upsertEvolutionMemory.bind(this),
+      enqueueJob: deps.enqueueJob
+    });
     this.reward = new RewardPipeline({
       get config() { return owner.deps.config; },
       repos: deps.repos,
@@ -198,12 +268,16 @@ export class EvolutionJobProcessor {
     });
   }
 
-  induceL2(job: EvolutionJobRecord): Promise<void> {
+  async induceL2(job: EvolutionJobRecord): Promise<void> {
+    if (typeof job.payload.proceduralClusterId === "string") {
+      await this.proceduralSpanPolicy.induce(job);
+      return;
+    }
     if (typeof job.payload.clusterId === "string") {
       this.spanPolicy.induce(job);
-      return Promise.resolve();
+      return;
     }
-    return this.policy.induceL2(job);
+    await this.policy.induceL2(job);
   }
 
   associateL2(job: EvolutionJobRecord): void {
@@ -215,6 +289,9 @@ export class EvolutionJobProcessor {
   }
 
   crystallizeSkill(job: EvolutionJobRecord): Promise<void> {
+    if (typeof job.payload.proceduralSkillCandidateId === "string") {
+      return this.proceduralSequenceSkill.compileJob(job).then(() => undefined);
+    }
     return this.skill.crystallizeSkill(job);
   }
 
@@ -228,6 +305,85 @@ export class EvolutionJobProcessor {
 
   splitBigTurn(job: EvolutionJobRecord): Promise<void> {
     return this.bigTurnSpan.splitAndStore(job);
+  }
+
+  async reconstructProceduralPath(job: EvolutionJobRecord): Promise<void> {
+    await this.proceduralPath.reconstructJob(job);
+  }
+
+  async reconstructProceduralPathForReplay(input: {
+    episodeId: string;
+    at?: string;
+  }): Promise<SaveEpisodeProceduralPathResult> {
+    return this.proceduralPath.reconstructAndPersist({
+      episodeId: input.episodeId,
+      activate: true,
+      ...(input.at ? { createdAt: input.at } : {})
+    });
+  }
+
+  async scoreSpanCredit(job: EvolutionJobRecord): Promise<void> {
+    await this.spanCredit.scoreJob(job);
+  }
+
+  async clusterProceduralSpans(job: EvolutionJobRecord): Promise<void> {
+    await this.proceduralSpanClustering.ingestCreditRun(job);
+  }
+
+  projectEpisodePolicies(job: EvolutionJobRecord): void {
+    const result = this.episodePolicyProjection.projectJob(job);
+    if (!result || result.record.status !== "active") return;
+    enqueuePolicySequenceMining(this.deps, {
+      projectionId: result.record.id,
+      projectionHash: result.record.projectionHash,
+      episodeId: result.record.episodeId,
+      userId: result.record.userId,
+      sessionId: result.record.sessionId,
+      at: job.updatedAt,
+      trigger: "episode_policy_projection"
+    });
+  }
+
+  async minePolicySequences(job: EvolutionJobRecord): Promise<void> {
+    const result = await this.policySequenceMining.mineJob(job);
+    if (!result) return;
+    const activeCandidatesByPattern = new Map(
+      result.activeCandidates.map((candidate) => [candidate.patternId, candidate])
+    );
+    for (const pattern of result.patterns) {
+      const candidate = activeCandidatesByPattern.get(pattern.id);
+      if (!candidate || candidate.lifecycleStatus !== "ready") {
+        this.proceduralSequenceSkill.retirePattern(pattern, job.updatedAt);
+      }
+    }
+    for (const candidate of result.activeCandidates) {
+      if (!this.proceduralSequenceSkill.needsCompilation(candidate)) continue;
+      this.deps.enqueueJob({
+        jobType: "skill_crystallization",
+        userId: candidate.namespaceId,
+        sessionId: job.sessionId,
+        episodeId: job.episodeId,
+        payload: {
+          proceduralSkillCandidateId: candidate.id,
+          patternId: candidate.patternId,
+          evidenceHash: candidate.evidenceHash,
+          compilerVersion: "procedural-sequence-skill-compiler.v2"
+        },
+        createdAt: job.updatedAt
+      });
+    }
+  }
+
+  async replayTrace2SkillEpisode(input: {
+    episodeId: string;
+    at?: string;
+  }): Promise<Trace2SkillReplayResultV1> {
+    return new Trace2SkillReplayService({
+      repos: this.deps.repos,
+      projection: this.episodePolicyProjection,
+      mining: this.policySequenceMining,
+      skillCompilation: this.proceduralSequenceSkill
+    }).replay(input);
   }
 
   clusterSpans(job: EvolutionJobRecord): void {

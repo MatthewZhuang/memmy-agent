@@ -75,6 +75,23 @@ describe("repository sqlite schema contract", () => {
         "decision_repairs",
         "l2_candidate_pool",
         "trace_policy_links",
+        "episode_procedural_paths",
+        "procedural_span_occurrences",
+        "procedural_span_occurrence_embeddings",
+        "episode_span_credit_runs",
+        "procedural_span_credits",
+        "procedural_span_clusters",
+        "procedural_span_cluster_members",
+        "procedural_policy_versions",
+        "procedural_policy_occurrences",
+        "episode_policy_projections",
+        "episode_policy_projection_nodes",
+        "episode_capability_signatures",
+        "episode_capability_affinities",
+        "policy_sequence_patterns",
+        "policy_sequence_pattern_edges",
+        "policy_sequence_pattern_occurrences",
+        "procedural_skill_candidates",
         "span_clusters",
         "span_cluster_members",
         "skill_trials",
@@ -272,7 +289,7 @@ describe("repository sqlite schema contract", () => {
     }
   });
 
-  it("migrates schema v2 to v4 without deleting user data", () => {
+  it("migrates schema v2 to the latest version without deleting user data", () => {
     const root = mkdtempSync(join(tmpdir(), "mindock-repo-v2-source-agent-migration-"));
     const dbPath = join(root, "memory.sqlite");
     try {
@@ -324,6 +341,249 @@ describe("repository sqlite schema contract", () => {
       });
       expect((migrated.db.prepare(`PRAGMA index_list(api_logs)`).all() as Array<{ name: string }>)
         .map((index) => index.name)).toContain("idx_api_logs_tool_source_time");
+      expect(existsSync(`${dbPath}.pre-v${SCHEMA_VERSION}.bak`)).toBe(true);
+      migrated.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates schema v5 by adding procedural Path, cluster, and Policy tables", () => {
+    const root = mkdtempSync(join(tmpdir(), "mindock-repo-v5-procedural-path-migration-"));
+    const dbPath = join(root, "memory.sqlite");
+    try {
+      const seeded = new MemoryDb({ path: dbPath });
+      const repos = new Repositories(seeded.db);
+      repos.memories.insert(schemaVectorMemory());
+      seeded.db.exec(`
+        DROP TABLE episode_capability_affinities;
+        DROP TABLE episode_capability_signatures;
+        DROP TABLE procedural_skill_candidates;
+        DROP TABLE policy_sequence_pattern_occurrences;
+        DROP TABLE policy_sequence_patterns;
+        DROP TABLE procedural_policy_occurrences;
+        DROP TABLE procedural_policy_versions;
+        DROP TABLE episode_policy_projection_nodes;
+        DROP TABLE episode_policy_projections;
+        DROP TABLE procedural_span_cluster_members;
+        DROP TABLE procedural_span_clusters;
+        DROP TABLE procedural_span_credits;
+        DROP TABLE episode_span_credit_runs;
+        DROP TABLE procedural_span_occurrences;
+        DROP TABLE episode_procedural_paths;
+        DELETE FROM schema_migrations;
+        INSERT INTO schema_migrations (id, version, applied_at, checksum)
+        VALUES ('005_span_embedding_vectors', 5, '2026-08-14T00:00:00.000Z', 'v5');
+      `);
+      seeded.close();
+
+      const migrated = new MemoryDb({ path: dbPath });
+      const tables = (migrated.db.prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'table'`
+      ).all() as Array<{ name: string }>).map((table) => table.name);
+      expect(migrated.schemaVersion()).toEqual({
+        version: SCHEMA_VERSION,
+        lastMigrationId: SCHEMA_MIGRATION_ID
+      });
+      expect(tables).toEqual(expect.arrayContaining([
+        "episode_procedural_paths",
+        "procedural_span_occurrences",
+        "episode_span_credit_runs",
+        "procedural_span_credits",
+        "procedural_span_clusters",
+        "procedural_span_cluster_members",
+        "procedural_policy_versions",
+        "procedural_policy_occurrences",
+        "episode_policy_projections",
+        "episode_policy_projection_nodes",
+        "episode_capability_signatures",
+        "episode_capability_affinities",
+        "policy_sequence_patterns",
+        "policy_sequence_pattern_occurrences",
+        "procedural_skill_candidates"
+      ]));
+      expect(migrated.db.prepare(`SELECT COUNT(*) AS count FROM memories`).get()).toEqual({ count: 1 });
+      expect(existsSync(`${dbPath}.pre-v${SCHEMA_VERSION}.bak`)).toBe(true);
+      migrated.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates schema v9 by adding Episode Policy Projection tables", () => {
+    const root = mkdtempSync(join(tmpdir(), "mindock-repo-v9-policy-projection-migration-"));
+    const dbPath = join(root, "memory.sqlite");
+    try {
+      const seeded = new MemoryDb({ path: dbPath });
+      seeded.db.exec(`
+        DROP TABLE episode_capability_affinities;
+        DROP TABLE episode_capability_signatures;
+        DROP TABLE procedural_skill_candidates;
+        DROP TABLE policy_sequence_pattern_occurrences;
+        DROP TABLE policy_sequence_patterns;
+        DROP TABLE episode_policy_projection_nodes;
+        DROP TABLE episode_policy_projections;
+        DELETE FROM schema_migrations;
+        INSERT INTO schema_migrations (id, version, applied_at, checksum)
+        VALUES ('009_procedural_span_embeddings', 9, '2026-08-20T00:00:00.000Z', 'v9');
+      `);
+      seeded.close();
+
+      const migrated = new MemoryDb({ path: dbPath });
+      const tables = (migrated.db.prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'table'`
+      ).all() as Array<{ name: string }>).map((table) => table.name);
+      expect(migrated.schemaVersion()).toEqual({
+        version: SCHEMA_VERSION,
+        lastMigrationId: SCHEMA_MIGRATION_ID
+      });
+      expect(tables).toEqual(expect.arrayContaining([
+        "episode_policy_projections",
+        "episode_policy_projection_nodes",
+        "episode_capability_signatures",
+        "episode_capability_affinities",
+        "policy_sequence_patterns",
+        "policy_sequence_pattern_occurrences",
+        "procedural_skill_candidates"
+      ]));
+      expect(existsSync(`${dbPath}.pre-v${SCHEMA_VERSION}.bak`)).toBe(true);
+      migrated.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates schema v10 by adding Policy sequence pattern and SkillCandidate tables", () => {
+    const root = mkdtempSync(join(tmpdir(), "mindock-repo-v10-policy-sequence-migration-"));
+    const dbPath = join(root, "memory.sqlite");
+    try {
+      const seeded = new MemoryDb({ path: dbPath });
+      seeded.db.exec(`
+        DROP TABLE procedural_skill_candidates;
+        DROP TABLE policy_sequence_pattern_occurrences;
+        DROP TABLE policy_sequence_patterns;
+        DELETE FROM schema_migrations;
+        INSERT INTO schema_migrations (id, version, applied_at, checksum)
+        VALUES ('010_episode_policy_projections', 10, '2026-08-20T00:00:00.000Z', 'v10');
+      `);
+      seeded.close();
+
+      const migrated = new MemoryDb({ path: dbPath });
+      const tables = (migrated.db.prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'table'`
+      ).all() as Array<{ name: string }>).map((table) => table.name);
+      expect(migrated.schemaVersion()).toEqual({
+        version: SCHEMA_VERSION,
+        lastMigrationId: SCHEMA_MIGRATION_ID
+      });
+      expect(tables).toEqual(expect.arrayContaining([
+        "policy_sequence_patterns",
+        "policy_sequence_pattern_occurrences",
+        "procedural_skill_candidates"
+      ]));
+      expect(existsSync(`${dbPath}.pre-v${SCHEMA_VERSION}.bak`)).toBe(true);
+      migrated.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates schema v11 by adding Episode Capability discovery and pattern routing fields", () => {
+    const root = mkdtempSync(join(tmpdir(), "mindock-repo-v11-episode-capability-migration-"));
+    const dbPath = join(root, "memory.sqlite");
+    try {
+      const seeded = new MemoryDb({ path: dbPath });
+      const repos = new Repositories(seeded.db);
+      repos.memories.insert(schemaTraceMemory("v11-trace", "already migrated trace", false));
+      seeded.db.exec(`
+        DROP TABLE episode_capability_affinities;
+        DROP TABLE episode_capability_signatures;
+        DROP TABLE procedural_skill_candidates;
+        DROP TABLE policy_sequence_pattern_occurrences;
+        DROP TABLE policy_sequence_patterns;
+        CREATE TABLE policy_sequence_patterns (
+          id TEXT PRIMARY KEY,
+          namespace_id TEXT NOT NULL,
+          schema_version TEXT NOT NULL,
+          algorithm_version TEXT NOT NULL,
+          sequence_hash TEXT NOT NULL,
+          policy_keys_json TEXT NOT NULL CHECK (json_valid(policy_keys_json)),
+          lifecycle_status TEXT NOT NULL,
+          occurrence_count INTEGER NOT NULL DEFAULT 0,
+          distinct_episode_count INTEGER NOT NULL DEFAULT 0,
+          distinct_support_episode_count INTEGER NOT NULL DEFAULT 0,
+          distinct_counterexample_episode_count INTEGER NOT NULL DEFAULT 0,
+          distinct_uncertain_episode_count INTEGER NOT NULL DEFAULT 0,
+          is_closed INTEGER NOT NULL DEFAULT 1,
+          is_maximal INTEGER NOT NULL DEFAULT 1,
+          membership_version TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE (namespace_id, algorithm_version, sequence_hash)
+        );
+        DELETE FROM schema_migrations;
+        INSERT INTO schema_migrations (id, version, applied_at, checksum)
+        VALUES ('011_policy_sequence_patterns', 11, '2026-08-20T00:00:00.000Z', 'v11');
+        CREATE TRIGGER reject_v11_memory_rewrite
+        BEFORE UPDATE ON memories
+        BEGIN
+          SELECT RAISE(ABORT, 'v11 memory rows must not be rewritten');
+        END;
+      `);
+      seeded.close();
+
+      const migrated = new MemoryDb({ path: dbPath });
+      const tables = (migrated.db.prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'table'`
+      ).all() as Array<{ name: string }>).map((table) => table.name);
+      const patternColumns = (migrated.db.prepare(
+        `PRAGMA table_info(policy_sequence_patterns)`
+      ).all() as Array<{ name: string }>).map((column) => column.name);
+      expect(migrated.schemaVersion()).toEqual({
+        version: SCHEMA_VERSION,
+        lastMigrationId: SCHEMA_MIGRATION_ID
+      });
+      expect(tables).toEqual(expect.arrayContaining([
+        "episode_capability_signatures",
+        "episode_capability_affinities",
+        "policy_sequence_pattern_occurrences",
+        "procedural_skill_candidates"
+      ]));
+      expect(patternColumns).toEqual(expect.arrayContaining([
+        "capability_type",
+        "episode_family_id"
+      ]));
+      expect(migrated.db.prepare(`SELECT tags_json FROM memories WHERE id = 'v11-trace'`).get())
+        .toEqual({ tags_json: JSON.stringify(schemaTraceMemory("v11-trace", "already migrated trace", false).tags) });
+      expect(existsSync(`${dbPath}.pre-v${SCHEMA_VERSION}.bak`)).toBe(true);
+      migrated.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates schema v12 by adding the incremental Policy sequence topology index", () => {
+    const root = mkdtempSync(join(tmpdir(), "mindock-repo-v12-policy-sequence-edges-migration-"));
+    const dbPath = join(root, "memory.sqlite");
+    try {
+      const seeded = new MemoryDb({ path: dbPath });
+      seeded.db.exec(`
+        DROP TABLE policy_sequence_pattern_edges;
+        DELETE FROM schema_migrations;
+        INSERT INTO schema_migrations (id, version, applied_at, checksum)
+        VALUES ('012_episode_capability_discovery', 12, '2026-08-20T00:00:00.000Z', 'v12');
+      `);
+      seeded.close();
+
+      const migrated = new MemoryDb({ path: dbPath });
+      expect(migrated.schemaVersion()).toEqual({
+        version: SCHEMA_VERSION,
+        lastMigrationId: SCHEMA_MIGRATION_ID
+      });
+      expect(migrated.db.prepare(
+        `SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name = 'policy_sequence_pattern_edges'`
+      ).get()).toEqual({ name: "policy_sequence_pattern_edges" });
       expect(existsSync(`${dbPath}.pre-v${SCHEMA_VERSION}.bak`)).toBe(true);
       migrated.close();
     } finally {

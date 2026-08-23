@@ -80,6 +80,11 @@ import {
   EmbeddingJobProcessor
 } from "./embedding/embedding-job-processor.js";
 import { EvolutionJobProcessor } from "./evolution/evolution-job-processor.js";
+import {
+  inspectTrace2SkillEpisode,
+  type Trace2SkillDiagnosticReportV1,
+  type Trace2SkillReplayResultV1
+} from "./evolution/trace2skill-replay.js";
 import { traceReflectionWasScored,traceSortKey } from "./evolution/span-pipeline.js";
 import {
   FeedbackExperienceService,
@@ -283,6 +288,11 @@ export class MemoryService {
           crystallizeSkill: (job) => this.evolutionJobs.crystallizeSkill(job),
           associateL2: (job) => this.evolutionJobs.associateL2(job),
           splitBigTurn: (job) => this.evolutionJobs.splitBigTurn(job),
+          reconstructProceduralPath: (job) => this.evolutionJobs.reconstructProceduralPath(job),
+          scoreSpanCredit: (job) => this.evolutionJobs.scoreSpanCredit(job),
+          clusterProceduralSpans: (job) => this.evolutionJobs.clusterProceduralSpans(job),
+          projectEpisodePolicies: (job) => this.evolutionJobs.projectEpisodePolicies(job),
+          minePolicySequences: (job) => this.evolutionJobs.minePolicySequences(job),
           clusterSpans: (job) => this.evolutionJobs.clusterSpans(job),
           auditSpanCluster: (job) => this.evolutionJobs.auditSpanCluster(job)
         },
@@ -303,6 +313,7 @@ export class MemoryService {
       get config() { return evolutionOwner.config; },
       get llm() { return evolutionOwner.llm; },
       get skillLlm() { return evolutionOwner.skillLlm; },
+      get embedder() { return evolutionOwner.embedder; },
       traceMeta: this.traceMeta.bind(this),
       namespaceIdFromMemory,
       buildMemory: (input) => this.buildMemory(input as Parameters<MemoryService["buildMemory"]>[0]),
@@ -1823,6 +1834,28 @@ export class MemoryService {
     } = {}
   ): ReturnType<WorkerRunner["runWorkerOnce"]> {
     return this.workerRunner.runWorkerOnce(limit, request);
+  }
+
+  inspectTrace2SkillEpisode(episodeId: string): Trace2SkillDiagnosticReportV1 {
+    return inspectTrace2SkillEpisode(this.repos, episodeId);
+  }
+
+  replayTrace2SkillEpisode(input: {
+    episodeId: string;
+    at?: string;
+  }): Promise<Trace2SkillReplayResultV1> {
+    return this.withModelTaskContext(() =>
+      this.evolutionJobs.replayTrace2SkillEpisode(input)
+    );
+  }
+
+  reconstructProceduralPathForReplay(input: {
+    episodeId: string;
+    at?: string;
+  }) {
+    return this.withModelTaskContext(() =>
+      this.evolutionJobs.reconstructProceduralPathForReplay(input)
+    );
   }
 
   private async queryVector(query: string): Promise<number[] | undefined> {

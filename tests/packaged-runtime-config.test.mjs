@@ -202,6 +202,24 @@ async function createAsarFixture(root, name, version, includeEnv = false, includ
   );
   mkdirSync(dirname(contracts), { recursive: true });
   writeFileSync(contracts, "export {};\n");
+  const memoryRuntimeFiles = [
+    "src/service/evolution/episode-procedural-reconstructor.js",
+    "src/service/evolution/span-credit-pipeline.js",
+    "src/service/evolution/procedural-span-clustering.js",
+    "src/service/evolution/procedural-policy-induction.js",
+    "src/service/evolution/episode-policy-projection.js",
+    "src/service/evolution/policy-sequence-mining.js",
+    "src/service/evolution/procedural-sequence-skill-compilation.js",
+    "src/service/evolution/trace2skill-replay.js",
+  ];
+  for (const file of memoryRuntimeFiles) {
+    const target = join(source, "dist/runtime/memory", file);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, "export {};\n");
+  }
+  const memoryHttp = join(source, "dist/runtime/memory/src/server/http.js");
+  mkdirSync(dirname(memoryHttp), { recursive: true });
+  writeFileSync(memoryHttp, "export const closedEpisodeIds = [];\n");
   if (includeEnv) writeFileSync(join(source, ".env.production"), "TOKEN=decoy\n");
   await createPackage(source, asar);
   return asar;

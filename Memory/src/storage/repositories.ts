@@ -37,6 +37,14 @@ import {
   type VectorSearchCandidate
 } from "./sqlite-vec-store.js";
 import { SpanClusterRepository } from "./span-cluster-repository.js";
+import { EpisodeProceduralPathRepository } from "./procedural-path-repository.js";
+import { ProceduralSpanClusterRepository } from "./procedural-span-cluster-repository.js";
+import { ProceduralPolicyRepository } from "./procedural-policy-repository.js";
+import { ProceduralSpanCreditRepository } from "./procedural-span-credit-repository.js";
+import { ProceduralSpanEmbeddingRepository } from "./procedural-span-embedding-repository.js";
+import { EpisodePolicyProjectionRepository } from "./episode-policy-projection-repository.js";
+import { EpisodeCapabilityRepository } from "./episode-capability-repository.js";
+import { PolicySequencePatternRepository } from "./policy-sequence-pattern-repository.js";
 
 type SqlValue = string | number | Buffer | null;
 const BUNDLE_TABLES = [
@@ -3909,6 +3917,14 @@ export class Repositories {
   readonly runtime: RuntimeRepository;
   readonly vectors: SqliteVecStore;
   readonly spanClusters: SpanClusterRepository;
+  readonly proceduralPaths: EpisodeProceduralPathRepository;
+  readonly proceduralSpanClusters: ProceduralSpanClusterRepository;
+  readonly proceduralPolicies: ProceduralPolicyRepository;
+  readonly proceduralSpanCredits: ProceduralSpanCreditRepository;
+  readonly proceduralSpanEmbeddings: ProceduralSpanEmbeddingRepository;
+  readonly episodePolicyProjections: EpisodePolicyProjectionRepository;
+  readonly episodeCapabilities: EpisodeCapabilityRepository;
+  readonly policySequencePatterns: PolicySequencePatternRepository;
 
   constructor(readonly db: Database.Database) {
     this.vectors = new SqliteVecStore(db);
@@ -3917,6 +3933,14 @@ export class Repositories {
     this.processing = new MemoryProcessingRepository(db);
     this.runtime = new RuntimeRepository(db);
     this.spanClusters = new SpanClusterRepository(db);
+    this.proceduralPaths = new EpisodeProceduralPathRepository(db);
+    this.proceduralSpanClusters = new ProceduralSpanClusterRepository(db);
+    this.proceduralPolicies = new ProceduralPolicyRepository(db);
+    this.proceduralSpanCredits = new ProceduralSpanCreditRepository(db);
+    this.proceduralSpanEmbeddings = new ProceduralSpanEmbeddingRepository(db);
+    this.episodePolicyProjections = new EpisodePolicyProjectionRepository(db);
+    this.episodeCapabilities = new EpisodeCapabilityRepository(db);
+    this.policySequencePatterns = new PolicySequencePatternRepository(db);
   }
 
   transaction<T>(fn: () => T): T {
@@ -5432,9 +5456,14 @@ function evolutionJobPrioritySql(): string {
              WHEN job_type = 'episode_idle_close' THEN 10
              WHEN job_type = 'reflection' THEN 20
              WHEN job_type = 'reward' THEN 30
+             WHEN job_type = 'procedural_path' THEN 32
+             WHEN job_type = 'span_credit' THEN 34
              WHEN job_type = 'span_big_turn' THEN 35
+             WHEN job_type = 'procedural_span_cluster' THEN 36
              WHEN job_type = 'l2_association' THEN 40
              WHEN job_type = 'l2_induction' THEN 50
+             WHEN job_type = 'episode_policy_projection' THEN 55
+             WHEN job_type = 'policy_sequence_mining' THEN 57
              WHEN job_type = 'l3_abstraction' THEN 60
              WHEN job_type = 'skill_crystallization' THEN 70
              WHEN job_type = 'skill_trial_resolve' THEN 80

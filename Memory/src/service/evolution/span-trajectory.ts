@@ -79,12 +79,15 @@ function buildEvent(call: unknown, index: number): SpanTrajectoryEvent {
     };
   }
   const tool = redactAndClip(call.name, TOOL_NAME_MAX);
-  const success = call.success ?? !call.error;
-  const errorClass = classifyError(call);
+  const inferredError = inferredToolError(call);
+  const success = call.success === false || inferredError
+    ? false
+    : call.success ?? true;
+  const errorClass = classifyError(call, inferredError);
   const inputPreview = previewValue(call.input, INPUT_PREVIEW_MAX);
   const outputPreview = previewValue(call.output, OUTPUT_PREVIEW_MAX);
-  const errorPreview = call.error
-    ? redactAndClip(call.error, ERROR_PREVIEW_MAX)
+  const errorPreview = inferredError
+    ? redactAndClip(inferredError, ERROR_PREVIEW_MAX)
     : undefined;
   return {
     index,
@@ -170,9 +173,9 @@ function hasToolToken(name: string, tokens: readonly string[]): boolean {
   return tokens.some((token) => normalized.includes(token) || name.includes(token));
 }
 
-function classifyError(call: ToolCallPayload): string | undefined {
-  if (!call.error && !call.errorCode && call.success !== false) return undefined;
-  const raw = `${call.errorCode ?? ""}\n${call.error ?? ""}`.toLowerCase();
+function classifyError(call: ToolCallPayload, inferredError?: string): string | undefined {
+  if (!inferredError && !call.errorCode && call.success !== false) return undefined;
+  const raw = `${call.errorCode ?? ""}\n${inferredError ?? ""}`.toLowerCase();
   if (/timeout|timed out|deadline/u.test(raw)) return "timeout";
   if (/403|forbidden|permission|unauthorized|401/u.test(raw)) return "access";
   if (/404|not found|enoent/u.test(raw)) return "not_found";
@@ -181,6 +184,50 @@ function classifyError(call: ToolCallPayload): string | undefined {
   if (/assert|expect|test failed|failure/u.test(raw)) return "test_failure";
   if (/rate.?limit|429/u.test(raw)) return "rate_limit";
   return "error";
+}
+
+function inferredToolError(call: ToolCallPayload): string | undefined {
+  if (typeof call.error === "string" && call.error.trim()) return call.error.trim();
+  if (call.success === false) return "Tool reported success=false";
+  const output = call.output;
+  if (typeof output === "string") {
+    const trimmed = output.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        const structuredError = inferredStructuredOutputError(parsed);
+        if (structuredError) return structuredError;
+      } catch {
+        // Non-JSON text is evaluated by the generic protocol markers below.
+      }
+    }
+    if (/^(?:error|failed|failure|exception|fatal)\b\s*[:\-]?/iu.test(trimmed)) {
+      return trimmed;
+    }
+    if (/\bexit\s+code\s*[:=]?\s*[1-9]\d*\b/iu.test(trimmed)) {
+      return trimmed;
+    }
+    return undefined;
+  }
+  return inferredStructuredOutputError(output);
+}
+
+function inferredStructuredOutputError(output: unknown): string | undefined {
+  if (!isRecord(output)) return undefined;
+  if (output.success === false || output.ok === false) {
+    return previewValue(output.error ?? output.message ?? output, ERROR_PREVIEW_MAX);
+  }
+  if (typeof output.error === "string" && output.error.trim()) return output.error.trim();
+  const status = typeof output.status === "number"
+    ? output.status
+    : typeof output.status === "string" && /^\d{3}$/u.test(output.status.trim())
+      ? Number(output.status)
+      : undefined;
+  if (status !== undefined && status >= 400) {
+    const detail = previewValue(output.message ?? output.statusText ?? output.text, 100);
+    return `HTTP ${status}${detail ? `: ${detail}` : ""}`;
+  }
+  return undefined;
 }
 
 function describeShape(value: unknown): string | undefined {

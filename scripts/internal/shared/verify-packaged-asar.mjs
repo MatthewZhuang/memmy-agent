@@ -16,6 +16,15 @@ const requiredFiles = [
   "dist/main/desktop-edition.json",
   "package.json",
   "dist/runtime/memory/package.json",
+  "dist/runtime/memory/src/server/http.js",
+  "dist/runtime/memory/src/service/evolution/episode-procedural-reconstructor.js",
+  "dist/runtime/memory/src/service/evolution/span-credit-pipeline.js",
+  "dist/runtime/memory/src/service/evolution/procedural-span-clustering.js",
+  "dist/runtime/memory/src/service/evolution/procedural-policy-induction.js",
+  "dist/runtime/memory/src/service/evolution/episode-policy-projection.js",
+  "dist/runtime/memory/src/service/evolution/policy-sequence-mining.js",
+  "dist/runtime/memory/src/service/evolution/procedural-sequence-skill-compilation.js",
+  "dist/runtime/memory/src/service/evolution/trace2skill-replay.js",
   "dist/runtime/memmy-agent/package.json",
   "dist/runtime/memmy-agent/node_modules/@memmy/local-api-contracts/dist/index.js",
 ];
@@ -24,34 +33,35 @@ for (const file of requiredFiles) {
   if (!entrySet.has(file)) throw new Error(`Packaged ASAR is missing required runtime file: ${file}`);
 }
 
-for (const [file, lock] of [
-  ["package.json", false],
-  ["dist/runtime/memory/package.json", false],
-  ["dist/runtime/memory/package-lock.json", true],
-  ["dist/runtime/memmy-agent/package.json", false],
-  ["dist/runtime/memmy-agent/package-lock.json", true],
+for (const file of [
+  "package.json",
+  "dist/runtime/memory/package.json",
+  "dist/runtime/memmy-agent/package.json",
 ]) {
-  // electron-builder excludes npm lockfiles by default. The staged-runtime
-  // version guard validates them before packaging; re-check any that are kept.
-  if (lock && !entrySet.has(file)) continue;
   const json = readAsarJson(asarPath, file);
   if (json.version !== expected) {
     throw new Error(`Packaged version does not match the requested version: ${file}`);
   }
-  if (lock && json.packages?.[""]?.version !== expected) {
-    throw new Error(`Packaged lock root does not match the requested version: ${file}`);
-  }
+}
+
+const memoryHttpSource = readAsarText(asarPath, "dist/runtime/memory/src/server/http.js");
+if (!memoryHttpSource.includes("closedEpisodeIds")) {
+  throw new Error("Packaged Memory close-session response is missing closedEpisodeIds");
 }
 
 console.log(`Verified packaged ASAR boundary and version ${expected}`);
 
 function readAsarJson(path, file) {
   try {
-    const archiveFile = process.platform === "win32" ? file.replaceAll("/", "\\") : file;
-    return JSON.parse(extractFile(path, archiveFile).toString("utf8"));
+    return JSON.parse(readAsarText(path, file));
   } catch {
     throw new Error(`Packaged runtime JSON is invalid: ${file}`);
   }
+}
+
+function readAsarText(path, file) {
+  const archiveFile = process.platform === "win32" ? file.replaceAll("/", "\\") : file;
+  return extractFile(path, archiveFile).toString("utf8");
 }
 
 function parseArgs(args) {

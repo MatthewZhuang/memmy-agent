@@ -431,7 +431,23 @@ describe("MemoryService / REST contract", () => {
         body: "{}"
       }
     );
+    const close = await closeResponse.json() as {
+      ok: boolean;
+      sessionId: string;
+      status: string;
+      closedEpisodeIds: string[];
+      changeSeq?: number;
+      syncCursor?: string;
+    };
     expect(closeResponse.status).toBe(200);
+    expect(close).toMatchObject({
+      ok: true,
+      sessionId: session.sessionId,
+      status: "closed",
+      closedEpisodeIds: expect.any(Array),
+      changeSeq: expect.any(Number),
+      syncCursor: expect.any(String)
+    });
 
     await waitFor(() => {
       const row = db.db.prepare(

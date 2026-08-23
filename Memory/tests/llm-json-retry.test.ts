@@ -95,27 +95,44 @@ describe("memory LLM JSON length retry", () => {
     expect(requestBodies(fetchMock).map((body) => body.max_tokens)).toEqual([4096, 4096]);
   });
 
-  it("returns a summary budget error when reasoning exists without final content", async () => {
+  it("doubles max tokens when reasoning exhausts the budget before final content", async () => {
     const fetchMock = sequenceFetch([
       openAiMessageResponse({
         content: null,
         reasoning_content: "The model spent its output budget reasoning."
-      }, "length")
+      }, "length"),
+      openAiResponse('{"ok":true}', "stop")
     ]);
     vi.stubGlobal("fetch", fetchMock);
 
     const client = createLlmClient(llmConfig({ malformedRetries: 1 }));
-    await expect(client.completeJson(
+    await expect(client.completeJson<{ ok: boolean }>(
       [{ role: "user", content: "generate" }],
       { operation: "capture.summarize" }
-    )).rejects.toThrow("Reasoning exhausted the summary output token budget");
+    )).resolves.toEqual({ ok: true });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(requestBodies(fetchMock).map((body) => body.max_tokens)).toEqual([4096, 8192]);
   });
 
-  it("keeps the standard missing-content error when reasoning is also absent", async () => {
+  it("doubles max tokens for a length stop without exposed reasoning content", async () => {
     const fetchMock = sequenceFetch([
-      openAiMessageResponse({ content: null }, "length")
+      openAiMessageResponse({ content: null }, "length"),
+      openAiResponse('{"ok":true}', "stop")
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = createLlmClient(llmConfig({ malformedRetries: 1 }));
+    await expect(client.completeJson<{ ok: boolean }>(
+      [{ role: "user", content: "generate" }],
+      { operation: "capture.summarize" }
+    )).resolves.toEqual({ ok: true });
+
+    expect(requestBodies(fetchMock).map((body) => body.max_tokens)).toEqual([4096, 8192]);
+  });
+
+  it("keeps the standard missing-content error for a non-length empty response", async () => {
+    const fetchMock = sequenceFetch([
+      openAiMessageResponse({ content: null }, "stop")
     ]);
     vi.stubGlobal("fetch", fetchMock);
 

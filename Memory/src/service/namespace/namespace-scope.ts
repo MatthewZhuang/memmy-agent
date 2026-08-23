@@ -53,3 +53,17 @@ export function profileIdFromMemory(memory: MemoryRow): string | undefined {
 export function namespaceForRawTurn(rawTurn: RawTurnRecord): RuntimeNamespace {
   return { source: DEFAULT_NAMESPACE_SOURCE, profileId: "default", sessionKey: rawTurn.sessionId, userId: rawTurn.userId };
 }
+
+/**
+ * Trace2Skill learns personal procedural capability across every Agent and
+ * workspace connected to the same Memmy user.  Keep this scope separate from
+ * the request/retrieval namespace, which still carries source, project, and
+ * profile coordinates for API compatibility and presentation.
+ */
+export function proceduralLearningScopeIdForSession(
+  session: Pick<SessionRecord, "userId">
+): string {
+  const userId = session.userId.trim();
+  if (!userId) throw new Error("procedural learning scope requires userId");
+  return userId;
+}

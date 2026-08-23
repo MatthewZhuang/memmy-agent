@@ -57,6 +57,17 @@ interface LlmCallResult {
   finishReason?: "stop" | "length" | "other";
 }
 
+class CompletionOutputBudgetExhaustedError extends Error {
+  constructor(
+    message: string,
+    readonly finishReason: LlmCallResult["finishReason"],
+    readonly reasoningContentPresent: boolean
+  ) {
+    super(message);
+    this.name = "CompletionOutputBudgetExhaustedError";
+  }
+}
+
 const OPENAI_COMPAT_THINKING_EFFORT = "medium";
 const ANTHROPIC_THINKING_BUDGET_TOKENS = 4096;
 const ANTHROPIC_MIN_THINKING_OUTPUT_TOKENS = ANTHROPIC_THINKING_BUDGET_TOKENS + 4096;
@@ -169,11 +180,38 @@ class HttpLlmClient implements LlmClient {
     while (true) {
       jsonAttempt += 1;
       const withJsonHint = jsonMessages(messages, lastError, previousWasTruncated);
-      const result = await this.completeResult(withJsonHint, {
-        ...options,
-        maxTokens,
-        jsonMode: true
-      });
+      let result: LlmCallResult;
+      try {
+        result = await this.completeResult(withJsonHint, {
+          ...options,
+          maxTokens,
+          jsonMode: true
+        });
+      } catch (error) {
+        if (!(error instanceof CompletionOutputBudgetExhaustedError) || lengthRetryUsed) {
+          throw error;
+        }
+        const expandedMaxTokens = doubleMaxTokens(maxTokens);
+        if (expandedMaxTokens === undefined) throw error;
+        logger.warn("json.truncated_retry", {
+          role: this.options.modelRole ?? "unspecified",
+          operation: options.operation,
+          provider: this.config.provider,
+          model: this.config.model,
+          attempt: jsonAttempt,
+          finishReason: error.finishReason ?? "unknown",
+          outputChars: 0,
+          previousMaxTokens: maxTokens,
+          nextMaxTokens: expandedMaxTokens,
+          reasoningContentPresent: error.reasoningContentPresent,
+          ...memoryErrorFields(error)
+        });
+        lengthRetryUsed = true;
+        previousWasTruncated = true;
+        maxTokens = expandedMaxTokens;
+        lastError = error;
+        continue;
+      }
       let parsed: T | undefined;
       let parseError: unknown;
       try {
@@ -330,20 +368,26 @@ class HttpLlmClient implements LlmClient {
       }
     });
     const choice = response.choices?.[0];
+    const finishReason = normalizeFinishReason(choice?.finish_reason);
     const text = choice?.message?.content;
+    this.recordTokenUsage(response, options);
     if (typeof text !== "string" || !text.trim()) {
       const reasoningContent = choice?.message?.reasoning_content;
-      if (
-        options.operation === "capture.summarize" &&
-        typeof reasoningContent === "string" &&
-        reasoningContent.trim()
-      ) {
-        throw new Error("Reasoning exhausted the summary output token budget");
+      const reasoningContentPresent = typeof reasoningContent === "string" &&
+        Boolean(reasoningContent.trim());
+      if (reasoningContentPresent || finishReason === "length") {
+        const message = options.operation === "capture.summarize" && reasoningContentPresent
+          ? "Reasoning exhausted the summary output token budget"
+          : "Completion output budget exhausted before final content";
+        throw new CompletionOutputBudgetExhaustedError(
+          message,
+          finishReason,
+          reasoningContentPresent
+        );
       }
       throw new Error("openai_compatible response missing choices[0].message.content");
     }
-    this.recordTokenUsage(response, options);
-    return { text, finishReason: normalizeFinishReason(choice?.finish_reason) };
+    return { text, finishReason };
   }
 
   private async completeGemini(messages: LlmMessage[], options: LlmCompletionOptions): Promise<LlmCallResult> {

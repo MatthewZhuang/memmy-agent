@@ -761,6 +761,9 @@ function publicCloseSessionResponse(result: unknown): Record<string, unknown> {
     ok: record.ok,
     sessionId: record.sessionId,
     status: record.status,
+    closedEpisodeIds: Array.isArray(record.closedEpisodeIds) ? record.closedEpisodeIds : [],
+    ...(typeof record.changeSeq === "number" ? { changeSeq: record.changeSeq } : {}),
+    ...(typeof record.syncCursor === "string" ? { syncCursor: record.syncCursor } : {}),
     serverTime: record.serverTime
   };
 }

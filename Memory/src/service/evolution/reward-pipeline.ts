@@ -29,6 +29,7 @@ import {
   SPAN_BIG_TURN_ENABLED,
   SPAN_BIG_TURN_MIN_TOOL_CALLS
 } from "./big-turn-span-pipeline.js";
+import { spanCreditRewardHash } from "./span-credit-pipeline.js";
 
 type TraceMeta = NonNullable<ReturnType<typeof traceMetaFromMemory>>;
 type HumanScoreResult = ReturnType<typeof heuristicHumanScore>;
@@ -148,6 +149,7 @@ export class RewardPipeline {
           source: "worker.reward.skip.v7",
           createdAt: savedEpisode.updatedAt
         });
+        this.enqueueProceduralState(savedEpisode);
       }
       return;
     }
@@ -197,6 +199,7 @@ export class RewardPipeline {
           source: "worker.reward.backprop.v7",
           createdAt: savedEpisode.updatedAt
         });
+        this.enqueueProceduralState(savedEpisode);
         if (
           this.deps.config.algorithm.negativeExperience.enabled
           && feedback.rHuman <= this.deps.config.algorithm.negativeExperience.failureRTaskThreshold
@@ -334,6 +337,34 @@ export class RewardPipeline {
       });
     }
     if (rewardedEpisode) this.deps.finalizeClosedEpisode(rewardedEpisode, at, "episode_rewarded");
+  }
+
+  private enqueueProceduralState(episode: EpisodeRecord): void {
+    const rewardHash = spanCreditRewardHash(episode);
+    const activePath = this.deps.repos.proceduralPaths.getActiveForEpisode(episode.id);
+    if (!activePath) {
+      this.deps.enqueueJob({
+        jobType: "procedural_path",
+        userId: episode.userId,
+        sessionId: episode.sessionId,
+        episodeId: episode.id,
+        payload: { rewardHash },
+        createdAt: episode.updatedAt
+      });
+      return;
+    }
+    this.deps.enqueueJob({
+      jobType: "span_credit",
+      userId: episode.userId,
+      sessionId: episode.sessionId,
+      episodeId: episode.id,
+      payload: {
+        pathId: activePath.id,
+        pathHash: activePath.pathHash,
+        rewardHash
+      },
+      createdAt: episode.updatedAt
+    });
   }
 
   async scoreFeedbackWithLlm(input: {

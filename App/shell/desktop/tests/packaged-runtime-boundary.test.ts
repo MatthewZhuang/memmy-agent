@@ -1589,10 +1589,13 @@ describe("desktop packaged runtime boundaries", () => {
     expect(prunerSource).toContain('name === ".env" || name.startsWith(".env.")');
     expect(versionGuardSource).toContain('["memory", "memmy-agent"]');
     expect(versionGuardSource).toContain("`staged ${component}`");
+    expect(versionGuardSource).toContain('join(runtime, component, "package-lock.json")');
     expect(asarGuardSource).toContain("Packaged ASAR contains a forbidden environment file");
     expect(asarGuardSource).toContain("dist/main/desktop-edition.json");
     expect(asarGuardSource).toContain("dist/runtime/memmy-agent/package.json");
-    expect(asarGuardSource).toContain("dist/runtime/memory/package-lock.json");
+    expect(asarGuardSource).toContain("procedural-sequence-skill-compilation.js");
+    expect(asarGuardSource).toContain("closedEpisodeIds");
+    expect(asarGuardSource).not.toContain("package-lock.json");
   });
 
   it("points packaged Memory at the bundled local embedding model resources", () => {

@@ -45,6 +45,10 @@ describe("MemoryService / evolution / policy induction", () => {
             ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
             minEpisodesForActivation: 2,
             minGain: -1
+          },
+          spanClustering: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.spanClustering,
+            enabled: false
           }
         }
       }

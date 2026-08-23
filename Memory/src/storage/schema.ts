@@ -1,8 +1,9 @@
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 6;
-export const SCHEMA_MIGRATION_ID = "006_span_embeddings_and_user_memory";
+export const SCHEMA_VERSION = 13;
+export const SCHEMA_MIGRATION_ID = "013_incremental_policy_sequence_refresh";
 const API_LOG_SOURCE_AGENT_MIGRATION_FROM_VERSION = 2;
+const MEMORY_PROCESSING_STATE_MIGRATION_VERSION = 4;
 const PROCESSING_TAGS = new Set([
   "摘要排队中",
   "摘要整理中",
@@ -288,6 +289,441 @@ const statements = [
   `CREATE INDEX IF NOT EXISTS idx_trace_policy_links_l2
     ON trace_policy_links (user_id, l2_memory_id, created_at DESC)`,
 
+  `CREATE TABLE IF NOT EXISTS episode_procedural_paths (
+    id TEXT PRIMARY KEY,
+    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    namespace_id TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    reconstruction_algorithm_version TEXT NOT NULL,
+    reconstruction_model TEXT,
+    source_snapshot_hash TEXT NOT NULL,
+    path_hash TEXT NOT NULL UNIQUE,
+    terminal_reward REAL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'inactive')),
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    deactivated_at TEXT
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_episode_procedural_paths_active
+    ON episode_procedural_paths (episode_id) WHERE status = 'active'`,
+  `CREATE INDEX IF NOT EXISTS idx_episode_procedural_paths_episode_created
+    ON episode_procedural_paths (episode_id, created_at DESC, id DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_episode_procedural_paths_namespace_status
+    ON episode_procedural_paths (namespace_id, status, created_at DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS procedural_span_occurrences (
+    id TEXT PRIMARY KEY,
+    path_id TEXT NOT NULL REFERENCES episode_procedural_paths(id) ON DELETE CASCADE,
+    path_hash TEXT NOT NULL,
+    span_id TEXT NOT NULL,
+    episode_id TEXT NOT NULL,
+    namespace_id TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    projection_version TEXT NOT NULL,
+    span_index INTEGER NOT NULL,
+    local_goal TEXT NOT NULL,
+    entry_condition TEXT NOT NULL,
+    exit_condition TEXT NOT NULL,
+    termination_status TEXT NOT NULL
+      CHECK (termination_status IN ('success', 'failure', 'blocked', 'abandoned')),
+    raw_turn_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(raw_turn_ids_json)),
+    step_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(step_ids_json)),
+    pre_state_id TEXT NOT NULL,
+    post_state_id TEXT NOT NULL,
+    goal_text TEXT NOT NULL,
+    condition_text TEXT NOT NULL,
+    procedure_text TEXT NOT NULL,
+    effect_text TEXT NOT NULL,
+    structure_signature TEXT NOT NULL,
+    span_json TEXT NOT NULL CHECK (json_valid(span_json)),
+    reconstruction_algorithm_version TEXT NOT NULL,
+    reconstruction_model TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (path_id, span_id),
+    UNIQUE (path_id, span_index)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_span_occurrences_path
+    ON procedural_span_occurrences (path_id, span_index ASC)`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_span_occurrences_namespace_episode
+    ON procedural_span_occurrences (namespace_id, episode_id, span_index ASC)`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_span_occurrences_span
+    ON procedural_span_occurrences (span_id, created_at DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS procedural_span_occurrence_embeddings (
+    id TEXT PRIMARY KEY,
+    occurrence_id TEXT NOT NULL REFERENCES procedural_span_occurrences(id) ON DELETE CASCADE,
+    namespace_id TEXT NOT NULL,
+    projection_version TEXT NOT NULL,
+    embedding_version TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    embedding_provider TEXT NOT NULL,
+    embedding_model TEXT NOT NULL,
+    embedding_dim INTEGER NOT NULL CHECK (embedding_dim > 0),
+    goal_vector_json TEXT NOT NULL CHECK (json_valid(goal_vector_json)),
+    procedure_vector_json TEXT NOT NULL CHECK (json_valid(procedure_vector_json)),
+    effect_vector_json TEXT NOT NULL CHECK (json_valid(effect_vector_json)),
+    content_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (
+      occurrence_id, projection_version, embedding_version,
+      source_hash, embedding_provider, embedding_model
+    )
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_span_embeddings_occurrence
+    ON procedural_span_occurrence_embeddings (occurrence_id, updated_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_span_embeddings_namespace_model
+    ON procedural_span_occurrence_embeddings (
+      namespace_id, embedding_version, embedding_provider, embedding_model, updated_at DESC
+    )`,
+
+  `CREATE TABLE IF NOT EXISTS episode_span_credit_runs (
+    id TEXT PRIMARY KEY,
+    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    path_id TEXT NOT NULL REFERENCES episode_procedural_paths(id) ON DELETE CASCADE,
+    path_hash TEXT NOT NULL,
+    namespace_id TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    reward_hash TEXT NOT NULL,
+    goal_achievement REAL NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'inactive')),
+    scorer_model TEXT,
+    content_hash TEXT NOT NULL UNIQUE,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    deactivated_at TEXT,
+    UNIQUE (path_id, reward_hash, algorithm_version)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_episode_span_credit_runs_active
+    ON episode_span_credit_runs (episode_id) WHERE status = 'active'`,
+  `CREATE INDEX IF NOT EXISTS idx_episode_span_credit_runs_path_created
+    ON episode_span_credit_runs (path_id, created_at DESC, id DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_episode_span_credit_runs_namespace_status
+    ON episode_span_credit_runs (namespace_id, status, created_at DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS procedural_span_credits (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES episode_span_credit_runs(id) ON DELETE CASCADE,
+    occurrence_id TEXT NOT NULL REFERENCES procedural_span_occurrences(id) ON DELETE CASCADE,
+    span_id TEXT NOT NULL,
+    span_index INTEGER NOT NULL,
+    episode_id TEXT NOT NULL,
+    path_id TEXT NOT NULL,
+    path_hash TEXT NOT NULL,
+    reward_hash TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    pre_state_id TEXT NOT NULL,
+    post_state_id TEXT NOT NULL,
+    goal_credit REAL NOT NULL CHECK (goal_credit >= -1 AND goal_credit <= 1),
+    process_quality REAL NOT NULL CHECK (process_quality >= -1 AND process_quality <= 1),
+    confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+    credit_score REAL NOT NULL CHECK (credit_score >= -1 AND credit_score <= 1),
+    evidence_role TEXT NOT NULL
+      CHECK (evidence_role IN ('support', 'counterexample', 'neutral', 'uncertain')),
+    evidence_refs_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(evidence_refs_json)),
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (run_id, occurrence_id),
+    UNIQUE (run_id, span_index)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_span_credits_occurrence
+    ON procedural_span_credits (occurrence_id, created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_span_credits_episode_role
+    ON procedural_span_credits (episode_id, evidence_role, span_index ASC)`,
+
+  `CREATE TABLE IF NOT EXISTS procedural_span_clusters (
+    id TEXT PRIMARY KEY,
+    namespace_id TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('forming', 'ready', 'promoted', 'stale')),
+    member_count INTEGER NOT NULL,
+    distinct_episode_count INTEGER NOT NULL,
+    distinct_support_episode_count INTEGER NOT NULL,
+    membership_version TEXT NOT NULL,
+    anchor_occurrence_id TEXT NOT NULL,
+    active_policy_version_id TEXT,
+    cluster_basis_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(cluster_basis_json)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_span_clusters_scope_status
+    ON procedural_span_clusters (namespace_id, algorithm_version, status, updated_at DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS procedural_span_cluster_members (
+    cluster_id TEXT NOT NULL REFERENCES procedural_span_clusters(id) ON DELETE CASCADE,
+    occurrence_id TEXT NOT NULL REFERENCES procedural_span_occurrences(id) ON DELETE CASCADE,
+    algorithm_version TEXT NOT NULL,
+    episode_id TEXT NOT NULL,
+    evidence_role TEXT NOT NULL CHECK (evidence_role IN ('support', 'counterexample')),
+    similarity REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (cluster_id, occurrence_id)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_procedural_span_cluster_member_algorithm
+    ON procedural_span_cluster_members (occurrence_id, algorithm_version)`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_span_cluster_members_cluster
+    ON procedural_span_cluster_members (cluster_id, evidence_role, episode_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_span_cluster_members_episode_algorithm
+    ON procedural_span_cluster_members (episode_id, algorithm_version, occurrence_id)`,
+
+  `CREATE TABLE IF NOT EXISTS procedural_policy_versions (
+    id TEXT PRIMARY KEY,
+    policy_key TEXT NOT NULL,
+    namespace_id TEXT NOT NULL,
+    cluster_id TEXT NOT NULL REFERENCES procedural_span_clusters(id) ON DELETE CASCADE,
+    cluster_membership_version TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    induction_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'inactive')),
+    title TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    evidence_hash TEXT NOT NULL,
+    evidence_occurrence_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(evidence_occurrence_ids_json)),
+    compiler_model TEXT,
+    l2_memory_id TEXT,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    deactivated_at TEXT,
+    UNIQUE (cluster_id, cluster_membership_version, induction_version)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_procedural_policy_versions_active
+    ON procedural_policy_versions (cluster_id) WHERE status = 'active'`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_policy_versions_scope_status
+    ON procedural_policy_versions (namespace_id, status, created_at DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS procedural_policy_occurrences (
+    id TEXT PRIMARY KEY,
+    policy_version_id TEXT NOT NULL REFERENCES procedural_policy_versions(id) ON DELETE CASCADE,
+    policy_key TEXT NOT NULL,
+    occurrence_id TEXT NOT NULL REFERENCES procedural_span_occurrences(id) ON DELETE CASCADE,
+    path_id TEXT NOT NULL,
+    span_id TEXT NOT NULL,
+    episode_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    cluster_membership_version TEXT NOT NULL,
+    evidence_role TEXT NOT NULL CHECK (evidence_role IN ('support', 'counterexample')),
+    match_confidence REAL NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'superseded')),
+    created_at TEXT NOT NULL,
+    superseded_at TEXT,
+    UNIQUE (policy_version_id, occurrence_id)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_procedural_policy_occurrence_active
+    ON procedural_policy_occurrences (policy_key, occurrence_id) WHERE status = 'active'`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_policy_occurrences_episode
+    ON procedural_policy_occurrences (episode_id, status, created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_policy_occurrences_policy
+    ON procedural_policy_occurrences (policy_version_id, status, occurrence_id)`,
+
+  `CREATE TABLE IF NOT EXISTS episode_policy_projections (
+    id TEXT PRIMARY KEY,
+    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    path_id TEXT NOT NULL REFERENCES episode_procedural_paths(id) ON DELETE CASCADE,
+    path_hash TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    namespace_id TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    assignment_snapshot_hash TEXT NOT NULL,
+    projection_hash TEXT NOT NULL UNIQUE,
+    mapped_span_count INTEGER NOT NULL CHECK (mapped_span_count >= 0),
+    unmapped_span_count INTEGER NOT NULL CHECK (unmapped_span_count >= 0),
+    status TEXT NOT NULL CHECK (status IN ('active', 'inactive')),
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    deactivated_at TEXT
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_episode_policy_projections_active
+    ON episode_policy_projections (episode_id) WHERE status = 'active'`,
+  `CREATE INDEX IF NOT EXISTS idx_episode_policy_projections_path_created
+    ON episode_policy_projections (path_id, created_at DESC, id DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_episode_policy_projections_namespace_status
+    ON episode_policy_projections (namespace_id, status, created_at DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS episode_policy_projection_nodes (
+    projection_id TEXT NOT NULL REFERENCES episode_policy_projections(id) ON DELETE CASCADE,
+    node_index INTEGER NOT NULL CHECK (node_index >= 0),
+    node_kind TEXT NOT NULL CHECK (node_kind IN ('policy', 'unmapped')),
+    occurrence_id TEXT NOT NULL REFERENCES procedural_span_occurrences(id) ON DELETE CASCADE,
+    span_id TEXT NOT NULL,
+    span_index INTEGER NOT NULL CHECK (span_index >= 0),
+    pre_state_id TEXT NOT NULL,
+    post_state_id TEXT NOT NULL,
+    policy_version_id TEXT,
+    policy_key TEXT,
+    cluster_id TEXT,
+    cluster_membership_version TEXT,
+    evidence_role TEXT CHECK (evidence_role IS NULL OR evidence_role IN ('support', 'counterexample')),
+    match_confidence REAL CHECK (match_confidence IS NULL OR (match_confidence >= 0 AND match_confidence <= 1)),
+    unmapped_reason TEXT CHECK (unmapped_reason IS NULL OR unmapped_reason IN (
+      'no_cluster_assignment', 'cluster_forming', 'cluster_ready_policy_pending',
+      'cluster_stale', 'active_policy_occurrence_missing'
+    )),
+    node_json TEXT NOT NULL CHECK (json_valid(node_json)),
+    PRIMARY KEY (projection_id, node_index),
+    UNIQUE (projection_id, occurrence_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_episode_policy_projection_nodes_policy
+    ON episode_policy_projection_nodes (policy_version_id, projection_id, node_index)`,
+  `CREATE INDEX IF NOT EXISTS idx_episode_policy_projection_nodes_policy_key
+    ON episode_policy_projection_nodes (policy_key, projection_id, node_index)`,
+  `CREATE INDEX IF NOT EXISTS idx_episode_policy_projection_nodes_occurrence
+    ON episode_policy_projection_nodes (occurrence_id, projection_id)`,
+
+  `CREATE TABLE IF NOT EXISTS episode_capability_signatures (
+    id TEXT PRIMARY KEY,
+    projection_id TEXT NOT NULL REFERENCES episode_policy_projections(id) ON DELETE CASCADE,
+    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    path_id TEXT NOT NULL REFERENCES episode_procedural_paths(id) ON DELETE CASCADE,
+    namespace_id TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    signature_hash TEXT NOT NULL UNIQUE,
+    family_id TEXT NOT NULL,
+    embedding_provider TEXT NOT NULL,
+    embedding_model TEXT NOT NULL,
+    embedding_dim INTEGER NOT NULL CHECK (embedding_dim > 0),
+    goal_vector_json TEXT NOT NULL CHECK (json_valid(goal_vector_json)),
+    state_transition_vector_json TEXT NOT NULL CHECK (json_valid(state_transition_vector_json)),
+    outcome_vector_json TEXT NOT NULL CHECK (json_valid(outcome_vector_json)),
+    context_vector_json TEXT NOT NULL CHECK (json_valid(context_vector_json)),
+    status TEXT NOT NULL CHECK (status IN ('active', 'inactive')),
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    deactivated_at TEXT,
+    UNIQUE (projection_id, algorithm_version)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_episode_capability_signatures_active
+    ON episode_capability_signatures (episode_id) WHERE status = 'active'`,
+  `CREATE INDEX IF NOT EXISTS idx_episode_capability_signatures_scope_family
+    ON episode_capability_signatures (namespace_id, family_id, status, created_at DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS episode_capability_affinities (
+    id TEXT PRIMARY KEY,
+    namespace_id TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    left_signature_id TEXT NOT NULL
+      REFERENCES episode_capability_signatures(id) ON DELETE CASCADE,
+    right_signature_id TEXT NOT NULL
+      REFERENCES episode_capability_signatures(id) ON DELETE CASCADE,
+    left_episode_id TEXT NOT NULL,
+    right_episode_id TEXT NOT NULL,
+    goal_similarity REAL NOT NULL,
+    state_transition_similarity REAL NOT NULL,
+    outcome_similarity REAL NOT NULL,
+    context_similarity REAL NOT NULL,
+    path_structure_similarity REAL NOT NULL,
+    combined_similarity REAL NOT NULL,
+    family_eligible INTEGER NOT NULL CHECK (family_eligible IN (0, 1)),
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    created_at TEXT NOT NULL,
+    UNIQUE (left_signature_id, right_signature_id, algorithm_version),
+    CHECK (left_signature_id < right_signature_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_episode_capability_affinities_scope_eligible
+    ON episode_capability_affinities
+      (namespace_id, family_eligible, combined_similarity DESC, created_at DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS policy_sequence_patterns (
+    id TEXT PRIMARY KEY,
+    namespace_id TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    sequence_hash TEXT NOT NULL,
+    capability_type TEXT NOT NULL DEFAULT 'sub_skill'
+      CHECK (capability_type IN ('task_skill', 'sub_skill')),
+    episode_family_id TEXT,
+    policy_keys_json TEXT NOT NULL CHECK (json_valid(policy_keys_json)),
+    lifecycle_status TEXT NOT NULL
+      CHECK (lifecycle_status IN ('forming', 'observed', 'ready', 'stale')),
+    occurrence_count INTEGER NOT NULL DEFAULT 0 CHECK (occurrence_count >= 0),
+    distinct_episode_count INTEGER NOT NULL DEFAULT 0 CHECK (distinct_episode_count >= 0),
+    distinct_support_episode_count INTEGER NOT NULL DEFAULT 0
+      CHECK (distinct_support_episode_count >= 0),
+    distinct_counterexample_episode_count INTEGER NOT NULL DEFAULT 0
+      CHECK (distinct_counterexample_episode_count >= 0),
+    distinct_uncertain_episode_count INTEGER NOT NULL DEFAULT 0
+      CHECK (distinct_uncertain_episode_count >= 0),
+    is_closed INTEGER NOT NULL DEFAULT 1 CHECK (is_closed IN (0, 1)),
+    is_maximal INTEGER NOT NULL DEFAULT 1 CHECK (is_maximal IN (0, 1)),
+    membership_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (namespace_id, algorithm_version, sequence_hash)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_policy_sequence_patterns_scope_status
+    ON policy_sequence_patterns (namespace_id, algorithm_version, lifecycle_status, updated_at DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS policy_sequence_pattern_edges (
+    parent_pattern_id TEXT NOT NULL
+      REFERENCES policy_sequence_patterns(id) ON DELETE CASCADE,
+    child_pattern_id TEXT NOT NULL
+      REFERENCES policy_sequence_patterns(id) ON DELETE CASCADE,
+    PRIMARY KEY (parent_pattern_id, child_pattern_id),
+    CHECK (parent_pattern_id != child_pattern_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_policy_sequence_pattern_edges_child
+    ON policy_sequence_pattern_edges (child_pattern_id, parent_pattern_id)`,
+
+  `CREATE TABLE IF NOT EXISTS policy_sequence_pattern_occurrences (
+    id TEXT PRIMARY KEY,
+    pattern_id TEXT NOT NULL REFERENCES policy_sequence_patterns(id) ON DELETE CASCADE,
+    projection_id TEXT NOT NULL REFERENCES episode_policy_projections(id) ON DELETE CASCADE,
+    episode_id TEXT NOT NULL,
+    path_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    start_node_index INTEGER NOT NULL CHECK (start_node_index >= 0),
+    end_node_index INTEGER NOT NULL CHECK (end_node_index >= start_node_index),
+    evidence_role TEXT NOT NULL
+      CHECK (evidence_role IN ('support', 'counterexample', 'uncertain')),
+    terminal_reward REAL,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    status TEXT NOT NULL CHECK (status IN ('active', 'superseded')),
+    created_at TEXT NOT NULL,
+    superseded_at TEXT,
+    UNIQUE (pattern_id, projection_id, start_node_index, end_node_index)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_policy_sequence_occurrences_pattern_status
+    ON policy_sequence_pattern_occurrences (pattern_id, status, episode_id, start_node_index)`,
+  `CREATE INDEX IF NOT EXISTS idx_policy_sequence_occurrences_episode_status
+    ON policy_sequence_pattern_occurrences (episode_id, status, projection_id)`,
+
+  `CREATE TABLE IF NOT EXISTS procedural_skill_candidates (
+    id TEXT PRIMARY KEY,
+    candidate_key TEXT NOT NULL,
+    namespace_id TEXT NOT NULL,
+    pattern_id TEXT NOT NULL REFERENCES policy_sequence_patterns(id) ON DELETE CASCADE,
+    pattern_membership_version TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    induction_version TEXT NOT NULL,
+    lifecycle_status TEXT NOT NULL CHECK (lifecycle_status IN ('observed', 'ready')),
+    status TEXT NOT NULL CHECK (status IN ('active', 'inactive')),
+    distinct_support_episode_count INTEGER NOT NULL
+      CHECK (distinct_support_episode_count >= 0),
+    distinct_counterexample_episode_count INTEGER NOT NULL
+      CHECK (distinct_counterexample_episode_count >= 0),
+    evidence_hash TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    deactivated_at TEXT,
+    UNIQUE (pattern_id, pattern_membership_version, induction_version)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_procedural_skill_candidates_active
+    ON procedural_skill_candidates (pattern_id) WHERE status = 'active'`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_skill_candidates_scope_status
+    ON procedural_skill_candidates (namespace_id, lifecycle_status, status, created_at DESC)`,
+
   `CREATE TABLE IF NOT EXISTS span_clusters (
     id TEXT PRIMARY KEY,
     scope_id TEXT NOT NULL,
@@ -535,7 +971,7 @@ export function migrate(db: Database.Database): void {
   const hasMemories = tableExists(db, "memories");
   const version = currentSchemaVersion(db);
 
-  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5) {
+  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11 && version !== 12) {
     throw new Error(
       `Unsupported memory database schema version ${version}; the database was left unchanged`
     );
@@ -556,6 +992,8 @@ export function migrate(db: Database.Database): void {
       for (const statement of statements) {
         db.prepare(statement).run();
       }
+      ensureEpisodeCapabilityDiscoverySchema(db);
+      if (version < 13) backfillPolicySequencePatternEdges(db);
       ensureSpanEmbeddingVectorSchema(db);
       addColumnIfMissing(db, "recall_events", "query_id", "TEXT");
       addColumnIfMissing(db, "recall_events", "user_memory_candidate_ids_json", "TEXT NOT NULL DEFAULT '[]'");
@@ -568,7 +1006,7 @@ export function migrate(db: Database.Database): void {
          WHERE dedupe_key IS NOT NULL AND status IN ('queued', 'leased', 'failed')`
       ).run();
 
-      if (hasMemories && version < SCHEMA_VERSION) {
+      if (hasMemories && version < MEMORY_PROCESSING_STATE_MIGRATION_VERSION) {
         backfillMemoryProcessingState(db, now);
         removeLegacyProcessingMetadata(db);
       }
@@ -595,6 +1033,90 @@ function addColumnIfMissing(
 ): void {
   if (!columnExists(db, table, column)) {
     db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+  }
+}
+
+function ensureEpisodeCapabilityDiscoverySchema(db: Database.Database): void {
+  if (!columnExists(db, "policy_sequence_patterns", "capability_type")) {
+    db.prepare(
+      `ALTER TABLE policy_sequence_patterns
+       ADD COLUMN capability_type TEXT NOT NULL DEFAULT 'sub_skill'
+       CHECK (capability_type IN ('task_skill', 'sub_skill'))`
+    ).run();
+  }
+  if (!columnExists(db, "policy_sequence_patterns", "episode_family_id")) {
+    db.prepare(
+      `ALTER TABLE policy_sequence_patterns ADD COLUMN episode_family_id TEXT`
+    ).run();
+  }
+}
+
+function backfillPolicySequencePatternEdges(db: Database.Database): void {
+  if (!tableExists(db, "policy_sequence_patterns") ||
+      !tableExists(db, "policy_sequence_pattern_edges")) return;
+  const rows = db.prepare(
+    `SELECT id, namespace_id, algorithm_version, capability_type,
+            episode_family_id, policy_keys_json
+     FROM policy_sequence_patterns`
+  ).all() as Array<{
+    id: string;
+    namespace_id: string;
+    algorithm_version: string;
+    capability_type: string;
+    episode_family_id: string | null;
+    policy_keys_json: string;
+  }>;
+  const patterns = rows.map((row) => ({
+    ...row,
+    policyKeys: parseStringArray(row.policy_keys_json)
+  }));
+  const idBySequence = new Map(patterns.map((pattern) => [
+    policySequenceTopologyKey(pattern, pattern.policyKeys),
+    pattern.id
+  ]));
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO policy_sequence_pattern_edges (
+       parent_pattern_id, child_pattern_id
+     ) VALUES (?, ?)`
+  );
+  for (const child of patterns) {
+    if (child.policyKeys.length <= 2) continue;
+    for (const parentKeys of [
+      child.policyKeys.slice(1),
+      child.policyKeys.slice(0, -1)
+    ]) {
+      const parentId = idBySequence.get(policySequenceTopologyKey(child, parentKeys));
+      if (parentId) insert.run(parentId, child.id);
+    }
+  }
+}
+
+function policySequenceTopologyKey(
+  pattern: {
+    namespace_id: string;
+    algorithm_version: string;
+    capability_type: string;
+    episode_family_id: string | null;
+  },
+  policyKeys: readonly string[]
+): string {
+  return JSON.stringify([
+    pattern.namespace_id,
+    pattern.algorithm_version,
+    pattern.capability_type,
+    pattern.episode_family_id,
+    policyKeys
+  ]);
+}
+
+function parseStringArray(value: string): string[] {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) && parsed.every((item) => typeof item === "string")
+      ? parsed
+      : [];
+  } catch {
+    return [];
   }
 }
 

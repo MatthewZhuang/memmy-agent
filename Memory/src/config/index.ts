@@ -173,6 +173,7 @@ export interface AlgorithmConfig {
   };
   spanClustering: {
     enabled: boolean;
+    proceduralSimilarityThreshold: number;
     goalSimilarityThreshold: number;
     policySimilarityThreshold: number;
     minDistinctSources: number;
@@ -403,8 +404,9 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
     },
     spanClustering: {
       enabled: true,
-      goalSimilarityThreshold: 0.9,
-      policySimilarityThreshold: 0.78,
+      proceduralSimilarityThreshold: 0.8,
+      goalSimilarityThreshold: 0.78,
+      policySimilarityThreshold: 0.86,
       minDistinctSources: 2,
       auditMinMembers: 5,
       auditCohesionThreshold: 0.85,
@@ -1020,6 +1022,10 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
         spanClustering.enabled,
         DEFAULT_MEMMY_CONFIG.algorithm.spanClustering.enabled
       ),
+      proceduralSimilarityThreshold: clamp01(numberValue(
+        spanClustering.proceduralSimilarityThreshold,
+        DEFAULT_MEMMY_CONFIG.algorithm.spanClustering.proceduralSimilarityThreshold
+      )),
       goalSimilarityThreshold: clamp01(numberValue(
         spanClustering.goalSimilarityThreshold,
         DEFAULT_MEMMY_CONFIG.algorithm.spanClustering.goalSimilarityThreshold

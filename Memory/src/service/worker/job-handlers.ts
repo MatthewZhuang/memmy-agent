@@ -63,6 +63,11 @@ export interface WorkerJobProcessors {
     crystallizeSkill(job: EvolutionJobRecord): MaybePromise<void>;
     associateL2(job: EvolutionJobRecord): MaybePromise<void>;
     splitBigTurn(job: EvolutionJobRecord): MaybePromise<void>;
+    reconstructProceduralPath(job: EvolutionJobRecord): MaybePromise<void>;
+    scoreSpanCredit(job: EvolutionJobRecord): MaybePromise<void>;
+    clusterProceduralSpans(job: EvolutionJobRecord): MaybePromise<void>;
+    projectEpisodePolicies(job: EvolutionJobRecord): MaybePromise<void>;
+    minePolicySequences(job: EvolutionJobRecord): MaybePromise<void>;
     clusterSpans(job: EvolutionJobRecord): MaybePromise<void>;
     auditSpanCluster(job: EvolutionJobRecord): MaybePromise<void>;
   };
@@ -240,6 +245,21 @@ export async function processJob(
       return;
     case "span_big_turn":
       await deps.processors.evolution.splitBigTurn(job);
+      return;
+    case "procedural_path":
+      await deps.processors.evolution.reconstructProceduralPath(job);
+      return;
+    case "span_credit":
+      await deps.processors.evolution.scoreSpanCredit(job);
+      return;
+    case "procedural_span_cluster":
+      await deps.processors.evolution.clusterProceduralSpans(job);
+      return;
+    case "episode_policy_projection":
+      await deps.processors.evolution.projectEpisodePolicies(job);
+      return;
+    case "policy_sequence_mining":
+      await deps.processors.evolution.minePolicySequences(job);
       return;
     case "span_cluster":
       await deps.processors.evolution.clusterSpans(job);
@@ -548,6 +568,26 @@ export function evolutionJobDedupeKey(input: Pick<EnqueueJobInput, "jobType" | "
       return input.episodeId ? `reward:${input.episodeId}` : target ? `reward:${target}` : undefined;
     case "span_big_turn":
       return target ? `span_big_turn:${target}` : undefined;
+    case "procedural_path":
+      return input.episodeId
+        ? `procedural_path:${input.episodeId}:${payloadString("rewardHash") ?? "unrewarded"}`
+        : undefined;
+    case "span_credit":
+      return input.episodeId && payloadString("pathHash") && payloadString("rewardHash")
+        ? `span_credit:${input.episodeId}:${payloadString("pathHash")}:${payloadString("rewardHash")}`
+        : undefined;
+    case "procedural_span_cluster":
+      return payloadString("creditRunId")
+        ? `procedural_span_cluster:${payloadString("creditRunId")}:${payloadString("algorithmVersion") ?? "procedural-span-semantic-cluster.v5"}`
+        : undefined;
+    case "episode_policy_projection":
+      return input.episodeId && payloadString("pathHash")
+        ? `episode_policy_projection:${input.episodeId}:${payloadString("pathHash")}`
+        : undefined;
+    case "policy_sequence_mining":
+      return payloadString("projectionId")
+        ? `policy_sequence_mining:${payloadString("projectionId")}`
+        : undefined;
     case "span_cluster":
       return payloadString("scopeId")
         ? `span_cluster:${payloadString("scopeId")}:${payloadString("algorithmVersion") ?? "span-cluster.v1"}`
@@ -564,6 +604,10 @@ export function evolutionJobDedupeKey(input: Pick<EnqueueJobInput, "jobType" | "
     case "l2_association":
       return target ? `l2_association:${target}` : undefined;
     case "l2_induction": {
+      const proceduralClusterId = payloadString("proceduralClusterId");
+      if (proceduralClusterId) {
+        return `l2_induction:procedural:${proceduralClusterId}:${payloadString("membershipVersion") ?? "current"}`;
+      }
       const seed = target ?? payloadString("sourceMemoryId") ?? payloadString("seedMemoryId");
       return seed ? `l2_induction:${seed}` : input.episodeId ? `l2_induction:${input.episodeId}` : undefined;
     }
@@ -575,6 +619,10 @@ export function evolutionJobDedupeKey(input: Pick<EnqueueJobInput, "jobType" | "
       return basis ? `l3_abstraction:${basis}` : input.episodeId ? `l3_abstraction:${input.episodeId}` : undefined;
     }
     case "skill_crystallization": {
+      const proceduralCandidateId = payloadString("proceduralSkillCandidateId");
+      if (proceduralCandidateId) {
+        return `skill_crystallization:procedural:${proceduralCandidateId}:${payloadString("evidenceHash") ?? "current"}`;
+      }
       const seed = payloadString("skillId") ?? target ?? payloadString("policyId");
       return seed ? `skill_crystallization:${seed}` : input.episodeId ? `skill_crystallization:${input.episodeId}` : undefined;
     }

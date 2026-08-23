@@ -68,8 +68,9 @@ describe("memmy memory config", () => {
     });
     expect(loadMemmyConfig(configPath).config.algorithm.spanClustering).toMatchObject({
       enabled: true,
-      goalSimilarityThreshold: 0.9,
-      policySimilarityThreshold: 0.78,
+      proceduralSimilarityThreshold: 0.8,
+      goalSimilarityThreshold: 0.78,
+      policySimilarityThreshold: 0.86,
       minDistinctSources: 2,
       auditMinMembers: 5,
       auditCohesionThreshold: 0.85,
@@ -87,6 +88,7 @@ describe("memmy memory config", () => {
       memmyMemory: {
         algorithm: {
           spanClustering: {
+            proceduralSimilarityThreshold: 0.83,
             goalSimilarityThreshold: 0.8,
             auditMinMembers: 8,
             auditCohesionThreshold: 0.9,
@@ -98,8 +100,9 @@ describe("memmy memory config", () => {
 
     expect(loadMemmyConfig(configPath).config.algorithm.spanClustering).toMatchObject({
       enabled: true,
+      proceduralSimilarityThreshold: 0.83,
       goalSimilarityThreshold: 0.8,
-      policySimilarityThreshold: 0.78,
+      policySimilarityThreshold: 0.86,
       minDistinctSources: 2,
       auditMinMembers: 8,
       auditCohesionThreshold: 0.9,

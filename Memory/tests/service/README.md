@@ -25,6 +25,11 @@ unchanged during migration so failures remain searchable with `rg` and Vitest
 | Evolution     | Reward                  | `evolution/reward.test.ts`                | `MemoryService / evolution / reward`              | episode reward, R_human, reward backpropagation                            | integration |
 | Evolution     | Negative experience     | `evolution/negative-experience.test.ts`   | `MemoryService / evolution / negative experience` | explicit and implicit failures, avoidance policies, preferences            | integration |
 | Evolution     | Policy induction        | `evolution/policy-induction.test.ts`      | `MemoryService / evolution / policy induction`    | L2 association, support, promotion, induction                              | integration |
+| Evolution     | Procedural Policy        | `evolution/procedural-policy-induction.test.ts` | `procedural Span Policy induction`            | cross-Episode evidence, repair, occurrence mapping, version rollback       | integration |
+| Evolution     | Episode SpanCredit       | `evolution/span-credit.test.ts`            | `Episode SpanCredit scoring`                     | reward conservation, structured repair, automatic evidence polarity       | integration |
+| Evolution     | Procedural clustering    | `evolution/procedural-span-clustering.test.ts` | `automatic procedural Span semantic clustering` | credit-run idempotency, incremental attach/detach, cross-Episode Policy     | integration |
+| Evolution     | Episode Policy projection | `evolution/episode-policy-projection.test.ts` | `Episode Policy Projection`                     | ordered Span-to-Policy projection and explicit UNMAPPED nodes               | integration |
+| Evolution     | Dual-entry procedural Skill | `evolution/policy-sequence-mining.test.ts`   | `dual-entry Policy sequence mining v2`          | Episode-family task Skills, cross-family sub-skills, Gap evidence, two-Episode compilation, rollback | integration |
 | Evolution     | World model             | `evolution/world-model.test.ts`           | `MemoryService / evolution / world model`         | L3 abstraction, merge, cooldown, invalid draft                             | integration |
 | Evolution     | Skill lifecycle         | `evolution/skill-lifecycle.test.ts`       | `MemoryService / evolution / skill lifecycle`     | crystallization, debounce, archival, reward drift                          | integration |
 | Evolution     | Large-turn spans        | `evolution/span-big-turn.test.ts`         | `MemoryService / evolution / span big turn`       | large-turn decomposition, Span creation, summaries, fallback               | integration |
@@ -84,3 +89,29 @@ npx vitest run tests/service
 - Each test file must register fixture cleanup explicitly with `afterEach`.
 
 The REST contract suite requires permission to listen on `127.0.0.1`; the facade suite does not open a local server.
+
+## Trace2Skill replay diagnostics
+
+Run these commands from the `Memory` package directory. `inspect` is read-only.
+`dry-run` copies only the selected Episodes and their Trace2Skill dependency
+closure into a temporary database, upgrades that copy to the current schema,
+and deletes it after the report is written.
+
+```bash
+npm run trace2skill:replay -- \
+  --episode episode_example \
+  --mode inspect \
+  --output /absolute/path/trace2skill-inspect.json
+
+npm run trace2skill:replay -- \
+  --episode episode_example \
+  --mode dry-run \
+  --from raw \
+  --output /absolute/path/trace2skill-raw-replay.json
+```
+
+`--from path` replays Projection → sequence mining → Skill compilation from
+the active procedural path. `--from raw` additionally runs the production raw
+turn → Step semantics → Span reconciliation → SpanCredit → clustering → Policy
+chain and is intentionally dry-run only. A source-database replay is limited to
+`--from path --mode commit --confirm-write`.
