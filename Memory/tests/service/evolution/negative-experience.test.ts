@@ -39,10 +39,22 @@ function createCountingLlm(
       return "{}";
     },
     async completeJson<T extends Record<string, unknown>>(
-      _messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+      messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
       options: { operation: string }
     ): Promise<T> {
       operations.push(options.operation);
+      if (options.operation === "capture.summarize") {
+        const payload = messages.find((message) => message.role === "user")?.content ?? "";
+        const userQuote = payload.match(/\bUSER:\s*(.*?)\s+ASSISTANT:/)?.[1]?.trim() ?? "";
+        return {
+          create_l1: true,
+          l1_summary: "completed task turn",
+          l1_evidence: [{ quote: userQuote, source_role: "user", kind: "task_outcome" }],
+          create_user_memory: false,
+          user_memory_types: [],
+          reason: "durable task result"
+        } as unknown as T;
+      }
       if (options.operation === "reward.reward.r_human.v7" && reward) {
         return reward as unknown as T;
       }

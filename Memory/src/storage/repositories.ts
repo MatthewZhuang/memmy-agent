@@ -14,7 +14,10 @@ import type {
   MemoryRow,
   MemoryStatsRow,
   MemoryStatus,
-  RecallHit
+  RecallHit,
+  UserMemoryRecord,
+  UserMemoryStatus,
+  UserMemoryType
 } from "../types.js";
 import { DEFAULT_NAMESPACE_SOURCE } from "../types.js";
 import { newId, stableHash } from "../utils/id.js";
@@ -38,6 +41,7 @@ import { SpanClusterRepository } from "./span-cluster-repository.js";
 type SqlValue = string | number | Buffer | null;
 const BUNDLE_TABLES = [
   "memories",
+  "user_memories",
   "sessions",
   "episodes",
   "raw_turns",
@@ -187,11 +191,37 @@ export interface RecallEventRecord {
   layers: MemoryLayer[];
   candidateMemoryIds?: string[];
   injectedMemoryIds?: string[];
+  queryId?: string;
+  userMemoryCandidateIds?: string[];
+  l1CandidateIds?: string[];
+  mergedSourceTurnIds?: string[];
+  memberMemoryIdsBySourceTurnId?: Record<string, string[]>;
   hitMemoryIds: string[];
   dropped?: unknown[];
   outcome?: "pending" | "positive" | "negative" | "ignored";
   request: unknown;
   createdAt: string;
+}
+
+interface UserMemorySqlRow {
+  id: string;
+  source_turn_id: string;
+  user_id: string;
+  memory_types_json: string;
+  content: string;
+  normalized_user_text_hash: string;
+  source_turn_refs_json: string;
+  status: UserMemoryStatus;
+  replaces_memory_id: string | null;
+  replaced_by_memory_id: string | null;
+  archived_at: string | null;
+  archive_reason: string | null;
+  embedding_json: string | null;
+  embedding_model: string | null;
+  embedding_provider: string | null;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
 }
 
 export interface ApiLogRecord {
@@ -519,6 +549,62 @@ export class MemoryRepository {
       )
       .get(memoryLayer, key) as MemorySqlRow | undefined;
     return row ? this.hydrate(memoryFromSql(row)) : undefined;
+  }
+
+  getByKeyIncludingDeleted(memoryLayer: MemoryLayer, key: string): MemoryRow | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM memories
+         WHERE memory_layer = ? AND memory_key = ?
+         ORDER BY updated_at DESC, id DESC LIMIT 1`
+      )
+      .get(memoryLayer, key) as MemorySqlRow | undefined;
+    return row ? this.hydrate(memoryFromSql(row)) : undefined;
+  }
+
+  archivePriorReadOnlySkillVersions(input: {
+    sourceAgentId: string;
+    sourceSkillIdentity: string;
+    currentMemoryId: string;
+    at: string;
+  }): MemoryRow[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM memories
+       WHERE memory_layer = 'Skill'
+         AND id != ?
+         AND deleted_at IS NULL
+         AND status IN ('activated', 'resolving')
+         AND json_extract(properties_json, '$.internal_info.read_only') = 1
+         AND json_extract(properties_json, '$.internal_info.source_agent_id') = ?
+         AND COALESCE(
+           json_extract(properties_json, '$.internal_info.source_skill_id'),
+           json_extract(properties_json, '$.internal_info.source_skill_path')
+         ) = ?`
+    ).all(
+      input.currentMemoryId,
+      input.sourceAgentId,
+      input.sourceSkillIdentity
+    ) as MemorySqlRow[];
+    return rows.map((row) => {
+      const memory = this.hydrate(memoryFromSql(row));
+      const internalSkill = isRecordLike(memory.properties.internal_info.skill)
+        ? memory.properties.internal_info.skill
+        : {};
+      return this.update({
+        ...memory,
+        status: "archived",
+        properties: {
+          ...memory.properties,
+          status: "archived",
+          internal_info: {
+            ...memory.properties.internal_info,
+            superseded_by_skill_id: input.currentMemoryId,
+            skill: { ...internalSkill, status: "archived" }
+          }
+        },
+        updatedAt: input.at
+      });
+    });
   }
 
   getMany(ids: string[]): MemoryRow[] {
@@ -1069,6 +1155,239 @@ export class MemoryRepository {
   }
 }
 
+export class UserMemoryRepository {
+  constructor(private readonly db: Database.Database) {}
+
+  upsertExact(memory: UserMemoryRecord): {
+    memory: UserMemoryRecord;
+    created: boolean;
+    previous?: UserMemoryRecord;
+  } {
+    const previous = this.getActiveByNormalizedText(memory.userId, memory.normalizedUserTextHash);
+    if (!previous) return { memory: this.insert(memory), created: true };
+    const updated = this.update({
+      ...previous,
+      memoryTypes: uniq([...previous.memoryTypes, ...memory.memoryTypes]),
+      sourceTurnRefs: uniq([...previous.sourceTurnRefs, ...memory.sourceTurnRefs]),
+      updatedAt: Date.parse(memory.updatedAt) > Date.parse(previous.updatedAt)
+        ? memory.updatedAt
+        : previous.updatedAt
+    });
+    return { memory: updated, created: false, previous };
+  }
+
+  insert(memory: UserMemoryRecord): UserMemoryRecord {
+    this.db.prepare(
+      `INSERT INTO user_memories (
+         id, source_turn_id, user_id, memory_types_json, content,
+         normalized_user_text_hash, source_turn_refs_json, status,
+         replaces_memory_id, replaced_by_memory_id, archived_at, archive_reason,
+         embedding_json, embedding_model, embedding_provider,
+         created_at, updated_at, deleted_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      memory.id, memory.sourceTurnId, memory.userId, toJson(memory.memoryTypes), memory.content,
+      memory.normalizedUserTextHash, toJson(memory.sourceTurnRefs), memory.status,
+      memory.replacesMemoryId ?? null, memory.replacedByMemoryId ?? null,
+      memory.archivedAt ?? null, memory.archiveReason ?? null,
+      memory.embedding ? toJson(memory.embedding) : null,
+      memory.embeddingModel ?? null, memory.embeddingProvider ?? null,
+      memory.createdAt, memory.updatedAt, memory.deletedAt ?? null
+    );
+    this.reindexFts(memory);
+    return memory;
+  }
+
+  update(memory: UserMemoryRecord): UserMemoryRecord {
+    this.db.prepare(
+      `UPDATE user_memories SET
+         source_turn_id = ?, user_id = ?, memory_types_json = ?, content = ?,
+         normalized_user_text_hash = ?, source_turn_refs_json = ?, status = ?,
+         replaces_memory_id = ?, replaced_by_memory_id = ?, archived_at = ?, archive_reason = ?,
+         embedding_json = ?, embedding_model = ?, embedding_provider = ?,
+         updated_at = ?, deleted_at = ?
+       WHERE id = ?`
+    ).run(
+      memory.sourceTurnId, memory.userId, toJson(memory.memoryTypes), memory.content,
+      memory.normalizedUserTextHash, toJson(memory.sourceTurnRefs), memory.status,
+      memory.replacesMemoryId ?? null, memory.replacedByMemoryId ?? null,
+      memory.archivedAt ?? null, memory.archiveReason ?? null,
+      memory.embedding ? toJson(memory.embedding) : null,
+      memory.embeddingModel ?? null, memory.embeddingProvider ?? null,
+      memory.updatedAt, memory.deletedAt ?? null, memory.id
+    );
+    this.reindexFts(memory);
+    return memory;
+  }
+
+  get(id: string): UserMemoryRecord | undefined {
+    const row = this.db.prepare(
+      `SELECT * FROM user_memories WHERE id = ? AND deleted_at IS NULL`
+    ).get(id) as UserMemorySqlRow | undefined;
+    return row ? userMemoryFromSql(row) : undefined;
+  }
+
+  getIncludingDeleted(id: string): UserMemoryRecord | undefined {
+    const row = this.db.prepare(`SELECT * FROM user_memories WHERE id = ?`)
+      .get(id) as UserMemorySqlRow | undefined;
+    return row ? userMemoryFromSql(row) : undefined;
+  }
+
+  getMany(ids: readonly string[]): UserMemoryRecord[] {
+    if (ids.length === 0) return [];
+    const rows = this.db.prepare(
+      `SELECT * FROM user_memories
+       WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?)) AND deleted_at IS NULL`
+    ).all(toJson(ids)) as UserMemorySqlRow[];
+    const byId = new Map(rows.map((row) => [row.id, userMemoryFromSql(row)]));
+    return ids.map((id) => byId.get(id)).filter((item): item is UserMemoryRecord => Boolean(item));
+  }
+
+  listActive(userId: string, limit = 2000): UserMemoryRecord[] {
+    return (this.db.prepare(
+      `SELECT * FROM user_memories
+       WHERE user_id = ? AND status = 'active' AND deleted_at IS NULL
+       ORDER BY updated_at DESC, id DESC LIMIT ?`
+    ).all(userId, limit) as UserMemorySqlRow[]).map(userMemoryFromSql);
+  }
+
+  listForPanel(input: {
+    userId: string;
+    status?: UserMemoryStatus;
+    query?: string;
+    limit: number;
+    offset: number;
+  }): UserMemoryRecord[] {
+    const { where, params } = userMemoryPanelFilter(input);
+    return (this.db.prepare(
+      `SELECT * FROM user_memories
+       WHERE ${where}
+       ORDER BY updated_at DESC, id DESC
+       LIMIT ? OFFSET ?`
+    ).all(...params, input.limit, input.offset) as UserMemorySqlRow[]).map(userMemoryFromSql);
+  }
+
+  countForPanel(input: {
+    userId: string;
+    status?: UserMemoryStatus;
+    query?: string;
+  }): number {
+    const { where, params } = userMemoryPanelFilter(input);
+    const row = this.db.prepare(`SELECT COUNT(*) AS count FROM user_memories WHERE ${where}`)
+      .get(...params) as { count: number };
+    return row.count;
+  }
+
+  getActiveByNormalizedText(userId: string, hash: string): UserMemoryRecord | undefined {
+    const row = this.db.prepare(
+      `SELECT * FROM user_memories
+       WHERE user_id = ? AND normalized_user_text_hash = ?
+         AND status = 'active' AND deleted_at IS NULL
+       ORDER BY updated_at DESC, id DESC LIMIT 1`
+    ).get(userId, hash) as UserMemorySqlRow | undefined;
+    return row ? userMemoryFromSql(row) : undefined;
+  }
+
+  archiveForCorrection(id: string, replacementId: string, at: string): UserMemoryRecord | undefined {
+    const memory = this.get(id);
+    if (!memory || memory.status !== "active") return undefined;
+    return this.update({
+      ...memory,
+      status: "archived",
+      archivedAt: at,
+      archiveReason: "user_correction",
+      replacedByMemoryId: replacementId,
+      updatedAt: at
+    });
+  }
+
+  softDelete(id: string, at = nowIso()): UserMemoryRecord | undefined {
+    const memory = this.get(id);
+    return memory
+      ? this.update({
+          ...memory,
+          memoryTypes: [],
+          content: "[DELETED]",
+          sourceTurnRefs: [],
+          status: "deleted",
+          embedding: undefined,
+          embeddingModel: undefined,
+          embeddingProvider: undefined,
+          deletedAt: at,
+          updatedAt: at
+        })
+      : undefined;
+  }
+
+  updateEmbedding(
+    id: string,
+    embedding: number[],
+    input: { model?: string; provider?: string; updatedAt: string }
+  ): UserMemoryRecord | undefined {
+    const memory = this.get(id);
+    return memory ? this.update({
+      ...memory,
+      embedding,
+      embeddingModel: input.model,
+      embeddingProvider: input.provider,
+      // updatedAt describes the latest user expression, not background indexing.
+      updatedAt: memory.updatedAt
+    }) : undefined;
+  }
+
+  searchFtsIds(userId: string, ftsMatch: string | undefined | null, limit: number): MemorySearchIdHit[] {
+    if (!ftsMatch || limit <= 0) return [];
+    try {
+      const rows = this.db.prepare(
+        `SELECT user_memories.id AS id
+         FROM user_memories_fts
+         JOIN user_memories ON user_memories.id = user_memories_fts.id
+         WHERE user_memories.user_id = ?
+           AND user_memories.status = 'active'
+           AND user_memories.deleted_at IS NULL
+           AND user_memories_fts MATCH ?
+         ORDER BY rank LIMIT ?`
+      ).all(userId, ftsMatch, limit) as Array<{ id: string }>;
+      return rows.map((row, index) => ({ id: row.id, score: 1 / (index + 1), channel: "fts" }));
+    } catch {
+      return [];
+    }
+  }
+
+  searchPatternIds(userId: string, terms: readonly string[], limit: number): MemorySearchIdHit[] {
+    const normalized = terms.map((term) => term.trim().toLowerCase()).filter(Boolean).slice(0, 16);
+    if (normalized.length === 0 || limit <= 0) return [];
+    const clauses = normalized.map(() => `lower(content) LIKE ? ESCAPE '\\'`);
+    const rows = this.db.prepare(
+      `SELECT id FROM user_memories
+       WHERE user_id = ? AND status = 'active' AND deleted_at IS NULL
+         AND (${clauses.join(" OR ")})
+       ORDER BY updated_at DESC, id DESC LIMIT ?`
+    ).all(userId, ...normalized.map((term) => `%${escapeLikePattern(term)}%`), limit) as Array<{ id: string }>;
+    return rows.map((row, index) => ({ id: row.id, score: 1 / (index + 1), channel: "pattern" }));
+  }
+
+  searchVectorIds(userId: string, query: readonly number[], limit: number): MemorySearchIdHit[] {
+    if (query.length === 0 || limit <= 0) return [];
+    return this.listActive(userId)
+      .flatMap((memory) => memory.embedding?.length === query.length
+        ? [{ id: memory.id, score: cosineVectors(query, memory.embedding), channel: "vec" as const }]
+        : [])
+      .filter((hit) => hit.score > 0)
+      .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id))
+      .slice(0, limit);
+  }
+
+  private reindexFts(memory: UserMemoryRecord): void {
+    this.db.prepare(`DELETE FROM user_memories_fts WHERE id = ?`).run(memory.id);
+    if (memory.status === "active" && !memory.deletedAt) {
+      this.db.prepare(
+        `INSERT INTO user_memories_fts (id, content, memory_types) VALUES (?, ?, ?)`
+      ).run(memory.id, memory.content, memory.memoryTypes.join(" "));
+    }
+  }
+}
+
 export class MemoryProcessingRepository {
   constructor(private readonly db: Database.Database) {}
 
@@ -1165,6 +1484,10 @@ export class MemoryProcessingRepository {
     const current = this.get(memoryId);
     if (!current || (expectedStates && !expectedStates.includes(current.state))) return undefined;
     return this.save({ ...current, ...patch, memoryId });
+  }
+
+  delete(memoryId: string): boolean {
+    return this.db.prepare(`DELETE FROM memory_processing_state WHERE memory_id = ?`).run(memoryId).changes > 0;
   }
 }
 
@@ -1940,8 +2263,11 @@ export class RuntimeRepository {
         `INSERT INTO recall_events (
           id, namespace_id, session_id, episode_id, turn_id, user_id, query,
           query_hash, layers_json, candidate_memory_ids_json, injected_memory_ids_json,
-          hit_memory_ids_json, dropped_json, outcome, request_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          hit_memory_ids_json, dropped_json, outcome, request_json,
+          query_id, user_memory_candidate_ids_json, l1_candidate_ids_json,
+          merged_source_turn_ids_json, member_memory_ids_by_source_turn_id_json,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         event.id,
@@ -1959,6 +2285,11 @@ export class RuntimeRepository {
         toJson(event.dropped ?? []),
         event.outcome ?? "pending",
         toJson(event.request),
+        event.queryId ?? event.turnId ?? null,
+        toJson(event.userMemoryCandidateIds ?? []),
+        toJson(event.l1CandidateIds ?? []),
+        toJson(event.mergedSourceTurnIds ?? []),
+        toJson(event.memberMemoryIdsBySourceTurnId ?? {}),
         event.createdAt
       );
     return event;
@@ -1968,6 +2299,18 @@ export class RuntimeRepository {
     const row = this.db
       .prepare(`SELECT * FROM recall_events WHERE id = ?`)
       .get(id) as SqlRecallEventRow | undefined;
+    return row ? recallEventFromSql(row) : undefined;
+  }
+
+  getRecallEventByQueryId(queryId: string): RecallEventRecord | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM recall_events
+         WHERE query_id = ?
+         ORDER BY created_at DESC
+         LIMIT 1`
+      )
+      .get(queryId) as SqlRecallEventRow | undefined;
     return row ? recallEventFromSql(row) : undefined;
   }
 
@@ -3561,6 +3904,7 @@ export class RuntimeRepository {
 
 export class Repositories {
   readonly memories: MemoryRepository;
+  readonly userMemories: UserMemoryRepository;
   readonly processing: MemoryProcessingRepository;
   readonly runtime: RuntimeRepository;
   readonly vectors: SqliteVecStore;
@@ -3569,6 +3913,7 @@ export class Repositories {
   constructor(readonly db: Database.Database) {
     this.vectors = new SqliteVecStore(db);
     this.memories = new MemoryRepository(db, this.vectors);
+    this.userMemories = new UserMemoryRepository(db);
     this.processing = new MemoryProcessingRepository(db);
     this.runtime = new RuntimeRepository(db);
     this.spanClusters = new SpanClusterRepository(db);
@@ -3622,6 +3967,65 @@ export function memoryFromSql(row: MemorySqlRow): MemoryRow {
     updatedAt: row.updated_at,
     deletedAt: row.deleted_at
   };
+}
+
+function userMemoryFromSql(row: UserMemorySqlRow): UserMemoryRecord {
+  return {
+    id: row.id,
+    sourceTurnId: row.source_turn_id,
+    userId: row.user_id,
+    memoryTypes: asStringArray(parseJson(row.memory_types_json, [])) as UserMemoryType[],
+    content: row.content,
+    normalizedUserTextHash: row.normalized_user_text_hash,
+    sourceTurnRefs: asStringArray(parseJson(row.source_turn_refs_json, [])),
+    status: row.status,
+    replacesMemoryId: row.replaces_memory_id ?? undefined,
+    replacedByMemoryId: row.replaced_by_memory_id ?? undefined,
+    archivedAt: row.archived_at,
+    archiveReason: row.archive_reason ?? undefined,
+    embedding: row.embedding_json ? finiteVector(parseJson(row.embedding_json, [])) : undefined,
+    embeddingModel: row.embedding_model ?? undefined,
+    embeddingProvider: row.embedding_provider ?? undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at
+  };
+}
+
+function userMemoryPanelFilter(input: {
+  userId: string;
+  status?: UserMemoryStatus;
+  query?: string;
+}): { where: string; params: Array<string> } {
+  const clauses = ["user_id = ?"];
+  const params = [input.userId];
+  if (input.status) {
+    clauses.push("status = ?");
+    params.push(input.status);
+  } else {
+    clauses.push("deleted_at IS NULL", "status != 'deleted'");
+  }
+  const query = input.query?.trim().toLowerCase();
+  if (query) {
+    clauses.push("lower(content) LIKE ? ESCAPE '\\'");
+    params.push(`%${escapeLikePattern(query)}%`);
+  }
+  return { where: clauses.join(" AND "), params };
+}
+
+function cosineVectors(left: readonly number[], right: readonly number[]): number {
+  if (left.length === 0 || left.length !== right.length) return 0;
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    const a = left[index] ?? 0;
+    const b = right[index] ?? 0;
+    dot += a * b;
+    leftNorm += a * a;
+    rightNorm += b * b;
+  }
+  return leftNorm > 0 && rightNorm > 0 ? dot / Math.sqrt(leftNorm * rightNorm) : 0;
 }
 
 export function memoryToSql(memory: MemoryRow): Record<string, SqlValue> {
@@ -4445,6 +4849,11 @@ interface SqlRecallEventRow {
   dropped_json: string;
   outcome: NonNullable<RecallEventRecord["outcome"]>;
   request_json: string;
+  query_id: string | null;
+  user_memory_candidate_ids_json: string;
+  l1_candidate_ids_json: string;
+  merged_source_turn_ids_json: string;
+  member_memory_ids_by_source_turn_id_json: string;
   created_at: string;
 }
 
@@ -4465,6 +4874,11 @@ function recallEventFromSql(row: SqlRecallEventRow): RecallEventRecord {
     dropped: parseJson(row.dropped_json, []),
     outcome: row.outcome,
     request: parseJson(row.request_json, {}),
+    queryId: row.query_id ?? undefined,
+    userMemoryCandidateIds: asStringArray(parseJson(row.user_memory_candidate_ids_json, [])),
+    l1CandidateIds: asStringArray(parseJson(row.l1_candidate_ids_json, [])),
+    mergedSourceTurnIds: asStringArray(parseJson(row.merged_source_turn_ids_json, [])),
+    memberMemoryIdsBySourceTurnId: parseJson(row.member_memory_ids_by_source_turn_id_json, {}),
     createdAt: row.created_at
   };
 }

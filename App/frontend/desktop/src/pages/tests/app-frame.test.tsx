@@ -4,14 +4,15 @@ import { resolve } from "node:path";
 import { renderToString } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { AppProviders } from "../../app/providers.js";
+import type { UpdateCoordinatorValue } from "../../app/update-coordinator.js";
 import type { MemmyAgentProject } from "../../api/memmy-agent-client.js";
 import { I18nProvider } from "../../i18n/i18n-provider.js";
-import { enUSMessages, zhCNMessages, type MessageKey } from "../../i18n/messages.js";
+import { enUSMessages, formatMessage, zhCNMessages, type MessageKey, type MessageValues } from "../../i18n/messages.js";
 import { appActions } from "../../state/app-actions.js";
 import { appReducer, createInitialAppState } from "../../state/app-reducer.js";
 import type { AgentTaskView } from "../../state/agent-chat-slice.js";
 import { mockBootstrap } from "./fixtures/bootstrap.js";
-import { AppFrame, TaskArchiveInlineAction, TaskRow, countProjectTasksToArchive, deriveSidebarPlacement, deriveVisibleSidebarPlacement, groupAgentTasks, groupTasksByTime, resolveSidebarAccountSummary, resolveSidebarContextMenuPlacement, resolveSidebarMenuOverlayStyle, resolveTaskAncestorGroupKeys, shouldCreateNewAgentDraft, truncateAccountDisplayText } from "../app-frame.js";
+import { AppFrame, TaskArchiveInlineAction, TaskRow, countProjectTasksToArchive, deriveSidebarPlacement, deriveVisibleSidebarPlacement, groupAgentTasks, groupTasksByTime, resolveSidebarAccountSummary, resolveSidebarContextMenuPlacement, resolveSidebarMenuOverlayStyle, resolveSidebarUpdateAction, resolveTaskAncestorGroupKeys, shouldCreateNewAgentDraft, truncateAccountDisplayText } from "../app-frame.js";
 
 describe("AppFrame", () => {
   it("使用原型 MainLayout 的侧栏图标与导航文案", () => {
@@ -526,6 +527,42 @@ describe("AppFrame", () => {
     expect(html).toContain('data-icon="user"');
     expect(html).toContain('data-icon="settings-2"');
     expect(source).not.toContain('className={`app-frame-profile-settings shrink-0 inline-flex items-center justify-center transition-colors cursor-pointer');
+  });
+
+  it("resolves account footer update states for the inline update button", () => {
+    const t = zhTestTranslate;
+
+    expect(resolveSidebarUpdateAction(null, t)).toBeNull();
+    expect(resolveSidebarUpdateAction(updateViewModel({ phase: "idle" }), t)).toBeNull();
+    expect(resolveSidebarUpdateAction(updateViewModel({ phase: "available" }), t)).toMatchObject({
+      kind: "available",
+      label: "更新",
+      disabled: false
+    });
+    expect(resolveSidebarUpdateAction(updateViewModel({
+      phase: "downloading",
+      downloadProgress: {
+        downloadUrl: "https://updates.example.com/Memmy.dmg",
+        filePath: "/tmp/Memmy.dmg",
+        transferredBytes: 12,
+        totalBytes: 100,
+        percent: 12.3
+      }
+    }), t)).toMatchObject({
+      kind: "downloading",
+      label: "12%",
+      disabled: true
+    });
+    expect(resolveSidebarUpdateAction(updateViewModel({ phase: "installing" }), t)).toMatchObject({
+      kind: "installing",
+      label: "正在安装",
+      disabled: true
+    });
+    expect(resolveSidebarUpdateAction(updateViewModel({ phase: "prepared" }), t)).toMatchObject({
+      kind: "prepared",
+      label: "重启",
+      disabled: false
+    });
   });
 
   it("settingsNav replaces the main sidebar with settings section links", () => {
@@ -1172,6 +1209,23 @@ function sidebarLabels() {
     accountMetaFallback: "未绑定手机号或邮箱",
     unsetName: "未选择模式",
     unsetMeta: "重新选择登录方式"
+  };
+}
+
+function zhTestTranslate(key: MessageKey, values?: MessageValues): string {
+  return formatMessage(zhCNMessages[key], values);
+}
+
+function updateViewModel(overrides: Partial<UpdateCoordinatorValue> = {}): UpdateCoordinatorValue {
+  return {
+    appVersion: "1.0.6",
+    phase: "idle",
+    preparedUpdatePath: null,
+    downloadProgress: null,
+    feedback: null,
+    requestInlineAction: async () => undefined,
+    requestPrimaryAction: async () => undefined,
+    ...overrides
   };
 }
 

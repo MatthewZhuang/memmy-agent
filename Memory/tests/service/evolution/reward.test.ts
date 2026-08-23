@@ -43,6 +43,18 @@ function createEmptyRewardSummaryLlm(calls: Array<{
       options: { operation: string }
     ): Promise<T> {
       calls.push({ messages, options });
+      if (options.operation === "capture.summarize") {
+        const payload = messages.find((message) => message.role === "user")?.content ?? "";
+        const turnSummary = payload.match(/\bUSER:\s*(.*?)\s+ASSISTANT:/)?.[1]?.trim() ?? "completed task turn";
+        return {
+          create_l1: true,
+          l1_summary: turnSummary,
+          l1_evidence: [{ quote: turnSummary, source_role: "user", kind: "task_outcome" }],
+          create_user_memory: false,
+          user_memory_types: [],
+          reason: "durable task result"
+        } as unknown as T;
+      }
       return {} as T;
     },
     status() {
@@ -86,6 +98,23 @@ function createCapturingRewardSummaryLlm(calls: Array<{
       }
     ): Promise<T> {
       calls.push({ messages, options });
+      if (options.operation === "capture.summarize") {
+        const payload = messages.find((message) => message.role === "user")?.content ?? "";
+        const turnSummary = payload.includes("verify reward scoring prompt")
+          ? "verify reward scoring prompt"
+          : payload.includes("now summarize the final reward result")
+            ? "now summarize the final reward result"
+            : "completed task turn";
+        const userQuote = payload.match(/\bUSER:\s*(.*?)\s+ASSISTANT:/)?.[1]?.trim() ?? turnSummary;
+        return {
+          create_l1: true,
+          l1_summary: turnSummary,
+          l1_evidence: [{ quote: userQuote, source_role: "user", kind: "task_outcome" }],
+          create_user_memory: false,
+          user_memory_types: [],
+          reason: "durable task result"
+        } as unknown as T;
+      }
       if (options.operation === "reward.reward.r_human.v7") {
         return {
           goal_achievement: 1,
@@ -296,8 +325,8 @@ describe("MemoryService / evolution / reward", () => {
     const reflectedItems = service.panelItems({
       userId: "user-reward-before-reflection",
       layer: "L1"
-    }).items.filter((item) => [first.l1MemoryId, second.l1MemoryId, third.l1MemoryId].includes(item.id));
-    expect(reflectedItems).toHaveLength(3);
+    }).items.filter((item) => [second.l1MemoryId, third.l1MemoryId].includes(item.id));
+    expect(reflectedItems).toHaveLength(2);
     expect(reflectedItems.every((item) => item.metrics?.reflectionDone)).toBe(true);
     expect(calls.some((call) => call.options.operation === "capture.reflection.batch.v13")).toBe(true);
     const rewardCalls = calls.filter((call) => call.options.operation === "reward.reward.r_human.v7");

@@ -1,8 +1,8 @@
 name: GitHub Draft Release v2
 
 on:
-  # Use the base repository's trusted workflow so release PRs from forks can
-  # create an auditable Draft Release without executing untrusted fork code.
+  # Use the base repository's trusted workflow and admit only its canonical
+  # release branches in the job guard below.
   pull_request_target:
     types: [closed]
     branches: [main]
@@ -34,17 +34,19 @@ permissions:
   contents: write
   pull-requests: read
 
-concurrency:
-  group: draft-release-v2-${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.event.pull_request.head.ref }}
-  cancel-in-progress: false
-
 jobs:
   release:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.pull_request.merged == true &&
-       (startsWith(github.event.pull_request.head.ref, 'v') ||
-        startsWith(github.event.pull_request.head.ref, 'release/v')))
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       startsWith(github.event.pull_request.head.ref, 'release/v'))
+    concurrency:
+      # Tag and Draft Release mutations are repository-global. Queue automatic
+      # and manual recovery runs so they cannot mutate assets concurrently.
+      group: draft-release-v2
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     environment: release
     env:
@@ -67,11 +69,11 @@ jobs:
           create_draft="false"
           manual_target_sha_supplied="false"
           if [[ "$EVENT_NAME" == "pull_request_target" ]]; then
-            if [[ ! "$PR_HEAD_REF" =~ ^(release/)?v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]]; then
-              echo "Release branch must match vX.Y.Z or release/vX.Y.Z" >&2
+            if [[ ! "$PR_HEAD_REF" =~ ^release/v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]]; then
+              echo "Release branch must match release/vX.Y.Z" >&2
               exit 1
             fi
-            version="${BASH_REMATCH[2]}"
+            version="${BASH_REMATCH[1]}"
             target_sha="$PR_MERGE_SHA"
             preflight_level="full"
             create_draft="true"

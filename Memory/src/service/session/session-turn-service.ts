@@ -32,6 +32,7 @@ import type {
   MemoryLayer,
   MemoryRow,
   RecallHit,
+  RecallMemoryLayer,
   RepairSuggestionRequest,
   RequestEnvelope,
   SessionCompactRequest,
@@ -46,8 +47,18 @@ import type {
 import { MemoryServiceError } from "../../utils/error.js";
 import { newId,stableHash,stableStringify } from "../../utils/id.js";
 import { isRecord } from "../../utils/json.js";
+import { isMemmyRecallToolName } from "../../utils/memmy-context-tags.js";
 import { clip } from "../../utils/text.js";
 import { nowIso } from "../../utils/time.js";
+import {
+  buildUserMemory,
+  classifyUserMemory,
+  isDynamicCurrentFactQuery,
+  isPureUserMemoryStatement,
+  isQuestionLike,
+  isTaskLinkedUserFeedback,
+  isUserMemoryQuestion
+} from "../user-memory/user-memory.js";
 import type {
   DecisionRepairLlmDraft,
   SynthesizeDecisionRepairDraft
@@ -90,7 +101,7 @@ type SessionTurnDependencies = {
   readonly skillLlm: LlmClient;
   synthesizeDecisionRepairDraft: SynthesizeDecisionRepairDraft;
 } & Record<string, any>;
-interface CompleteTurnResponse { turnId: string; sessionId: string; episodeId: string; rawTurnId: string; l1MemoryId: string; l1MemoryIds: string[]; closedEpisodeIds: string[]; scheduledEvolution: boolean; jobs: JobRef[]; changeSeq: number; syncCursor: string; etag: string; serverTime: string; duplicate?: boolean; }
+interface CompleteTurnResponse { turnId: string; sessionId: string; episodeId: string; rawTurnId: string; userMemoryId: string; userMemoryIds: string[]; l1MemoryId: string; l1MemoryIds: string[]; closedEpisodeIds: string[]; scheduledEvolution: boolean; jobs: JobRef[]; changeSeq: number; syncCursor: string; etag: string; serverTime: string; duplicate?: boolean; }
 type EndTopicDecision = TurnRelationDecision & { relation: "end_topic" };
 interface EpisodeTurnRoute { episode: EpisodeRecord; endTopicDecision?: EndTopicDecision; }
 type TurnRouteAction = "create_first" | "append" | "split" | "end_topic";
@@ -268,7 +279,7 @@ function endTopicDecisionFromRawTurn(rawTurn: RawTurnRecord): EndTopicDecision |
   };
 }
 
-function rawTurnIsExcludedFromMemory(rawTurn: RawTurnRecord): boolean {
+function rawTurnIsExcludedFromL1(rawTurn: RawTurnRecord): boolean {
   if (endTopicDecisionFromRawTurn(rawTurn)) {
     return true;
   }
@@ -278,7 +289,116 @@ function rawTurnIsExcludedFromMemory(rawTurn: RawTurnRecord): boolean {
   const intentDecision = turnStart && isRecord(turnStart.intent_decision)
     ? turnStart.intent_decision
     : undefined;
-  return intentDecision?.kind === "chitchat";
+  const kind = typeof intentDecision?.kind === "string"
+    ? intentDecision.kind
+    : classifyIntent(rawTurn.userText ?? "").kind;
+  if (kind === "chitchat" || kind === "meta" || kind === "memory_probe") return true;
+  if (isUserMemoryQuestion(rawTurn.userText ?? "")) return true;
+  if (isDynamicCurrentFactQuery(rawTurn.userText ?? "")) return true;
+  const taskLinkedFeedback = isTaskLinkedUserFeedback(rawTurn.userText ?? "");
+  const hasOnlyRecalledMemoryEvidence = rawTurn.sourceMemoryIds.length > 0 && (
+    (rawTurn.toolCalls.length === 0 && rawTurn.toolResults.length === 0) ||
+    (rawTurn.toolCalls.length > 0 && rawTurn.toolCalls.every((call) =>
+      isToolCallPayload(call) && isMemmyRecallToolName(call.name)
+    ))
+  );
+  if (
+    !taskLinkedFeedback &&
+    hasOnlyRecalledMemoryEvidence
+  ) return true;
+  if (
+    isPureUserMemoryStatement(rawTurn.userText ?? "") &&
+    rawTurn.toolCalls.length === 0 &&
+    rawTurn.toolResults.length === 0 &&
+    rawTurn.sourceMemoryIds.length === 0
+  ) return !taskLinkedFeedback;
+  return false;
+}
+
+function l1ObservationMetadata(rawTurn: RawTurnRecord, session: SessionRecord, at: string): {
+  memoryKey?: string;
+  info: Record<string, unknown>;
+  internal: Record<string, unknown>;
+} {
+  const text = rawTurn.userText ?? "";
+  const hasToolEvidence = rawTurn.toolCalls.length > 0 && rawTurn.toolResults.length > 0;
+  const deviceMemoryObservation = hasToolEvidence &&
+    /(?:(?:电脑|计算机|设备|机器).{0,16}(?:内存|ram)|(?:内存|ram).{0,16}(?:电脑|计算机|设备|机器))|\b(?:computer|device|machine)\b.{0,24}\b(?:memory|ram)\b/i.test(text);
+  if (deviceMemoryObservation) {
+    const deviceId = stringFromMaybeRecord(session.meta, "device_id") ??
+      stringFromMaybeRecord(session.meta, "deviceId") ??
+      stringFromMaybeRecord(session.meta, "installation_id") ??
+      stringFromMaybeRecord(session.meta, "installationId") ??
+      "local";
+    const scopeKey = `device:${deviceId}:${session.profileId}`;
+    const claim = {
+      key: "device.total_memory",
+      source_role: "tool",
+      evidence_status: "verified",
+      observed_at: at,
+      scope_key: scopeKey,
+      policy_eligible: false
+    };
+    return {
+      memoryKey: `trace:environment:${scopeKey}:device.total_memory`,
+      info: {
+        scope_key: scopeKey,
+        observed_at: at,
+        evidence_status: "verified",
+        policy_eligible: false
+      },
+      internal: {
+        scope_key: scopeKey,
+        observed_at: at,
+        evidence_status: "verified",
+        policy_eligible: false,
+        claims: [claim]
+      }
+    };
+  }
+  if (hasToolEvidence) {
+    return {
+      info: { observed_at: at, evidence_status: "verified" },
+      internal: {
+        observed_at: at,
+        evidence_status: "verified",
+        claims: [{ source_role: "tool", evidence_status: "verified", observed_at: at }]
+      }
+    };
+  }
+  if (isQuestionLike(text) && !isTaskLinkedUserFeedback(text)) {
+    return {
+      info: { observed_at: at, evidence_status: "provisional", policy_eligible: false },
+      internal: {
+        observed_at: at,
+        evidence_status: "provisional",
+        policy_eligible: false,
+        claims: [{ source_role: "agent", evidence_status: "provisional", observed_at: at }]
+      }
+    };
+  }
+  return { info: {}, internal: {} };
+}
+
+function pendingL1DecisionMetadata(observation: ReturnType<typeof l1ObservationMetadata>): ReturnType<typeof l1ObservationMetadata> {
+  const originalEvidenceStatus = typeof observation.internal.evidence_status === "string"
+    ? observation.internal.evidence_status
+    : undefined;
+  return {
+    memoryKey: observation.memoryKey,
+    info: {
+      ...observation.info,
+      evidence_status: "provisional"
+    },
+    internal: {
+      ...observation.internal,
+      evidence_status: "provisional",
+      capture_decision: {
+        status: "pending",
+        ...(originalEvidenceStatus ? { original_evidence_status: originalEvidenceStatus } : {})
+      }
+    }
+  };
 }
 
 function episodeClosedByEndTopicTurn(episode: EpisodeRecord, turnId: string): boolean {
@@ -791,7 +911,7 @@ export class SessionTurnService {
     droppedDueToBudget: Array<{
       id: string;
       kind: MemoryKind;
-      memoryLayer: MemoryLayer;
+      memoryLayer: RecallMemoryLayer;
       reason: "token_budget";
       tokenEstimate?: number;
     }>;
@@ -915,6 +1035,10 @@ export class SessionTurnService {
           const memory = this.deps.repos.memories.get(memoryId);
           return memory && this.deps.rawTurnIdFromMemory(memory) === existingRawTurn.id;
         });
+        const userMemoryIds = this.deps.repos.userMemories
+          .listActive(session.userId)
+          .filter((memory) => memory.sourceTurnRefs.includes(existingRawTurn.id))
+          .map((memory) => memory.id);
         const responseChangeSeq = this.deps.repos.runtime.latestChangeSeq(
           session.userId,
           this.deps.namespaceIdFromSession(session)
@@ -924,6 +1048,8 @@ export class SessionTurnService {
           sessionId: session.id,
           episodeId: episode.id,
           rawTurnId: existingRawTurn.id,
+          userMemoryId: userMemoryIds[0] ?? "",
+          userMemoryIds,
           l1MemoryId: l1MemoryIds[0] ?? "",
           l1MemoryIds,
           closedEpisodeIds: episodeClosedByEndTopicTurn(episode, turnId) ? [episode.id] : [],
@@ -1158,6 +1284,7 @@ export class SessionTurnService {
       }
       this.deps.repos.runtime.appendEpisodeRawTurn(episode.id, rawTurn.id, at);
 
+      const userMemoryCapture = this.captureUserMemory(rawTurn, request, at);
       const requestTags = this.deps.normalizeRequestTags(request.tags);
       const capturedSteps = this.captureEpisodeIncrementalSteps(episode, rawTurn, at)
         .map((step) => {
@@ -1169,10 +1296,17 @@ export class SessionTurnService {
 
       const l1MemoryIds: string[] = [];
       let changeSeq = 0;
-      const jobs: EvolutionJobRecord[] = [...route.jobs];
+      const jobs: EvolutionJobRecord[] = [...route.jobs, ...userMemoryCapture.jobs];
 
       for (const step of capturedSteps) {
         const stepRawTurnId = step.rawTurnId ?? rawTurn.id;
+        const sourceRawTurn = stepRawTurnId === rawTurn.id
+          ? rawTurn
+          : this.deps.repos.runtime.getRawTurn(stepRawTurnId) ?? rawTurn;
+        const modelDecidesCapture = this.deps.llm.isConfigured();
+        const observation = modelDecidesCapture
+          ? pendingL1DecisionMetadata(l1ObservationMetadata(sourceRawTurn, session, at))
+          : l1ObservationMetadata(sourceRawTurn, session, at);
         const signature = signatureFromTraceParts(step.tags, step.toolCalls, step.reflection.text ?? "");
         const l1Memory = this.deps.buildMemory({
           id: `trace_${stableHash(`L1:${session.id}:${step.turnId}:${step.stepIndex}`).slice(0, 20)}`,
@@ -1185,8 +1319,9 @@ export class SessionTurnService {
           profileId: session.profileId,
           layer: "L1",
           kind: "trace",
+          lifecycleStatus: modelDecidesCapture ? "candidate" : "active",
           memoryType: "LongTermMemory",
-          key: `trace:${session.id}:${step.turnId}:${step.stepIndex}`,
+          key: observation.memoryKey ?? `trace:${session.id}:${step.turnId}:${step.stepIndex}`,
           value: this.deps.renderTraceMemoryValue({
             ...step,
             summary: "",
@@ -1199,7 +1334,8 @@ export class SessionTurnService {
             episode_id: episode.id,
             status: rawTurn.status,
             summary: "",
-            time_zone: step.timeZone
+            time_zone: step.timeZone,
+            ...observation.info
           },
           internal: {
             source: "turn.complete",
@@ -1219,6 +1355,7 @@ export class SessionTurnService {
               tool_call_count: step.toolCalls.length
             },
             error_signatures: step.errorSignatures,
+            ...observation.internal,
             trace: {
               key: step.key,
               ts: step.ts,
@@ -1270,14 +1407,22 @@ export class SessionTurnService {
           createdAt: at
         });
         this.deps.repos.runtime.appendEpisodeTurn(episode.id, stepRawTurnId, upsert.memory.id, at);
-        if (!this.deps.repos.processing.get(upsert.memory.id)) {
+        const existingProcessing = this.deps.repos.processing.get(upsert.memory.id);
+        const contentChanged = Boolean(
+          !upsert.created && upsert.previous?.contentHash !== upsert.memory.contentHash
+        );
+        if (!existingProcessing || contentChanged) {
+          if (contentChanged) {
+            this.deps.repos.memories.deleteVector(upsert.memory.id, "vec_summary");
+            this.deps.repos.memories.deleteVector(upsert.memory.id, "vec_action");
+          }
           this.deps.repos.processing.save({
             memoryId: upsert.memory.id,
             state: "summary_pending",
             stage: "summary",
             activeJobId: null,
             attemptCount: 0,
-            manualRetryCount: 0,
+            manualRetryCount: existingProcessing?.manualRetryCount ?? 0,
             retryAction: "retry",
             errorCode: null,
             errorMessage: null,
@@ -1292,7 +1437,9 @@ export class SessionTurnService {
             targetMemoryId: upsert.memory.id,
             payload: {
               source: "turn.complete.capture",
-              contentHash: upsert.memory.contentHash
+              contentHash: upsert.memory.contentHash,
+              decideCapture: modelDecidesCapture,
+              captureUserMemory: modelDecidesCapture && !request.userMemoryCorrection && step.stepIndex === 0
             },
             maxAttempts: 3,
             createdAt: at
@@ -1385,6 +1532,8 @@ export class SessionTurnService {
         sessionId: session.id,
         episodeId: episode.id,
         rawTurnId: rawTurn.id,
+        userMemoryId: userMemoryCapture.memoryIds[0] ?? "",
+        userMemoryIds: userMemoryCapture.memoryIds,
         l1MemoryId: l1MemoryIds[0] ?? "",
         l1MemoryIds,
         closedEpisodeIds: uniqueClosedEpisodeIds,
@@ -1394,6 +1543,7 @@ export class SessionTurnService {
         syncCursor: this.deps.encodeChangeCursor(responseChangeSeq, namespaceForSession(session)),
         etag: stableHash({
           changeSeq: responseChangeSeq,
+          userMemoryIds: userMemoryCapture.memoryIds,
           l1MemoryIds,
           rawTurnId: rawTurn.id
         }),
@@ -2115,7 +2265,7 @@ export class SessionTurnService {
   ): ReturnType<typeof captureTurnSteps> {
     const seenRawTurnIds = new Set(
       episode.l1MemoryIds
-        .map((id) => this.deps.repos.memories.get(id))
+        .map((id) => this.deps.repos.memories.getIncludingDeleted(id))
         .filter((memory): memory is MemoryRow => Boolean(memory))
         .map((memory) => this.deps.rawTurnIdFromMemory(memory))
         .filter((id): id is string => Boolean(id))
@@ -2126,7 +2276,8 @@ export class SessionTurnService {
         Boolean(rawTurn && (rawTurn.id === currentRawTurn.id || !seenRawTurnIds.has(rawTurn.id)))
       )
       .filter((rawTurn) => isRecord(rawTurn.messagePayload?.turn_complete))
-      .filter((rawTurn) => !rawTurnIsExcludedFromMemory(rawTurn))
+      .filter((rawTurn) => !endTopicDecisionFromRawTurn(rawTurn))
+      .filter((rawTurn) => this.deps.llm.isConfigured() || !rawTurnIsExcludedFromL1(rawTurn))
       .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
     return rawTurns.flatMap((rawTurn) =>
       captureTurnSteps({
@@ -2145,6 +2296,114 @@ export class SessionTurnService {
         maxToolOutputChars: this.deps.config.algorithm.capture.maxToolOutputChars
       }).map((step) => ({ ...step, rawTurnId: rawTurn.id }))
     );
+  }
+
+  private captureUserMemory(
+    rawTurn: RawTurnRecord,
+    request: TurnCompleteRequest,
+    at: string
+  ): { memoryIds: string[]; jobs: EvolutionJobRecord[] } {
+    const correction = request.userMemoryCorrection;
+    if (correction) {
+      const target = this.deps.repos.userMemories.get(correction.targetMemoryId);
+      if (!target || target.userId !== rawTurn.userId || target.status !== "active") {
+        throw new MemoryServiceError("not_found", `active user memory not found: ${correction.targetMemoryId}`);
+      }
+      const content = correction.revisedContent.trim();
+      const memoryTypes = classifyUserMemory(content);
+      if (!content || memoryTypes.length === 0) {
+        throw new MemoryServiceError("invalid_argument", "user memory correction requires complete revised user content");
+      }
+      const replacement = buildUserMemory({
+        id: `user_memory_${stableHash(`${rawTurn.id}:${target.id}:${content}`).slice(0, 20)}`,
+        sourceTurnId: rawTurn.id,
+        userId: rawTurn.userId,
+        memoryTypes,
+        content,
+        createdAt: at,
+        replacesMemoryId: target.id
+      });
+      if (replacement.normalizedUserTextHash === target.normalizedUserTextHash) {
+        throw new MemoryServiceError("invalid_argument", "user memory correction must change the target content");
+      }
+      const upsert = this.deps.repos.userMemories.upsertExact(replacement);
+      const inserted = upsert.memory;
+      const archived = this.deps.repos.userMemories.archiveForCorrection(target.id, inserted.id, at);
+      this.appendUserMemoryChange(
+        inserted,
+        upsert.previous,
+        upsert.created ? "created" : "updated",
+        at
+      );
+      if (archived) this.appendUserMemoryChange(archived, target, "archived", at);
+      return {
+        memoryIds: [inserted.id],
+        jobs: upsert.created ? this.userMemoryEmbeddingJobs(inserted, rawTurn, at) : []
+      };
+    }
+
+    if (this.deps.llm.isConfigured()) return { memoryIds: [], jobs: [] };
+
+    const content = rawTurn.userText?.trim() ?? "";
+    const memoryTypes = classifyUserMemory(content);
+    if (memoryTypes.length === 0) return { memoryIds: [], jobs: [] };
+    const candidate = buildUserMemory({
+      id: `user_memory_${stableHash(`${rawTurn.id}:${content}`).slice(0, 20)}`,
+      sourceTurnId: rawTurn.id,
+      userId: rawTurn.userId,
+      memoryTypes,
+      content,
+      createdAt: at
+    });
+    const upsert = this.deps.repos.userMemories.upsertExact(candidate);
+    this.appendUserMemoryChange(
+      upsert.memory,
+      upsert.previous,
+      upsert.created ? "created" : "updated",
+      at
+    );
+    return {
+      memoryIds: [upsert.memory.id],
+      jobs: upsert.created ? this.userMemoryEmbeddingJobs(upsert.memory, rawTurn, at) : []
+    };
+  }
+
+  private userMemoryEmbeddingJobs(
+    memory: { id: string; userId: string; content: string },
+    rawTurn: RawTurnRecord,
+    at: string
+  ): EvolutionJobRecord[] {
+    if (!this.deps.config.algorithm.capture.embedAfterCapture) return [];
+    return [this.deps.enqueueJob({
+      jobType: "user_memory_embedding",
+      userId: memory.userId,
+      sessionId: rawTurn.sessionId,
+      episodeId: rawTurn.episodeId,
+      targetMemoryId: memory.id,
+      payload: { contentHash: stableHash(memory.content) },
+      maxAttempts: 6,
+      createdAt: at
+    })];
+  }
+
+  private appendUserMemoryChange(
+    memory: { id: string; userId: string },
+    before: unknown,
+    op: "created" | "updated" | "archived",
+    at: string
+  ): void {
+    this.deps.repos.runtime.appendChange({
+      memoryId: memory.id,
+      kind: "user_memory",
+      op,
+      entityId: memory.id,
+      userId: memory.userId,
+      changeType: `user_memory_${op}`,
+      before,
+      after: memory,
+      source: "turn.complete.user_memory",
+      createdAt: at
+    });
   }
 
   private buildTurnRouteProposal(

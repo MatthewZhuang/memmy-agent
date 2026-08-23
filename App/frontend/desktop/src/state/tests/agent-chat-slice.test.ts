@@ -4966,6 +4966,19 @@ describe("agent chat slice", () => {
     expect(state.currentChatId).toBe("chat-1");
   });
 
+  it("remembers a successful connection after the Agent bridge is disposed", () => {
+    let state = agentReducer(initialAgentState, {
+      type: "agent/wsEvent",
+      event: { event: "ready", chat_id: "chat-1", connection_generation: 1 }
+    });
+    expect(state.hasConnectedSinceStartup).toBe(true);
+
+    state = agentReducer(state, { type: "agent/connectionDisposed" });
+
+    expect(state.connectionGeneration).toBe(0);
+    expect(state.hasConnectedSinceStartup).toBe(true);
+  });
+
   it("does not treat attached as an application-ready connection", () => {
     const state = agentReducer({ ...initialAgentState, connectionStatus: "connecting" }, {
       type: "agent/wsEvent",

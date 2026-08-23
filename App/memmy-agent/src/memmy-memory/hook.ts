@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { AgentHook, AgentHookContext, type AgentToolRegistrationContext, type SystemPromptBuildContext } from "../core/agent-runtime/hook.js";
 import { ContextBuilder } from "../core/agent-runtime/context.js";
-import { extractReasoning, stripThink } from "../utils/helpers.js";
+import { extractReasoning, imagePlaceholderText, stripThink } from "../utils/helpers.js";
 import {
   CURRENT_USER_REQUEST_TAG,
   extractCurrentUserRequestText,
@@ -139,7 +139,7 @@ export class MemmyMemoryHook extends AgentHook implements MemmyMemoryToolRuntime
     if (isGoalContinuation && !internalObjective) return;
     try {
       const sessionId = await this.ensureSession(ctx, sessionKey);
-      const turnId = randomUUID();
+      const turnId = stringOrUndefined(ctx.spec?.turnId) ?? randomUUID();
       const userText = isGoalContinuation ? internalObjective : lastUserText(messages);
       const turn: MemmyMemoryTurnState = {
         sessionKey,
@@ -551,7 +551,15 @@ function arrayOfStrings(value: any): string[] | undefined {
 
 function messageContentText(content: any): string {
   if (typeof content === "string") return content;
-  if (Array.isArray(content)) return content.map((item) => item?.text ?? item?.content ?? "").filter(Boolean).join("\n");
+  if (Array.isArray(content)) {
+    return content.map((item) => {
+      if (item?.type === "image_url") {
+        const mediaPath = typeof item.meta?.path === "string" ? item.meta.path : "";
+        return imagePlaceholderText(mediaPath);
+      }
+      return item?.text ?? item?.content ?? "";
+    }).filter(Boolean).join("\n");
+  }
   if (content == null) return "";
   return String(content);
 }

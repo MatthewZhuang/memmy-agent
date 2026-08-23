@@ -48,6 +48,7 @@ import type {
   MemoryKind,
   MemoryLayer,
   MemoryListItem,
+  PanelMemoryListItem,
   MemoryProcessingRecord,
   MemoryReloadConfigRequest,
   MemoryReloadConfigResponse,
@@ -55,6 +56,7 @@ import type {
   MemorySearchRequest,
   RawTurnRedactRequest,
   RecallHit,
+  RecallMemoryLayer,
   RepairSuggestionRequest,
   RequestEnvelope,
   RetrievalMode,
@@ -182,6 +184,8 @@ export interface CompleteTurnResponse {
   sessionId: string;
   episodeId: string;
   rawTurnId: string;
+  userMemoryId: string;
+  userMemoryIds: string[];
   l1MemoryId: string;
   l1MemoryIds: string[];
   closedEpisodeIds: string[];
@@ -288,7 +292,8 @@ export class MemoryService {
           resolveSkillTrial: (job) => this.skillTrials.resolveSkillTrial(job)
         },
         embedding: {
-          embedMemory: this.embedMemory.bind(this)
+          embedMemory: this.embedMemory.bind(this),
+          embedUserMemory: (job) => this.embeddingJobs.embedUserMemory(job)
         }
       }
     });
@@ -390,7 +395,8 @@ export class MemoryService {
       enqueueImportSummaryIfMissing: this.workerHandlers.enqueueImportSummaryIfMissing,
       enqueueEmbeddingRetry: this.workerHandlers.enqueueEmbeddingRetry,
       appendEmbeddingRetryChange: this.workerHandlers.appendEmbeddingRetryChange,
-      summarizeTraceForCapture: this.evolutionJobs.summarizeTraceForCapture.bind(this.evolutionJobs)
+      summarizeTraceForCapture: this.evolutionJobs.summarizeTraceForCapture.bind(this.evolutionJobs),
+      decideTurnMemoryForCapture: this.evolutionJobs.decideTurnMemoryForCapture.bind(this.evolutionJobs)
     });
     const workerRunnerOwner = this;
     this.workerRunner = new WorkerRunner({
@@ -404,6 +410,8 @@ export class MemoryService {
       namespaceIdFromMemory,
       runWorkerNoWrite: this.runWorkerNoWrite.bind(this),
       restartFailedProcessing: this.restartFailedProcessing.bind(this),
+      previewPolicyEvidenceReconciliation: this.evolutionJobs.previewPolicyEvidenceReconciliation.bind(this.evolutionJobs),
+      reconcileOrphanedPolicies: this.evolutionJobs.reconcileOrphanedPolicies.bind(this.evolutionJobs),
       enqueueJob: this.workerHandlers.enqueueJob,
       enqueueEmbeddingRetry: this.workerHandlers.enqueueEmbeddingRetry,
       appendJobChange: this.workerHandlers.appendJobChange,
@@ -855,7 +863,7 @@ export class MemoryService {
     droppedDueToBudget: Array<{
       id: string;
       kind: MemoryKind;
-      memoryLayer: MemoryLayer;
+      memoryLayer: RecallMemoryLayer;
       reason: "token_budget";
       tokenEstimate?: number;
     }>;
@@ -923,7 +931,7 @@ export class MemoryService {
     droppedDueToBudget: Array<{
       id: string;
       kind: MemoryKind;
-      memoryLayer: MemoryLayer;
+      memoryLayer: RecallMemoryLayer;
       reason: "token_budget";
       tokenEstimate?: number;
     }>;
@@ -1239,7 +1247,8 @@ export class MemoryService {
     const memory = this.requireExistingMemory(id);
     this.assertMemoryInScope(memory, request.namespace);
     const kind = kindFromMemory(memory);
-    const archived = this.repos.memories.archive(memory.id, nowIso());
+    const at = nowIso();
+    const archived = this.repos.memories.archive(memory.id, at);
     if (!archived) {
       throw new MemoryServiceError("not_found", `memory not found: ${id}`);
     }
@@ -1269,6 +1278,7 @@ export class MemoryService {
       meta: { reason: request.reason },
       createdAt: archived.updatedAt
     });
+    this.evolutionJobs.invalidateMemoryDependencies(memory, at);
     return {
       ok: true,
       id: archived.id,
@@ -1292,10 +1302,61 @@ export class MemoryService {
     serverTime: string;
   } {
     this.assertMemoryAddEnabled();
+    const userMemory = this.repos.userMemories.get(id);
+    if (userMemory) {
+      const namespaceUserId = request.namespace?.userId;
+      if (namespaceUserId && namespaceUserId !== userMemory.userId) {
+        throw new MemoryServiceError("forbidden", "user memory belongs to a different user");
+      }
+      const deleted = this.repos.userMemories.softDelete(userMemory.id, nowIso());
+      if (!deleted) throw new MemoryServiceError("not_found", `user memory not found: ${id}`);
+      const changeSeq = this.repos.runtime.appendChange({
+        memoryId: deleted.id,
+        kind: "user_memory",
+        op: "deleted",
+        entityId: deleted.id,
+        userId: deleted.userId,
+        changeType: "user_memory_delete",
+        before: {
+          id: userMemory.id,
+          sourceTurnId: userMemory.sourceTurnId,
+          status: userMemory.status
+        },
+        after: { id: deleted.id, status: deleted.status, deletedAt: deleted.deletedAt },
+        source: "panel.delete",
+        createdAt: deleted.updatedAt
+      });
+      const audit = this.repos.runtime.insertAudit({
+        userId: deleted.userId,
+        actor: request.namespace ? { ...request.namespace } : {},
+        action: "delete",
+        targetKind: "user_memory",
+        targetId: deleted.id,
+        before: {
+          id: userMemory.id,
+          sourceTurnId: userMemory.sourceTurnId,
+          status: userMemory.status
+        },
+        after: { id: deleted.id, status: deleted.status, deletedAt: deleted.deletedAt },
+        meta: { reason: request.reason },
+        createdAt: deleted.updatedAt
+      });
+      return {
+        ok: true,
+        id: deleted.id,
+        kind: "user_memory",
+        status: "deleted",
+        changeSeq,
+        syncCursor: this.encodeChangeCursor(changeSeq, request.namespace),
+        auditId: audit.id,
+        serverTime: nowIso()
+      };
+    }
     const memory = this.requireExistingMemory(id);
     this.assertMemoryInScope(memory, request.namespace);
     const kind = kindFromMemory(memory);
-    const deleted = this.repos.memories.softDelete(memory.id, nowIso());
+    const at = nowIso();
+    const deleted = this.repos.memories.softDelete(memory.id, at);
     if (!deleted) {
       throw new MemoryServiceError("not_found", `memory not found: ${id}`);
     }
@@ -1325,6 +1386,7 @@ export class MemoryService {
       meta: { reason: request.reason },
       createdAt: deleted.updatedAt
     });
+    this.evolutionJobs.invalidateMemoryDependencies(memory, at);
     return {
       ok: true,
       id: deleted.id,
@@ -1333,6 +1395,50 @@ export class MemoryService {
       changeSeq,
       syncCursor: this.encodeChangeCursor(changeSeq, request.namespace ?? namespaceForMemory(deleted)),
       auditId: audit.id,
+      serverTime: nowIso()
+    };
+  }
+
+  recallEvidence(queryId: string, request: RequestEnvelope = {}): {
+    recallEventId: string;
+    queryId: string;
+    query: string;
+    hits: RecallHit[];
+    createdAt: string;
+    serverTime: string;
+  } {
+    this.assertMemorySearchEnabled();
+    const event = this.repos.runtime.getRecallEventByQueryId(queryId);
+    if (!event) throw new MemoryServiceError("not_found", `recall event not found: ${queryId}`);
+    if (request.namespace?.userId && request.namespace.userId !== event.userId) {
+      throw new MemoryServiceError("forbidden", "recall event belongs to a different user");
+    }
+    const eventRequest = isRecord(event.request) ? event.request : {};
+    const evidence = isRecord(eventRequest.recallEvidence) ? eventRequest.recallEvidence : {};
+    const storedHits = Array.isArray(evidence.hits)
+      ? evidence.hits.filter(isRecord) as unknown as RecallHit[]
+      : [];
+    const hits = storedHits.flatMap((hit) => {
+      if (!hit.members?.length) {
+        return this.isDeletedRecallMemory(hit.id) ? [] : [hit];
+      }
+      const members = hit.members.filter((member) => !this.isDeletedRecallMemory(member.id));
+      if (members.length === 0) return [];
+      const memberIds = new Set(members.map((member) => member.id));
+      return [{
+        ...hit,
+        members,
+        memberMemoryIds: (hit.memberMemoryIds ?? members.map((member) => member.id))
+          .filter((id) => memberIds.has(id)),
+        retrievalRoutes: [...new Set(members.map((member) => member.retrievalRoute))]
+      }];
+    });
+    return {
+      recallEventId: event.id,
+      queryId: event.queryId ?? queryId,
+      query: event.query,
+      hits,
+      createdAt: event.createdAt,
       serverTime: nowIso()
     };
   }
@@ -1554,6 +1660,7 @@ export class MemoryService {
   panelOverviewSummary(input: RequestEnvelope & { userId?: string } = {}): {
     counts: {
       memories: number;
+      userMemories: number;
       skills: number;
       experiences: number;
       worldModels: number;
@@ -1589,7 +1696,7 @@ export class MemoryService {
 
   panelItems(input: RequestEnvelope & {
     userId?: string;
-    layer?: MemoryLayer;
+    layer?: RecallMemoryLayer;
     status?: "activated" | "resolving" | "archived" | "deleted";
     q?: string;
     tags?: string[];
@@ -1599,7 +1706,7 @@ export class MemoryService {
     limit?: number;
     cursor?: string | number;
   }): {
-    items: MemoryListItem[];
+    items: PanelMemoryListItem[];
     page: number;
     pageSize: number;
     total: number;
@@ -1949,6 +2056,8 @@ export class MemoryService {
       sessionId: request.sessionId,
       episodeId,
       rawTurnId,
+      userMemoryId: "",
+      userMemoryIds: [],
       l1MemoryId: "",
       l1MemoryIds: [],
       closedEpisodeIds: [],
@@ -2035,6 +2144,13 @@ export class MemoryService {
       throw new MemoryServiceError("not_found", `memory not found: ${id}`);
     }
     return memory;
+  }
+
+  private isDeletedRecallMemory(id: string): boolean {
+    const userMemory = this.repos.userMemories.getIncludingDeleted(id);
+    if (userMemory) return userMemory.status === "deleted" || Boolean(userMemory.deletedAt);
+    const memory = this.repos.memories.getIncludingDeleted(id);
+    return Boolean(memory && (memory.status === "deleted" || memory.deletedAt));
   }
 
   private requireRawTurn(rawTurnId: string): RawTurnRecord {

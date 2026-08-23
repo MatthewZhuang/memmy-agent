@@ -4,6 +4,7 @@ import {
   cosine,
   detectDominantLanguage,
   languageSteeringLine,
+  policyIsEligibleForDownstream,
   policyMetaFromMemory,
   shapeWorldModelConfidence,
   traceMetaFromMemory,
@@ -49,6 +50,113 @@ export interface WorldModelPipelineDeps {
 export class WorldModelPipeline {
   constructor(private readonly deps: WorldModelPipelineDeps) {}
 
+  invalidatePolicySource(policyId: string, at: string): void {
+    const affected = this.deps.repos.memories
+      .list({ memoryLayer: "L3", status: ["activated", "resolving"] }, 1000)
+      .map((memory) => ({ memory, world: worldModelMetaFromMemory(memory) }))
+      .filter((item): item is { memory: MemoryRow; world: WorldModelMeta } =>
+        Boolean(item.world?.policyIds.includes(policyId))
+      );
+
+    for (const { memory, world } of affected) {
+      const remainingPolicies = world.policyIds
+        .map((id) => this.deps.repos.memories.get(id))
+        .map((source) => source ? policyMetaFromMemory(source) : null)
+        .filter((policy): policy is PolicyMeta => Boolean(
+          policy && policyIsEligibleForDownstream(policy)
+        ));
+      const replacement = buildWorldModelDraft({
+        policies: remainingPolicies,
+        minPolicies: this.deps.config.algorithm.l3Abstraction.minPolicies,
+        minPolicyGain: this.deps.config.algorithm.l3Abstraction.minPolicyGain,
+        minPolicySupport: this.deps.config.algorithm.l3Abstraction.minPolicySupport,
+        clusterMinSimilarity: this.deps.config.algorithm.l3Abstraction.clusterMinSimilarity
+      }).find((draft) => draft.domainKey === world.domainKey);
+
+      if (!replacement) {
+        const archived = this.deps.repos.memories.archive(memory.id, at);
+        if (archived) this.recordPolicyInvalidation(memory, archived, policyId, at);
+        continue;
+      }
+
+      const internal = memory.properties.internal_info;
+      const saved = this.deps.repos.memories.update({
+        ...memory,
+        status: "activated",
+        memoryValue: replacement.body,
+        tags: replacement.tags,
+        info: {
+          ...memory.info,
+          domain_key: replacement.domainKey,
+          confidence: replacement.confidence,
+          cohesion: replacement.cohesion,
+          admission: replacement.admission,
+          source_memory_ids: replacement.policyIds
+        },
+        properties: {
+          ...memory.properties,
+          internal_info: {
+            ...internal,
+            source_memory_ids: replacement.policyIds,
+            source_policy_ids: replacement.policyIds,
+            title: replacement.title,
+            summary: replacement.summary,
+            body: replacement.body,
+            structure: replacement.structure,
+            domain_tags: replacement.domainTags,
+            world_model_confidence: replacement.confidence,
+            world_model: {
+              title: replacement.title,
+              domain_key: replacement.domainKey,
+              domain_tags: replacement.domainTags,
+              policy_ids: replacement.policyIds,
+              confidence: replacement.confidence,
+              cohesion: replacement.cohesion,
+              admission: replacement.admission,
+              structure: replacement.structure,
+              summary: replacement.summary,
+              body: replacement.body,
+              vec: replacement.vec
+            }
+          }
+        },
+        updatedAt: at
+      });
+      this.recordPolicyInvalidation(memory, saved, policyId, at);
+      if (this.deps.config.algorithm.capture.embedAfterCapture) {
+        this.deps.enqueueJob({
+          jobType: "embedding",
+          userId: saved.userId,
+          sessionId: saved.sessionId,
+          targetMemoryId: saved.id,
+          payload: { reason: "l3.policy_source_invalidated" },
+          createdAt: at
+        });
+      }
+    }
+  }
+
+  private recordPolicyInvalidation(
+    before: MemoryRow,
+    after: MemoryRow,
+    policyId: string,
+    at: string
+  ): void {
+    this.deps.repos.runtime.appendChange({
+      memoryId: after.id,
+      namespaceId: this.deps.namespaceIdFromMemory(after),
+      kind: kindFromMemory(after),
+      op: after.status === "archived" ? "archived" : "updated",
+      entityId: after.id,
+      userId: after.userId,
+      changeType: "world_model_policy_source_invalidated",
+      before,
+      after,
+      source: "governance.policy_invalidation",
+      createdAt: at
+    });
+  }
+
   async abstractL3(job: EvolutionJobRecord): Promise<void> {
     const source = this.l3AbstractionSourceForJob(job);
     const userId = source?.userId ?? job.userId;
@@ -57,7 +165,7 @@ export class WorldModelPipeline {
       .list({ memoryLayer: "L2", status: "activated" }, 1000)
       .map(policyMetaFromMemory)
       .filter((policy): policy is NonNullable<ReturnType<typeof policyMetaFromMemory>> =>
-        Boolean(policy)
+        Boolean(policy && policyIsEligibleForDownstream(policy))
       );
     const domainTagsFilter = stringArray(job.payload.domainTagsFilter);
     const filteredPolicies = domainTagsFilter.length > 0

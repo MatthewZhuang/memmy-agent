@@ -73,11 +73,12 @@ export interface WorkerJobProcessors {
   };
   embedding: {
     embedMemory(job: EvolutionJobRecord): MaybePromise<void>;
+    embedUserMemory(job: EvolutionJobRecord): MaybePromise<void>;
   };
 }
 
 export interface WorkerJobHandlerDeps {
-  repos: Pick<Repositories, "transaction" | "memories" | "processing" | "runtime">;
+  repos: Pick<Repositories, "transaction" | "memories" | "userMemories" | "processing" | "runtime">;
   capture: { synthReflection: boolean };
   reward: { feedbackWindowSec: number };
   nowIso(): string;
@@ -248,6 +249,9 @@ export async function processJob(
       return;
     case "embedding":
       await deps.processors.embedding.embedMemory(job);
+      return;
+    case "user_memory_embedding":
+      await deps.processors.embedding.embedUserMemory(job);
       return;
     case "reflection":
       await deps.processors.feedback.reflectTrace(job);
@@ -532,6 +536,8 @@ export function evolutionJobDedupeKey(input: Pick<EnqueueJobInput, "jobType" | "
       return target
         ? `embedding:${target}:${payloadString("vectorField") ?? "vec"}:${payloadString("sourceHash") ?? payloadString("contentHash") ?? "current"}`
         : undefined;
+    case "user_memory_embedding":
+      return target ? `user_memory_embedding:${target}:${payloadString("contentHash") ?? "current"}` : undefined;
     case "trace_summary":
       return target ? `trace_summary:${target}:${payloadString("contentHash") ?? "current"}` : undefined;
     case "import_summary":
@@ -569,7 +575,7 @@ export function evolutionJobDedupeKey(input: Pick<EnqueueJobInput, "jobType" | "
       return basis ? `l3_abstraction:${basis}` : input.episodeId ? `l3_abstraction:${input.episodeId}` : undefined;
     }
     case "skill_crystallization": {
-      const seed = target ?? payloadString("policyId") ?? payloadString("skillId");
+      const seed = payloadString("skillId") ?? target ?? payloadString("policyId");
       return seed ? `skill_crystallization:${seed}` : input.episodeId ? `skill_crystallization:${input.episodeId}` : undefined;
     }
     case "skill_trial_resolve": {

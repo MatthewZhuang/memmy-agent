@@ -128,6 +128,53 @@ describe("agent source service", () => {
     });
   });
 
+  it("imports scanned Agent skills with immutable source provenance", async () => {
+    const added: Parameters<MemoryClient["addMemory"]>[0][] = [];
+    const memoryClient = createMockMemoryClient();
+    const service = createService({
+      adapters: [createFakeAdapter("cursor", createCompleteMemoryMessages("cursor", 1, "2026-05-28T10:00:00.000Z"))],
+      memoryClient: {
+        ...memoryClient,
+        async addMemory(input, context) {
+          added.push(input);
+          return memoryClient.addMemory(input, context);
+        }
+      },
+      skillDistributionService: {
+        async listSkills() {
+          return [{
+            sourceAgentId: "cursor",
+            sourceSkillId: "review-code",
+            sourceSkillPath: "/tmp/cursor/skills/review-code/SKILL.md",
+            sourceSkillVersion: "v2",
+            sourceContentHash: "hash-v2",
+            title: "review-code",
+            content: "Review changed code.",
+            updatedAt: "2026-05-28T09:00:00.000Z"
+          }];
+        },
+        async install() {},
+        async uninstall() {},
+        async installPlugin() {},
+        async uninstallPlugin() {}
+      }
+    });
+
+    await service.scanOne("cursor");
+
+    expect(added).toEqual([
+      expect.objectContaining({
+        layer: "Skill",
+        sourceAgentId: "cursor",
+        sourceSkillId: "review-code",
+        sourceSkillPath: "/tmp/cursor/skills/review-code/SKILL.md",
+        sourceSkillVersion: "v2",
+        sourceContentHash: "hash-v2",
+        tags: ["agent-source", "cross-agent-skill", "cursor"]
+      })
+    ]);
+  });
+
   it("completes the scan and advances checkpoints when every memory is skipped", async () => {
     const repository = createRepository();
     const messages = createCompleteMemoryMessages("cursor", 1, "2026-05-28T10:00:00.000Z");

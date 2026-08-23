@@ -25,6 +25,7 @@ interface MemmyPreloadApi {
   platform: string;
   getRuntimeConfig(): Promise<unknown>;
   getAppInfo(): Promise<DesktopAppInfo>;
+  getInstallationId(): Promise<string>;
   checkForUpdates(): Promise<DesktopUpdateCheckResult>;
   downloadUpdate(update: DesktopUpdateCheckResult, options?: DesktopUpdateDownloadOptions): Promise<DesktopUpdateInstallResult>;
   onUpdateDownloadProgress(callback: (progress: DesktopUpdateDownloadProgress) => void): () => void;
@@ -116,6 +117,10 @@ const memmyPreloadApi: MemmyPreloadApi = {
 
   async getAppInfo(): Promise<DesktopAppInfo> {
     return ipcRenderer.invoke("memmy:get-app-info");
+  },
+
+  async getInstallationId(): Promise<string> {
+    return ipcRenderer.invoke("memmy:get-installation-id");
   },
 
   async checkForUpdates(): Promise<DesktopUpdateCheckResult> {

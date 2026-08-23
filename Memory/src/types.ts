@@ -2,7 +2,8 @@ export type IsoTime = string;
 export const DEFAULT_NAMESPACE_SOURCE = "unknown";
 export type Cursor = string;
 export type MemoryLayer = "L1" | "L2" | "L3" | "Skill";
-export type MemoryKind = "trace" | "span" | "policy" | "world_model" | "skill";
+export type RecallMemoryLayer = MemoryLayer | "UserMemory";
+export type MemoryKind = "user_memory" | "trace" | "span" | "policy" | "world_model" | "skill";
 export type MemoryStatus = "activated" | "resolving" | "archived" | "deleted";
 export type RetrievalMode =
   | "search"
@@ -41,6 +42,7 @@ export interface MemoryProcessingRecord {
 export type JobType =
   | "episode_idle_close"
   | "trace_summary"
+  | "user_memory_embedding"
   | "import_summary"
   | "reflection"
   | "embedding"
@@ -165,14 +167,32 @@ export interface MemoryFilter {
 export interface RecallHit {
   id: string;
   kind: MemoryKind;
-  memoryLayer: MemoryLayer;
+  memoryLayer: RecallMemoryLayer;
   status: MemoryStatus;
   title?: string;
   snippet: string;
   score: number;
   tags: string[];
+  createdAt?: IsoTime;
   updatedAt?: IsoTime;
   source: "search" | "episode" | "rule" | "skill";
+  sourceTurnId?: string;
+  memberMemoryIds?: string[];
+  retrievalRoutes?: Array<"user_memory" | "l1" | "agent_memory">;
+  sourceAgentId?: string;
+  sourceSkillId?: string;
+  sourceSkillVersion?: string;
+  readOnly?: boolean;
+  members?: Array<{
+    id: string;
+    kind: MemoryKind;
+    memoryLayer: RecallMemoryLayer;
+    status: MemoryStatus | UserMemoryStatus;
+    content: string;
+    createdAt: IsoTime;
+    updatedAt: IsoTime;
+    retrievalRoute: "user_memory" | "l1" | "agent_memory";
+  }>;
 }
 
 export interface InjectedContext {
@@ -181,7 +201,7 @@ export interface InjectedContext {
     id: string;
     title: string;
     kind: MemoryKind;
-    memoryLayer: MemoryLayer;
+    memoryLayer: RecallMemoryLayer;
     memoryIds: string[];
     content: string;
     tokenEstimate?: number;
@@ -207,6 +227,10 @@ export interface MemoryListItem {
   updatedAt: IsoTime;
   version: number;
   processing?: MemoryProcessingRecord;
+}
+
+export interface PanelMemoryListItem extends Omit<MemoryListItem, "memoryLayer"> {
+  memoryLayer: RecallMemoryLayer;
 }
 
 export interface MemoryDetailItem extends MemoryListItem {
@@ -282,6 +306,34 @@ export interface TurnCompleteRequest extends RequestEnvelope {
   sourceMemoryIds?: string[];
   usage?: Record<string, unknown>;
   status?: "succeeded" | "failed" | "cancelled";
+  userMemoryCorrection?: {
+    targetMemoryId: string;
+    revisedContent: string;
+  };
+}
+
+export type UserMemoryType = "User Fact" | "User Preference" | "User Directive";
+export type UserMemoryStatus = "active" | "archived" | "deleted";
+
+export interface UserMemoryRecord {
+  id: string;
+  sourceTurnId: string;
+  userId: string;
+  memoryTypes: UserMemoryType[];
+  content: string;
+  normalizedUserTextHash: string;
+  sourceTurnRefs: string[];
+  status: UserMemoryStatus;
+  replacesMemoryId?: string;
+  replacedByMemoryId?: string;
+  archivedAt?: IsoTime | null;
+  archiveReason?: string;
+  embedding?: number[];
+  embeddingModel?: string;
+  embeddingProvider?: string;
+  createdAt: IsoTime;
+  updatedAt: IsoTime;
+  deletedAt?: IsoTime | null;
 }
 
 export interface ToolObserveRequest extends RequestEnvelope {
@@ -346,6 +398,11 @@ export interface MemoryAddRequest extends RequestEnvelope {
   turnId?: string;
   createdAt?: string;
   deferProcessing?: boolean;
+  sourceAgentId?: string;
+  sourceSkillId?: string;
+  sourceSkillPath?: string;
+  sourceSkillVersion?: string;
+  sourceContentHash?: string;
 }
 
 export interface FeedbackTarget {

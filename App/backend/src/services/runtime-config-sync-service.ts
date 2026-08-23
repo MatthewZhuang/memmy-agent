@@ -1,10 +1,11 @@
 /** Runtime config sync service module. */
-import type { UserMode } from "@memmy/local-api-contracts";
+import type { AccountChannel, UserMode } from "@memmy/local-api-contracts";
 import {
   createAppStateStore,
   type AppStateStore
 } from "../infrastructure/app-state-store/index.js";
 import {
+  clearAccountModelProjectionFromMemmyConfig,
   readRuntimeMemmyConfigState,
   type RuntimeMemmyConfigState
 } from "../infrastructure/memmy-config/index.js";
@@ -12,11 +13,15 @@ import {
 export interface SyncRuntimeConfigWithAppStateOptions {
   appStateStore: AppStateStore;
   memmyConfigPath: string;
+  /** Login channel supported by the current desktop package. */
+  accountChannel?: AccountChannel;
 }
 
 export interface SyncRuntimeConfigForStartupOptions {
   databasePath: string;
   memmyConfigPath: string;
+  /** Login channel supported by the current desktop package. */
+  accountChannel?: AccountChannel;
 }
 
 export interface RuntimeConfigSyncResult {
@@ -43,11 +48,43 @@ export async function syncRuntimeConfigWithAppState(
   options: SyncRuntimeConfigWithAppStateOptions
 ): Promise<RuntimeConfigSyncResult> {
   const state = await readRuntimeMemmyConfigState(options.memmyConfigPath);
+  const activeChannelMismatch = await clearMismatchedActiveSession(options, state);
+  if (activeChannelMismatch) {
+    const clearedUntrustedProjection = await clearUntrustedAccountProjection(
+      options,
+      accountProjectionFromState(state)
+    );
+    const wroteConfig = activeChannelMismatch.wroteConfig || clearedUntrustedProjection;
+    if (state.status === "valid_byok") {
+      const hydrated = hydrateByokRuntimeConfig(options.appStateStore, state);
+      return {
+        ...hydrated,
+        wroteConfig,
+        reason: "cleared_mismatched_account_session_and_hydrated_byok"
+      };
+    }
+    if (state.status === "conflict" && state.reason === "account_runtime_credentials_conflict") {
+      return {
+        ...await syncRuntimeConfigWithAppState(options),
+        wroteConfig: true,
+        reason: "cleared_conflicting_account_credentials"
+      };
+    }
+    if (state.status === "invalid_yaml" || state.status === "conflict") {
+      throw createRuntimeConfigSyncError(state);
+    }
+    return accountChannelMismatchResult(options.appStateStore, wroteConfig);
+  }
   switch (state.status) {
-    case "valid_byok":
-      return hydrateByokRuntimeConfig(options.appStateStore, state);
+    case "valid_byok": {
+      const clearedDormantProjection = await clearUntrustedAccountProjection(options, state.accountProjection);
+      const hydrated = hydrateByokRuntimeConfig(options.appStateStore, state);
+      return clearedDormantProjection
+        ? { ...hydrated, wroteConfig: true, reason: "cleared_untrusted_account_projection_and_hydrated_byok" }
+        : hydrated;
+    }
     case "valid_account":
-      return hydrateAccountRuntimeConfig(options.appStateStore, state);
+      return hydrateAccountRuntimeConfig(options, state);
     case "missing":
     case "empty":
       return {
@@ -57,17 +94,29 @@ export async function syncRuntimeConfigWithAppState(
         wroteConfig: false,
         reason: `${state.status}_runtime_config_requires_startup_migration`
       };
-    case "no_model_config":
+    case "no_model_config": {
+      const clearedProjection = await clearUntrustedAccountProjection(options, state.accountProjection);
       return {
         source: "none",
         mode: options.appStateStore.repositories.bootstrap.getAppSettings().userMode,
         hydratedAppState: false,
-        wroteConfig: false,
-        reason: state.reason
+        wroteConfig: clearedProjection,
+        reason: clearedProjection ? "cleared_untrusted_account_projection" : state.reason
       };
+    }
     case "invalid_yaml":
-    case "conflict":
       throw createRuntimeConfigSyncError(state);
+    case "conflict":
+      if (state.reason !== "account_runtime_credentials_conflict") {
+        throw createRuntimeConfigSyncError(state);
+      }
+      options.appStateStore.repositories.accountSession.clear();
+      await clearAccountModelProjectionFromMemmyConfig(options.memmyConfigPath, { force: true });
+      return {
+        ...await syncRuntimeConfigWithAppState(options),
+        wroteConfig: true,
+        reason: "cleared_conflicting_account_credentials"
+      };
   }
 }
 
@@ -79,7 +128,8 @@ export async function syncRuntimeConfigForStartup(
   try {
     return await syncRuntimeConfigWithAppState({
       appStateStore,
-      memmyConfigPath: options.memmyConfigPath
+      memmyConfigPath: options.memmyConfigPath,
+      accountChannel: options.accountChannel
     });
   } finally {
     appStateStore.close();
@@ -102,19 +152,33 @@ function hydrateByokRuntimeConfig(
   };
 }
 
-function hydrateAccountRuntimeConfig(
-  appStateStore: AppStateStore,
+async function hydrateAccountRuntimeConfig(
+  options: SyncRuntimeConfigWithAppStateOptions,
   state: Extract<RuntimeMemmyConfigState, { status: "valid_account" }>
-): RuntimeConfigSyncResult {
-  const activated = appStateStore.repositories.accountSession.activateByCloudUuid(state.cloudUuid);
+): Promise<RuntimeConfigSyncResult> {
+  const { appStateStore } = options;
+  const activated = appStateStore.repositories.accountSession.activateByCloudUuid(
+    state.cloudUuid,
+    options.accountChannel
+  );
   const session = appStateStore.repositories.accountSession.get();
-  if (!activated || !session.authenticated || (state.userId && session.profile.userId !== state.userId)) {
-    if (activated) appStateStore.repositories.accountSession.activateByCloudUuid("");
+  const sessionChannel = appStateStore.repositories.accountSession.getAuthChannel();
+  if (
+    !activated
+    || !session.authenticated
+    || (options.accountChannel && sessionChannel !== options.accountChannel)
+    || (state.userId && session.profile.userId !== state.userId)
+  ) {
+    if (activated) appStateStore.repositories.accountSession.clear();
+    const projection = await clearAccountModelProjectionFromMemmyConfig(options.memmyConfigPath, {
+      ownerAccountId: state.userId ?? (session.authenticated ? session.profile.userId : undefined),
+      force: true
+    });
     return {
       source: "none",
       mode: appStateStore.repositories.bootstrap.getAppSettings().userMode,
       hydratedAppState: false,
-      wroteConfig: false,
+      wroteConfig: projection.changed,
       reason: "account_projection_has_no_matching_local_session"
     };
   }
@@ -127,6 +191,70 @@ function hydrateAccountRuntimeConfig(
     hydratedAppState: true,
     wroteConfig: false,
     reason: "hydrated_account_from_runtime_config"
+  };
+}
+
+async function clearMismatchedActiveSession(
+  options: SyncRuntimeConfigWithAppStateOptions,
+  state: RuntimeMemmyConfigState
+): Promise<{ wroteConfig: boolean } | null> {
+  if (!options.accountChannel) return null;
+  const session = options.appStateStore.repositories.accountSession.get();
+  if (!session.authenticated) return null;
+  if (options.appStateStore.repositories.accountSession.getAuthChannel() === options.accountChannel) {
+    return null;
+  }
+
+  options.appStateStore.repositories.accountSession.clear();
+  if (
+    state.status === "missing"
+    || state.status === "empty"
+    || state.status === "invalid_yaml"
+    || state.status === "conflict"
+  ) {
+    return { wroteConfig: false };
+  }
+  const projection = await clearAccountModelProjectionFromMemmyConfig(options.memmyConfigPath, {
+    ownerAccountId: session.profile.userId
+  });
+  return { wroteConfig: projection.changed };
+}
+
+async function clearUntrustedAccountProjection(
+  options: SyncRuntimeConfigWithAppStateOptions,
+  accountProjection: { cloudUuid: string; userId?: string } | undefined
+): Promise<boolean> {
+  if (!options.accountChannel || !accountProjection) return false;
+  const storedChannel = options.appStateStore.repositories.accountSession.getAuthChannelByCloudUuid(
+    accountProjection.cloudUuid
+  );
+  if (storedChannel === options.accountChannel) return false;
+  const projection = await clearAccountModelProjectionFromMemmyConfig(options.memmyConfigPath, {
+    ownerAccountId: accountProjection.userId,
+    force: true
+  });
+  return projection.changed;
+}
+
+function accountProjectionFromState(
+  state: RuntimeMemmyConfigState
+): { cloudUuid: string; userId?: string } | undefined {
+  if (state.status === "valid_account") {
+    return state.userId ? { cloudUuid: state.cloudUuid, userId: state.userId } : { cloudUuid: state.cloudUuid };
+  }
+  return "accountProjection" in state ? state.accountProjection : undefined;
+}
+
+function accountChannelMismatchResult(
+  appStateStore: AppStateStore,
+  wroteConfig: boolean
+): RuntimeConfigSyncResult {
+  return {
+    source: "none",
+    mode: appStateStore.repositories.bootstrap.getAppSettings().userMode,
+    hydratedAppState: false,
+    wroteConfig,
+    reason: "account_session_channel_mismatch"
   };
 }
 

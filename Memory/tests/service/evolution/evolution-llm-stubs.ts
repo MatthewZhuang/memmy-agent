@@ -41,10 +41,15 @@ export function createCapturingL2Llm(calls: Array<{
       }
       if (options.operation === "capture.summarize") {
         return {
-          summary: "reflected trace summary"
+          summary: "reflected trace summary",
+          create_l1: true,
+          l1_summary: "reflected trace summary",
+          create_user_memory: false,
+          user_memory_types: [],
+          reason: "durable task result"
         } as unknown as T;
       }
-      if (options.operation === "l2.induction.v3") {
+      if (options.operation === "l2.induction.v4") {
         const configuredResponse = Array.isArray(l2InductionResponse)
           ? l2InductionResponse[
               Math.min(l2InductionCallIndex, Math.max(0, l2InductionResponse.length - 1))

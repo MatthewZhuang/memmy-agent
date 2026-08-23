@@ -6,7 +6,12 @@ import { CONTEXT_SAFETY_BUFFER_TOKENS } from "../../token-budget.js";
 import { GitStore } from "../../utils/gitstore.js";
 import { ensureDir, estimatePromptTokensChain, stripThink, truncateText } from "../../utils/helpers.js";
 import { renderTemplate } from "../../utils/prompt-templates.js";
-import { DagSnapshotBuilder, SessionDagStore, type SessionDagQueueManager } from "../../session-dag/index.js";
+import {
+  DagSnapshotBuilder,
+  SessionDagStore,
+  sessionDagDbPath,
+  type SessionDagQueueManager,
+} from "../../session-dag/index.js";
 import { AgentHook, AgentHookContext } from "./hook.js";
 import { AgentRunner, AgentRunSpec } from "./runner.js";
 import { EditFileTool, ReadFileTool, WriteFileTool } from "./tools/filesystem.js";
@@ -42,6 +47,48 @@ type TokenCompactionOptions = {
   onCompactionEvent?: TokenCompactionEventCallback;
   notifyOnLockWait?: boolean;
 };
+
+type DagCompactionFailureRecord = {
+  event: "session_dag_compaction_failed";
+  timestamp: string;
+  platform: NodeJS.Platform;
+  pid: number;
+  sessionKey: string;
+  databasePath: string;
+  summaryMode: "dag";
+  errorName: string;
+  errorCode: string | null;
+  message: string;
+  stack: string | null;
+};
+
+function dagCompactionFailureRecord(sessionKey: string, caught: unknown): DagCompactionFailureRecord {
+  const errorName = caught instanceof Error
+    ? caught.name.trim() || "Error"
+    : typeof caught;
+  let errorCode: string | null = null;
+  if (caught && typeof caught === "object" && "code" in caught) {
+    const code = (caught as { code?: unknown }).code;
+    if (typeof code === "string" || typeof code === "number") errorCode = String(code);
+  }
+  const message = caught instanceof Error ? caught.message : String(caught);
+  const stack = caught instanceof Error && typeof caught.stack === "string" && caught.stack.trim()
+    ? caught.stack
+    : null;
+  return {
+    event: "session_dag_compaction_failed",
+    timestamp: new Date().toISOString(),
+    platform: process.platform,
+    pid: process.pid,
+    sessionKey,
+    databasePath: sessionDagDbPath(sessionKey),
+    summaryMode: "dag",
+    errorName,
+    errorCode,
+    message,
+    stack,
+  };
+}
 
 export interface HistoryEntry {
   cursor?: unknown;
@@ -1086,7 +1133,9 @@ export class Consolidator {
         });
       }
     } catch (caught) {
-      error = caught instanceof Error ? caught.message : String(caught);
+      const failure = dagCompactionFailureRecord(sessionKey, caught);
+      error = failure.message;
+      console.error("[session-dag] compaction failed", JSON.stringify(failure));
       if (started) {
         await emitCompactionEvent({
           kind: "token",

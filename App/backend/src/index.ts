@@ -1,5 +1,5 @@
 /** Src module. */
-import { RuntimeConfigSchema, type AppSettingsDto, type LastLaunchMode, type RuntimeConfig } from "@memmy/local-api-contracts";
+import { RuntimeConfigSchema, type AccountChannel, type AppSettingsDto, type LastLaunchMode, type RuntimeConfig } from "@memmy/local-api-contracts";
 import { randomBytes } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { createDefaultAgentAdapterRegistry, type AgentAdapterRegistry } from "./adapters/outbound/agent-adapter/index.js";
@@ -28,11 +28,15 @@ import {
 } from "./services/agent-source-auto-scan-service.js";
 import { resolveCloudClientConfig, type CloudClientConfig } from "./config/service-urls.js";
 import { resetAccountRuntimeForDesktopInstallChange } from "./services/desktop-install-state-service.js";
-import { syncRuntimeConfigWithAppState } from "./services/runtime-config-sync-service.js";
+import {
+  syncRuntimeConfigForStartup,
+  syncRuntimeConfigWithAppState
+} from "./services/runtime-config-sync-service.js";
 import { loadCloudServiceEnv } from "./load-env.js";
 
 export type { BootstrapScenario };
 export { loadCloudServiceEnv };
+export { syncRuntimeConfigForStartup };
 export { trackAnalyticsEvent } from "./analytics/analytics-transport.js";
 
 const DEFAULT_MEMORY_LAYER_TIMEOUT_MS = 20_000;
@@ -53,6 +57,8 @@ export interface CreateLocalBackendOptions {
   memoryBaseUrl?: string;
   /** Desktop install fingerprint. */
   desktopInstallFingerprint?: string;
+  /** Login channel supported by the current desktop package. */
+  accountChannel?: AccountChannel;
   /** Agent source auto scan interval in ms. Defaults to one hour. */
   agentSourceAutoScanIntervalMs?: number;
   /** Agent source startup scan delay in ms. Defaults to five minutes. */
@@ -89,7 +95,8 @@ export async function createLocalBackend(options: CreateLocalBackendOptions): Pr
     }
     await syncRuntimeConfigWithAppState({
       appStateStore,
-      memmyConfigPath
+      memmyConfigPath,
+      accountChannel: options.accountChannel
     });
 
     const permissionManager = createPermissionManager({
@@ -98,7 +105,7 @@ export async function createLocalBackend(options: CreateLocalBackendOptions): Pr
     });
     const memoryClient = options.memoryClient ?? createDefaultMemoryClient(process.env);
     await memoryClient.reloadConfig({ reason: "desktop_startup" });
-    const scanWorker = options.memoryClient ? undefined : { databasePath: appStateStore.databasePath };
+    const scanProcess = options.memoryClient ? undefined : { databasePath: appStateStore.databasePath };
     const cloudConfig = resolveCloudClientConfig(process.env);
     const cloudClient = options.cloudClient ?? createDefaultCloudClient(
       cloudConfig,
@@ -120,6 +127,7 @@ export async function createLocalBackend(options: CreateLocalBackendOptions): Pr
       bootstrapScenario: options.bootstrapScenario,
       memmyConfigWriter,
       memmyConfigPath,
+      accountChannel: options.accountChannel,
       memmyAgentAdminBootstrapSecret: await readAgentGatewayBootstrapSecret(memmyConfigPath)
     });
     const localToken = await permissionManager.getRuntimeToken();
@@ -130,7 +138,7 @@ export async function createLocalBackend(options: CreateLocalBackendOptions): Pr
       composioMcpToken,
       timeZone: configuredTimeZone,
       heartbeatIntervalMs: options.heartbeatIntervalMs,
-      scanWorker
+      scanProcess
     });
     await server.listen({ host: "127.0.0.1", port: 0 });
 

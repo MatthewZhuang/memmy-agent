@@ -7,7 +7,7 @@ if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(expected)) {
   throw new Error("Expected packaged version must use semantic version syntax");
 }
 
-const entries = listPackage(asarPath).map((entry) => entry.replace(/^\/+/, ""));
+const entries = listPackage(asarPath).map((entry) => entry.replaceAll("\\", "/").replace(/^\/+/, ""));
 if (entries.some((entry) => /(^|\/)\.env(?:$|\.)/u.test(entry))) {
   throw new Error("Packaged ASAR contains a forbidden environment file");
 }
@@ -16,9 +16,7 @@ const requiredFiles = [
   "dist/main/desktop-edition.json",
   "package.json",
   "dist/runtime/memory/package.json",
-  "dist/runtime/memory/package-lock.json",
   "dist/runtime/memmy-agent/package.json",
-  "dist/runtime/memmy-agent/package-lock.json",
   "dist/runtime/memmy-agent/node_modules/@memmy/local-api-contracts/dist/index.js",
 ];
 const entrySet = new Set(entries);
@@ -33,6 +31,9 @@ for (const [file, lock] of [
   ["dist/runtime/memmy-agent/package.json", false],
   ["dist/runtime/memmy-agent/package-lock.json", true],
 ]) {
+  // electron-builder excludes npm lockfiles by default. The staged-runtime
+  // version guard validates them before packaging; re-check any that are kept.
+  if (lock && !entrySet.has(file)) continue;
   const json = readAsarJson(asarPath, file);
   if (json.version !== expected) {
     throw new Error(`Packaged version does not match the requested version: ${file}`);
@@ -46,7 +47,8 @@ console.log(`Verified packaged ASAR boundary and version ${expected}`);
 
 function readAsarJson(path, file) {
   try {
-    return JSON.parse(extractFile(path, file).toString("utf8"));
+    const archiveFile = process.platform === "win32" ? file.replaceAll("/", "\\") : file;
+    return JSON.parse(extractFile(path, archiveFile).toString("utf8"));
   } catch {
     throw new Error(`Packaged runtime JSON is invalid: ${file}`);
   }

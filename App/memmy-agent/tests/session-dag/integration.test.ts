@@ -380,6 +380,79 @@ describe("Session DAG integration", () => {
     }
   });
 
+  it("logs a structured DAG compaction failure without changing session state", async () => {
+    const root = tmpRoot();
+    const dagRoot = path.join(root, "dag");
+    const sessionKey = "websocket:dag-cant-open";
+    const sessions = new SessionManager(path.join(root, "sessions"));
+    const session = new Session({ key: sessionKey });
+    session.messages = [
+      { role: "user", content: "private-user-message-0" },
+      { role: "assistant", content: "private-assistant-message-0" },
+      { role: "user", content: "private-user-message-1" },
+      { role: "assistant", content: "private-assistant-message-1" },
+    ];
+    sessions.save(session);
+    const messagesBefore = session.messages.map((message) => ({ ...message }));
+    const queue = { waitUntilProcessed: vi.fn(async () => true) };
+    const cantOpenError = Object.assign(new Error("unable to open database file"), {
+      name: "SqliteError",
+      code: "SQLITE_CANTOPEN",
+    });
+    const consolidator = new Consolidator({
+      store: new MemoryStore(root),
+      provider: provider(),
+      model: "test-model",
+      sessions,
+      contextWindowTokens: 10_000,
+      maxCompletionTokens: 100,
+      buildMessages: ({ history }: any) => history,
+      getToolDefinitions: () => [],
+      summaryMode: "dag",
+      dagQueue: queue as any,
+      createDagStore: () => {
+        throw cantOpenError;
+      },
+    });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const previousDagRoot = process.env.MEMMY_AGENT_SESSION_DAG_DIR;
+    process.env.MEMMY_AGENT_SESSION_DAG_DIR = dagRoot;
+
+    try {
+      await expect(
+        consolidator.maybeConsolidateByTokens(session, { replayMaxMessages: 2 }),
+      ).rejects.toBe(cantOpenError);
+
+      expect(consoleError).toHaveBeenCalledTimes(1);
+      const [prefix, serialized] = consoleError.mock.calls[0] ?? [];
+      expect(prefix).toBe("[session-dag] compaction failed");
+      expect(serialized).toEqual(expect.any(String));
+      const record = JSON.parse(String(serialized));
+      expect(new Date(record.timestamp).toISOString()).toBe(record.timestamp);
+      expect(record).toMatchObject({
+        event: "session_dag_compaction_failed",
+        platform: process.platform,
+        pid: process.pid,
+        sessionKey,
+        databasePath: sessionDagDbPath(sessionKey),
+        summaryMode: "dag",
+        errorName: "SqliteError",
+        errorCode: "SQLITE_CANTOPEN",
+        message: "unable to open database file",
+        stack: expect.stringContaining("unable to open database file"),
+      });
+      expect(serialized).not.toContain("private-user-message");
+      expect(serialized).not.toContain("private-assistant-message");
+      expect(queue.waitUntilProcessed).not.toHaveBeenCalled();
+      expect(session.lastConsolidated).toBe(0);
+      expect(session.metadata.lastSummary).toBeUndefined();
+      expect(session.messages).toEqual(messagesBefore);
+    } finally {
+      if (previousDagRoot === undefined) delete process.env.MEMMY_AGENT_SESSION_DAG_DIR;
+      else process.env.MEMMY_AGENT_SESSION_DAG_DIR = previousDagRoot;
+    }
+  });
+
   it("DAG mode does not run idle text compaction", async () => {
     const root = tmpRoot();
     const sessions = new SessionManager(path.join(root, "sessions"));

@@ -1,3 +1,6 @@
+!include "FileFunc.nsh"
+!include "getProcessInfo.nsh"
+
 !ifndef MEMMY_WM_SETTINGCHANGE
   !define MEMMY_WM_SETTINGCHANGE 0x001A
 !endif
@@ -19,10 +22,27 @@
 !macroend
 
 !ifndef BUILD_UNINSTALLER
+  Var MemmyIsRelayedUpgrade
+  Var MemmyUpgradeWorkDir
+  Var MemmyUpgradeReopenAfterInstall
+
+  ; The 1.0.8 updater starts the downloaded installer from $INSTDIR\data. electron-builder's
+  ; normal upgrade path asks the old uninstaller to move all of $INSTDIR, so that running
+  ; installer keeps the directory busy and the old uninstaller exits with code 2. Relay only
+  ; this legacy --updated invocation through a copy outside $INSTDIR. The relayed child carries
+  ; an explicit marker so normal installs and future upgrades continue through electron-builder.
+  !macro customInit
+    Call MemmyRelayLegacyUpgrade
+  !macroend
+
   !macro customInstall
+    Call MemmyRestoreRelayedUpgradeData
     Call MemmyAddCliToUserPath
     Call MemmyInstallLaunchProxy
     !insertmacro MemmyPointShortcutsToLaunchProxy
+    Call MemmyClearRelayedUpgradeMarkers
+    Call MemmyLaunchRelayedUpgrade
+    Call MemmyScheduleRelayedUpgradeCleanup
   !macroend
 !endif
 
@@ -34,6 +54,168 @@
 !endif
 
 !ifndef BUILD_UNINSTALLER
+Function MemmyRelayLegacyUpgrade
+  ${GetParameters} $R0
+
+  ClearErrors
+  ${GetOptions} $R0 "--memmy-upgrade-relayed" $R1
+  IfErrors memmy_relay_check_legacy
+  Call MemmyReadRelayedUpgradeContext
+  Return
+
+  memmy_relay_check_legacy:
+    ClearErrors
+    ${GetOptions} $R0 "--updated" $R1
+    IfErrors memmy_relay_done
+
+    System::Call 'kernel32::GetCurrentProcessId() i .r2'
+    StrCmp $2 "" memmy_relay_failed
+    StrCmp $2 "0" memmy_relay_failed
+    ${GetProcessInfo} $2 $2 $3 $4 $5 $6
+    StrCmp $3 "" memmy_relay_failed
+    StrCmp $3 "0" memmy_relay_failed
+    StrCpy $R1 "$LOCALAPPDATA\Memmy\upgrade-staging\$2"
+    StrCpy $R3 "$R1\MemmyWindowsUpgradeRelay.ps1"
+    StrCpy $R4 "$R1\Memmy-${VERSION}-upgrade.exe"
+    StrCpy $R5 "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe"
+    StrCpy $R7 "$LOCALAPPDATA\Memmy\upgrade-logs\windows-upgrade.log"
+    StrCpy $R8 "$R1\relay-ready"
+
+    ; Direct/manual updates reopen Memmy. A prepared update without the boot-attempt marker was
+    ; launched during normal app shutdown and must remain closed. Boot fallback writes .attempt.
+    StrCpy $R6 "1"
+    IfFileExists "$INSTDIR\data\Memmy\prepared-required-update.json" 0 memmy_relay_stage
+    IfFileExists "$INSTDIR\data\Memmy\prepared-required-update.json.attempt" memmy_relay_stage
+    StrCpy $R6 "0"
+
+  memmy_relay_stage:
+    ; Refresh the launch proxy before the relay moves $INSTDIR\data. The 1.0.8 proxy only knows
+    ; the install-local marker lock, which disappears with that move; the refreshed proxy also
+    ; recognizes the relay lock outside $INSTDIR and keeps desktop launches blocked throughout.
+    Call MemmyInstallLaunchProxy
+    ClearErrors
+    CreateDirectory "$R1"
+    SetOutPath "$R1"
+    File /oname=MemmyWindowsUpgradeRelay.ps1 "${BUILD_RESOURCES_DIR}\MemmyWindowsUpgradeRelay.ps1"
+    IfErrors memmy_relay_failed
+    IfFileExists "$R3" 0 memmy_relay_failed
+    File /oname=MemmyWindowsUpgradeCleanup.ps1 "${BUILD_RESOURCES_DIR}\MemmyWindowsUpgradeCleanup.ps1"
+    IfErrors memmy_relay_failed
+    IfFileExists "$R1\MemmyWindowsUpgradeCleanup.ps1" 0 memmy_relay_failed
+
+    ClearErrors
+    CopyFiles /SILENT "$EXEPATH" "$R4"
+    IfErrors memmy_relay_failed
+    IfFileExists "$R4" 0 memmy_relay_failed
+    IfFileExists "$R5" 0 memmy_relay_failed
+    Delete "$R8"
+
+    ClearErrors
+    ExecShell "open" "$R5" '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File $\"$R3$\" -InstallerPath $\"$R4$\" -InstallDir $\"$INSTDIR$\" -OriginalInstallerPid $2 -LegacyHelperPid $3 -ExpectedVersion $\"${VERSION}$\" -ReopenAfterInstall $R6 -ReadyPath $\"$R8$\" -WorkDir $\"$R1$\" -LogPath $\"$R7$\"' SW_HIDE
+    IfErrors memmy_relay_failed
+    StrCpy $R9 "0"
+
+  memmy_relay_wait_ready:
+    IfFileExists "$R8" memmy_relay_ready
+    Sleep 100
+    IntOp $R9 $R9 + 1
+    IntCmp $R9 100 memmy_relay_failed memmy_relay_wait_ready memmy_relay_failed
+
+  memmy_relay_ready:
+
+    ; The old 1.0.8 helper must not reopen the old executable while the relay owns the upgrade.
+    SetErrorLevel 1602
+    Quit
+
+  memmy_relay_failed:
+    SetOutPath "$INSTDIR"
+    SetErrorLevel 2
+    Quit
+
+  memmy_relay_done:
+FunctionEnd
+
+Function MemmyReadRelayedUpgradeContext
+  StrCpy $MemmyIsRelayedUpgrade "0"
+  ReadEnvStr $MemmyUpgradeWorkDir "MEMMY_UPGRADE_WORK_DIR"
+  ReadEnvStr $MemmyUpgradeReopenAfterInstall "MEMMY_UPGRADE_REOPEN_AFTER_INSTALL"
+  StrCmp $MemmyUpgradeWorkDir "" memmy_relay_context_failed
+  StrCmp $MemmyUpgradeReopenAfterInstall "0" memmy_relay_context_validate_path
+  StrCmp $MemmyUpgradeReopenAfterInstall "1" memmy_relay_context_validate_path memmy_relay_context_failed
+
+  memmy_relay_context_validate_path:
+    StrCpy $0 "$LOCALAPPDATA\Memmy\upgrade-staging\"
+    StrLen $1 $0
+    StrLen $2 $MemmyUpgradeWorkDir
+    IntCmp $2 $1 memmy_relay_context_failed memmy_relay_context_failed memmy_relay_context_compare_path
+
+  memmy_relay_context_compare_path:
+    StrCpy $3 $MemmyUpgradeWorkDir $1
+    StrCmp $3 $0 0 memmy_relay_context_failed
+    StrCpy $MemmyIsRelayedUpgrade "1"
+    Return
+
+  memmy_relay_context_failed:
+    SetErrorLevel 2
+    Quit
+FunctionEnd
+
+Function MemmyRestoreRelayedUpgradeData
+  StrCmp $MemmyIsRelayedUpgrade "1" 0 memmy_restore_relayed_data_done
+  StrCpy $0 "$MemmyUpgradeWorkDir\data-backup"
+  StrCpy $1 "$INSTDIR\data"
+  StrCpy $2 "$MemmyUpgradeWorkDir\installer-created-data"
+  IfFileExists "$0\*" 0 memmy_restore_relayed_data_failed
+  IfFileExists "$2\*" memmy_restore_relayed_data_failed
+  IfFileExists "$1\*" 0 memmy_restore_relayed_data_backup
+  ClearErrors
+  Rename "$1" "$2"
+  IfErrors memmy_restore_relayed_data_failed
+
+  memmy_restore_relayed_data_backup:
+    ClearErrors
+    Rename "$0" "$1"
+    IfErrors memmy_restore_relayed_data_failed
+    IfFileExists "$1\*" memmy_restore_relayed_data_done memmy_restore_relayed_data_failed
+
+  memmy_restore_relayed_data_failed:
+    SetErrorLevel 3
+    Quit
+
+  memmy_restore_relayed_data_done:
+FunctionEnd
+
+Function MemmyClearRelayedUpgradeMarkers
+  StrCmp $MemmyIsRelayedUpgrade "1" 0 memmy_clear_relayed_markers_done
+  StrCpy $0 "$INSTDIR\data\Memmy\prepared-required-update.json"
+  Delete "$0"
+  RMDir /r "$0.lock"
+  Delete "$0.prompt"
+  Delete "$0.attempt"
+  RMDir /r "$LOCALAPPDATA\Memmy\upgrade-staging\active.lock"
+
+  memmy_clear_relayed_markers_done:
+FunctionEnd
+
+Function MemmyLaunchRelayedUpgrade
+  StrCmp $MemmyIsRelayedUpgrade "1" 0 memmy_launch_relayed_upgrade_done
+  StrCmp $MemmyUpgradeReopenAfterInstall "1" 0 memmy_launch_relayed_upgrade_done
+  Exec '$\"$INSTDIR\${PRODUCT_FILENAME}.exe$\" --updated'
+
+  memmy_launch_relayed_upgrade_done:
+FunctionEnd
+
+Function MemmyScheduleRelayedUpgradeCleanup
+  StrCmp $MemmyIsRelayedUpgrade "1" 0 memmy_schedule_relayed_cleanup_done
+  StrCpy $0 "$MemmyUpgradeWorkDir\MemmyWindowsUpgradeCleanup.ps1"
+  StrCpy $1 "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe"
+  IfFileExists "$0" 0 memmy_schedule_relayed_cleanup_done
+  IfFileExists "$1" 0 memmy_schedule_relayed_cleanup_done
+  ExecShell "open" "$1" '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File $\"$0$\" -WorkDir $\"$MemmyUpgradeWorkDir$\"' SW_HIDE
+
+  memmy_schedule_relayed_cleanup_done:
+FunctionEnd
+
 Function MemmyPathContains
   Exch $R1
   Exch
@@ -103,6 +285,10 @@ Function MemmyInstallLaunchProxy
   FileWrite $1 "languagePath = dataRoot & $\"\Memmy\update-prompt-language.txt$\"$\r$\n"
   FileWrite $1 "markerPath = dataRoot & $\"\Memmy\prepared-required-update.json$\"$\r$\n"
   FileWrite $1 "lockPath = markerPath & $\".lock$\"$\r$\n"
+  FileWrite $1 "relayLockPath = shell.ExpandEnvironmentStrings($\"%LOCALAPPDATA%$\") & $\"\Memmy\upgrade-staging\active.lock$\"$\r$\n"
+  FileWrite $1 "If fso.FolderExists(relayLockPath) Then$\r$\n"
+  FileWrite $1 "  lockPath = relayLockPath$\r$\n"
+  FileWrite $1 "End If$\r$\n"
   FileWrite $1 "promptMarkerPath = markerPath & $\".prompt$\"$\r$\n"
   FileWrite $1 "If fso.FolderExists(lockPath) And fso.FileExists(promptMarkerPath) Then$\r$\n"
   FileWrite $1 "  If fso.FileExists(powerShellPath) And fso.FileExists(promptPath) Then$\r$\n"

@@ -12,6 +12,7 @@ import {
   MemoryHealthSnapshotSchema,
   MemoryProcessingStatusOutputSchema,
   MemoryReloadConfigOutputSchema,
+  RecallEvidenceOutputSchema,
   PanelAnalysisOutputSchema,
   PanelItemsOutputSchema,
   PanelOverviewOutputSchema,
@@ -172,6 +173,13 @@ export function createHttpMemoryClient(
       return request("DELETE", "deleteMemory", DeleteMemoryOutputSchema, {
         params: { id: memoryId },
         body,
+        context
+      });
+    },
+
+    async recallEvidence(queryId, context) {
+      return request("GET", "recallEvidence", RecallEvidenceOutputSchema, {
+        params: { queryId },
         context
       });
     },

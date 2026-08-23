@@ -1030,6 +1030,7 @@ export class AgentLoop {
         contextWindowTokens: selection.snapshot.contextWindowTokens,
         modelPreset: selection.preset,
         modelProvider: selection.provider,
+        actualModelContext: persistedModelSelection(selection),
       }),
     };
   }
@@ -1624,6 +1625,40 @@ export class AgentLoop {
       this.queueMutationLocks.set(key, lock);
     }
     return lock;
+  }
+
+  private async tryAdmitDirectSteer(
+    sessionKey: string,
+    message: InboundMessage,
+  ): Promise<string | null> {
+    if (message.turnAdmission !== "steer") return null;
+    const route = `${message.channel}\0${String(message.chatId)}`;
+    const requestedSource = sharedTurnSource(message);
+    return this.queueMutationLockFor(sessionKey).runExclusive(async () => {
+      const activeSlot = (this.turnSlots.get(sessionKey) ?? []).find((slot) => {
+        if (
+          slot.state !== "running"
+          || !slot.acceptingSteer
+          || slot.route !== route
+        ) return false;
+        if (requestedSource?.kind !== "tui") return true;
+        const activeSource = sharedTurnSource(slot.root);
+        return slot.turnId === message.expectedTurnId
+          && activeSource?.kind === "tui"
+          && activeSource.channel === requestedSource.channel;
+      });
+      if (!activeSlot) return null;
+      const steer = this.cloneInboundMessage(
+        message,
+        requestedSource?.kind === "tui" ? { turnId: activeSlot.turnId } : {},
+      );
+      try {
+        activeSlot.pendingSteer.put(steer);
+        return activeSlot.turnId;
+      } catch {
+        return null;
+      }
+    });
   }
 
   private queueRevision(sessionKey: string): number {
@@ -4983,6 +5018,18 @@ export class AgentLoop {
         await this.dispatchCommandInline(msg, effectiveKey, raw, (ctx) => this.commands.dispatch(ctx));
         continue;
       }
+      const shouldTryEarlyTuiSteer = msg.turnAdmission === "steer"
+        && sharedTurnSource(msg)?.kind === "tui"
+        && !msg.content.trimStart().startsWith("/");
+      let didTryDirectSteer = false;
+      if (shouldTryEarlyTuiSteer) {
+        didTryDirectSteer = true;
+        const steeredTurnId = await this.tryAdmitDirectSteer(effectiveKey, msg);
+        if (steeredTurnId) {
+          await this.publishWebuiMessageSteered(msg, steeredTurnId);
+          continue;
+        }
+      }
       const goal = this.goalRuntime.get(effectiveKey);
       const shouldPersistGoalInbox = !msg.internal
         && !ownsGoalReservation
@@ -5038,34 +5085,9 @@ export class AgentLoop {
         await this.dispatchCommandInline(msg, effectiveKey, raw, (ctx) => this.commands.dispatch(ctx));
         continue;
       }
-      if (msg.turnAdmission === "steer") {
-        let steeredTurnId: string | null = null;
+      if (msg.turnAdmission === "steer" && !didTryDirectSteer) {
         const requestedSource = sharedTurnSource(msg);
-        await this.queueMutationLockFor(effectiveKey).runExclusive(async () => {
-          const currentSlots = this.turnSlots.get(effectiveKey) ?? [];
-          const activeSlot = currentSlots.find((slot) => (
-            slot.state === "running"
-            && slot.acceptingSteer
-            && slot.route === route
-            && (
-              requestedSource?.kind === "tui"
-                ? slot.turnId === msg.expectedTurnId
-                  && sharedTurnSource(slot.root)?.kind === "tui"
-                : true
-            )
-          ));
-          if (!activeSlot) return;
-          const steer = this.cloneInboundMessage(
-            msg,
-            requestedSource?.kind === "tui" ? { turnId: activeSlot.turnId } : {},
-          );
-          try {
-            activeSlot.pendingSteer.put(steer);
-            steeredTurnId = activeSlot.turnId;
-          } catch {
-            // A closing active Slot safely falls back to a queued Turn.
-          }
-        });
+        const steeredTurnId = await this.tryAdmitDirectSteer(effectiveKey, msg);
         if (steeredTurnId) {
           if (requestedSource?.kind === "tui") {
             await this.publishWebuiMessageSteered(msg, steeredTurnId);

@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 5;
-export const SCHEMA_MIGRATION_ID = "005_span_embedding_vectors";
+export const SCHEMA_VERSION = 6;
+export const SCHEMA_MIGRATION_ID = "006_span_embeddings_and_user_memory";
 const API_LOG_SOURCE_AGENT_MIGRATION_FROM_VERSION = 2;
 const PROCESSING_TAGS = new Set([
   "摘要排队中",
@@ -60,6 +60,39 @@ const statements = [
     ON memories (content_hash, memory_layer)`,
   `CREATE INDEX IF NOT EXISTS idx_memories_key_layer
     ON memories (memory_key, memory_layer)`,
+
+  `CREATE TABLE IF NOT EXISTS user_memories (
+    id TEXT PRIMARY KEY,
+    source_turn_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    memory_types_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(memory_types_json)),
+    content TEXT NOT NULL,
+    normalized_user_text_hash TEXT NOT NULL,
+    source_turn_refs_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(source_turn_refs_json)),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived', 'deleted')),
+    replaces_memory_id TEXT,
+    replaced_by_memory_id TEXT,
+    archived_at TEXT,
+    archive_reason TEXT,
+    embedding_json TEXT CHECK (embedding_json IS NULL OR json_valid(embedding_json)),
+    embedding_model TEXT,
+    embedding_provider TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    deleted_at TEXT
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_user_memories_user_status_updated
+    ON user_memories (user_id, status, updated_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_memories_source_turn
+    ON user_memories (source_turn_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_memories_exact_text
+    ON user_memories (user_id, normalized_user_text_hash, status, updated_at DESC)`,
+  `CREATE VIRTUAL TABLE IF NOT EXISTS user_memories_fts USING fts5 (
+    id UNINDEXED,
+    content,
+    memory_types,
+    tokenize='unicode61'
+  )`,
 
   `CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5 (
     id UNINDEXED,
@@ -336,6 +369,11 @@ const statements = [
     dropped_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(dropped_json)),
     outcome TEXT NOT NULL DEFAULT 'pending' CHECK (outcome IN ('pending', 'positive', 'negative', 'ignored')),
     request_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(request_json)),
+    query_id TEXT,
+    user_memory_candidate_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(user_memory_candidate_ids_json)),
+    l1_candidate_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(l1_candidate_ids_json)),
+    merged_source_turn_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(merged_source_turn_ids_json)),
+    member_memory_ids_by_source_turn_id_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(member_memory_ids_by_source_turn_id_json)),
     created_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_recall_events_session_created
@@ -497,7 +535,7 @@ export function migrate(db: Database.Database): void {
   const hasMemories = tableExists(db, "memories");
   const version = currentSchemaVersion(db);
 
-  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4) {
+  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5) {
     throw new Error(
       `Unsupported memory database schema version ${version}; the database was left unchanged`
     );
@@ -519,6 +557,11 @@ export function migrate(db: Database.Database): void {
         db.prepare(statement).run();
       }
       ensureSpanEmbeddingVectorSchema(db);
+      addColumnIfMissing(db, "recall_events", "query_id", "TEXT");
+      addColumnIfMissing(db, "recall_events", "user_memory_candidate_ids_json", "TEXT NOT NULL DEFAULT '[]'");
+      addColumnIfMissing(db, "recall_events", "l1_candidate_ids_json", "TEXT NOT NULL DEFAULT '[]'");
+      addColumnIfMissing(db, "recall_events", "merged_source_turn_ids_json", "TEXT NOT NULL DEFAULT '[]'");
+      addColumnIfMissing(db, "recall_events", "member_memory_ids_by_source_turn_id_json", "TEXT NOT NULL DEFAULT '{}'");
       db.prepare(
         `CREATE UNIQUE INDEX IF NOT EXISTS uq_evolution_jobs_active_dedupe
          ON evolution_jobs (dedupe_key)
@@ -541,6 +584,17 @@ export function migrate(db: Database.Database): void {
     })();
   } finally {
     db.pragma(`foreign_keys = ${foreignKeys ? "ON" : "OFF"}`);
+  }
+}
+
+function addColumnIfMissing(
+  db: Database.Database,
+  table: string,
+  column: string,
+  definition: string
+): void {
+  if (!columnExists(db, table, column)) {
+    db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
   }
 }
 

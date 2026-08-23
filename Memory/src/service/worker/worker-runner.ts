@@ -23,6 +23,7 @@ import type {
   EmbeddingJobProcessor,
   PreparedEmbeddingJob
 } from "../embedding/embedding-job-processor.js";
+import type { PolicyEvidencePreflightReport } from "../evolution/evolution-job-processor.js";
 import {
   embeddingRetrySourceText,
   embeddingRetryBackoffMs,
@@ -82,6 +83,8 @@ export interface WorkerStartupReconciliation {
   requeuedJobs: number;
   requeuedEmbeddingRetries: number;
   restartedFailedProcessing: number;
+  reconciledOrphanPolicies: number;
+  policyEvidencePreflight: PolicyEvidencePreflightReport;
   enqueuedImportSummaries: number;
   enqueuedEmbeddingRepairs: number;
   enqueuedRetrievalReindexes: number;
@@ -115,6 +118,8 @@ export interface WorkerRunnerDeps {
   namespaceIdFromMemory: (memory: MemoryRow) => string;
   runWorkerNoWrite: (request: RequestEnvelope) => Promise<WorkerRunSummary>;
   restartFailedProcessing: (at: string, limit: number) => number;
+  previewPolicyEvidenceReconciliation: (limit: number) => PolicyEvidencePreflightReport;
+  reconcileOrphanedPolicies: (at: string, limit: number) => number;
   enqueueJob: (input: EnqueueJobInput) => EvolutionJobRecord;
   enqueueEmbeddingRetry: (
     memory: MemoryRow,
@@ -159,6 +164,8 @@ export class WorkerRunner {
         requeuedJobs: 0,
         requeuedEmbeddingRetries: 0,
         restartedFailedProcessing: 0,
+        reconciledOrphanPolicies: 0,
+        policyEvidencePreflight: emptyPolicyEvidencePreflight(),
         enqueuedImportSummaries: 0,
         enqueuedEmbeddingRepairs: 0,
         enqueuedRetrievalReindexes: 0
@@ -177,6 +184,8 @@ export class WorkerRunner {
       this.deps.appendEmbeddingRetryChange(after, "queued", before);
     }
     const restartedFailedProcessing = this.deps.restartFailedProcessing(at, limit);
+    const policyEvidencePreflight = this.deps.previewPolicyEvidenceReconciliation(limit);
+    const reconciledOrphanPolicies = this.deps.reconcileOrphanedPolicies(at, limit);
 
     let enqueuedImportSummaries = 0;
     let enqueuedEmbeddingRepairs = 0;
@@ -297,6 +306,8 @@ export class WorkerRunner {
       requeuedJobs: interruptedJobs.length + failedJobs.length,
       requeuedEmbeddingRetries: embeddingRetries.length,
       restartedFailedProcessing,
+      reconciledOrphanPolicies,
+      policyEvidencePreflight,
       enqueuedImportSummaries,
       enqueuedEmbeddingRepairs,
       enqueuedRetrievalReindexes
@@ -714,6 +725,15 @@ export class WorkerRunner {
       createdAt: at
     });
   }
+}
+
+function emptyPolicyEvidencePreflight(): PolicyEvidencePreflightReport {
+  return {
+    orphanPolicyIds: [],
+    affectedWorldModelIds: [],
+    affectedSkillIds: [],
+    restorablePolicyIds: []
+  };
 }
 
 function workerJobLogFields(job: EvolutionJobRecord): Record<string, unknown> {

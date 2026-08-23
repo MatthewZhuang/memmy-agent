@@ -1,4 +1,5 @@
 import { mutateRuntimeConfig } from "@memmy/migrations";
+import type { AgentGatewayStartupIssue } from "@memmy/local-api-contracts";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -22,7 +23,7 @@ const EXISTING_MEMORY_STARTUP_GRACE_MS = 10_000;
 type RuntimeEnv = Record<string, string | undefined>;
 type ConfigRecord = Record<string, unknown>;
 
-export interface PackagedRuntimeServices {
+export interface ManagedRuntimeServices {
   memory: {
     baseUrl: string;
     token: string;
@@ -34,6 +35,7 @@ export interface PackagedRuntimeServices {
     bootstrapSecret: string;
     configPath: string;
     workspace: string;
+    startupIssue?: AgentGatewayStartupIssue;
   };
   restartMemory(): Promise<void>;
   close(): Promise<void>;
@@ -47,6 +49,15 @@ export interface StartPackagedRuntimeServicesOptions {
   logDirectory: string;
   logLevel: LogLevel;
 }
+
+export interface StartManagedRuntimeServicesOptions extends StartPackagedRuntimeServicesOptions {
+  runtimeEntries?: RuntimeEntryPaths;
+  runtimeExecutable?: string;
+  /** Runs after migrations/config preparation and before any managed child starts. */
+  beforeStartServices?: (input: { databasePath: string; configPath: string }) => Promise<void>;
+}
+
+export type PackagedRuntimeServices = ManagedRuntimeServices;
 
 export interface PreparePackagedRuntimeConfigOptions {
   env?: RuntimeEnv;
@@ -94,6 +105,7 @@ interface ServiceLogOptions {
   logFilePath: string;
   logLevel: LogLevel;
   ipc?: boolean;
+  executablePath?: string;
 }
 
 const DAEMON_LOG_MAX_SIZE = 5 * 1024 * 1024;
@@ -139,9 +151,9 @@ export interface MemoryServerLock {
   sqlitePath?: string;
 }
 
-export async function startPackagedRuntimeServices(
-  options: StartPackagedRuntimeServicesOptions
-): Promise<PackagedRuntimeServices> {
+export async function startManagedRuntimeServices(
+  options: StartManagedRuntimeServicesOptions
+): Promise<ManagedRuntimeServices> {
   const entries = resolveRuntimeEntryPaths(options);
   const migrationTargets = await resolvePackagedRuntimeMigrationTargets();
   await runPackagedMigrationCommand({
@@ -150,10 +162,15 @@ export async function startPackagedRuntimeServices(
     agentWorkspace: migrationTargets.agentWorkspace,
     appDatabaseFile: options.appDatabaseFile,
     logDirectory: options.logDirectory,
-    logLevel: options.logLevel
+    logLevel: options.logLevel,
+    runtimeExecutable: options.runtimeExecutable
   });
   const runtimeConfig = await preparePackagedRuntimeConfig();
   runtimeConfig.appDatabaseFile = options.appDatabaseFile;
+  await options.beforeStartServices?.({
+    databasePath: options.appDatabaseFile,
+    configPath: runtimeConfig.configPath
+  });
   const browserPreparationAttemptId = randomUUID();
   const children: ManagedChild[] = [];
   const gatewaySupervisor = new AgentGatewaySupervisor(
@@ -185,7 +202,7 @@ export async function startPackagedRuntimeServices(
       .catch((error) => {
         console.warn(`Memory service unavailable during desktop startup: ${errorMessage(error)}`);
       });
-    await gatewaySupervisor.ensureStarted();
+    const agentGatewayStartupIssue = await startAgentGatewayWithRecovery(gatewaySupervisor);
 
     return {
       memory: {
@@ -198,7 +215,8 @@ export async function startPackagedRuntimeServices(
         baseUrl: runtimeConfig.agentGatewayBaseUrl,
         bootstrapSecret: runtimeConfig.agentGatewayBootstrapSecret,
         configPath: runtimeConfig.configPath,
-        workspace: runtimeConfig.agentWorkspace
+        workspace: runtimeConfig.agentWorkspace,
+        ...(agentGatewayStartupIssue ? { startupIssue: agentGatewayStartupIssue } : {})
       },
       async restartMemory() {
         if (closing) {
@@ -237,6 +255,12 @@ export async function startPackagedRuntimeServices(
     await stopManagedChildren(children);
     throw error;
   }
+}
+
+export async function startPackagedRuntimeServices(
+  options: StartPackagedRuntimeServicesOptions
+): Promise<PackagedRuntimeServices> {
+  return startManagedRuntimeServices(options);
 }
 
 export async function preparePackagedRuntimeConfig(
@@ -367,6 +391,7 @@ export async function runPackagedMigrationCommand(options: {
   appDatabaseFile: string;
   logDirectory: string;
   logLevel: LogLevel;
+  runtimeExecutable?: string;
   spawnProcess?: typeof spawn;
   timeoutMs?: number;
 }): Promise<void> {
@@ -398,7 +423,7 @@ export async function runPackagedMigrationCommand(options: {
       options.appDatabaseFile
     ];
     child = (options.spawnProcess ?? spawn)(
-      process.execPath,
+      options.runtimeExecutable ?? process.execPath,
       migrationArgs,
       {
         env,
@@ -536,7 +561,7 @@ function readDesktopBrowserPreparationState(
 export async function preparePackagedBrowser(
   entries: RuntimeEntryPaths,
   runtimeConfig: PackagedRuntimeConfig,
-  options: StartPackagedRuntimeServicesOptions,
+  options: StartManagedRuntimeServicesOptions,
   spawnProcess: typeof spawn = spawn
 ): Promise<boolean> {
   return startPackagedBrowserPreparation(
@@ -550,7 +575,7 @@ export async function preparePackagedBrowser(
 export function startPackagedBrowserPreparation(
   entries: RuntimeEntryPaths,
   runtimeConfig: PackagedRuntimeConfig,
-  options: StartPackagedRuntimeServicesOptions,
+  options: StartManagedRuntimeServicesOptions,
   spawnProcess: typeof spawn = spawn,
   attemptId: string = randomUUID()
 ): PackagedBrowserPreparation {
@@ -594,7 +619,7 @@ export function startPackagedBrowserPreparation(
 
   try {
     child = spawnProcess(
-      process.execPath,
+      options.runtimeExecutable ?? process.execPath,
       [entries.agentEntry, "internal", "browser-prepare"],
       {
         env: {
@@ -677,7 +702,7 @@ export async function ensureMemoryService(
   entries: RuntimeEntryPaths,
   runtimeConfig: PackagedRuntimeConfig,
   children: ManagedChild[],
-  options: StartPackagedRuntimeServicesOptions
+  options: StartManagedRuntimeServicesOptions
 ): Promise<void> {
   const healthUrl = `${runtimeConfig.memoryBaseUrl}/api/v1/health`;
   const healthHeaders = memoryAuthHeaders(runtimeConfig.memoryToken);
@@ -715,7 +740,8 @@ export async function ensureMemoryService(
     MEMORY_SERVICE_DB: runtimeConfig.memoryDatabasePath
   }, {
     logFilePath: join(options.logDirectory, "memory.log"),
-    logLevel: options.logLevel
+    logLevel: options.logLevel,
+    executablePath: options.runtimeExecutable
   });
   children.push(memoryChild);
   try {
@@ -733,7 +759,7 @@ async function restartManagedMemoryService(
   entries: RuntimeEntryPaths,
   runtimeConfig: PackagedRuntimeConfig,
   children: ManagedChild[],
-  options: StartPackagedRuntimeServicesOptions
+  options: StartManagedRuntimeServicesOptions
 ): Promise<void> {
   const healthUrl = `${runtimeConfig.memoryBaseUrl}/api/v1/health`;
   const healthHeaders = memoryAuthHeaders(runtimeConfig.memoryToken);
@@ -806,6 +832,26 @@ export interface AgentGatewaySupervisorDependencies {
   clearTimer?: typeof clearTimeout;
 }
 
+export async function startAgentGatewayWithRecovery(
+  supervisor: Pick<AgentGatewaySupervisor, "ensureStarted" | "startRecovery">
+): Promise<AgentGatewayStartupIssue | null> {
+  try {
+    await supervisor.ensureStarted();
+    return null;
+  } catch (error) {
+    console.warn(`Agent gateway unavailable during desktop startup: ${errorMessage(error)}`);
+    supervisor.startRecovery();
+    return classifyAgentGatewayStartupIssue(error);
+  }
+}
+
+function classifyAgentGatewayStartupIssue(error: unknown): AgentGatewayStartupIssue | null {
+  const message = errorMessage(error);
+  return /failed to load config[\s\S]*\b(providers|modelPresets|modelAssignments|agents\.defaults)\b/i.test(message)
+    ? "model_config_invalid"
+    : null;
+}
+
 export class AgentGatewaySupervisor {
   ownership: "external" | "owned" | null = null;
   ownedChild: ManagedChild | null = null;
@@ -827,7 +873,7 @@ export class AgentGatewaySupervisor {
     private readonly entries: RuntimeEntryPaths,
     private readonly runtimeConfig: PackagedRuntimeConfig,
     private readonly children: ManagedChild[],
-    private readonly options: StartPackagedRuntimeServicesOptions,
+    private readonly options: StartManagedRuntimeServicesOptions,
     dependencies: AgentGatewaySupervisorDependencies = {},
     private readonly browserPreparationAttemptId: string =
       process.env[BROWSER_PREPARATION_ATTEMPT_ID_ENV]?.trim() || ""
@@ -852,6 +898,11 @@ export class AgentGatewaySupervisor {
       this.startPromise = null;
     });
     return this.startPromise;
+  }
+
+  startRecovery(): void {
+    if (this.stopping || this.hasReachedReady) return;
+    this.scheduleReplacement();
   }
 
   async close(): Promise<void> {
@@ -934,7 +985,8 @@ export class AgentGatewaySupervisor {
     }, {
       logFilePath: join(this.options.logDirectory, "agent-gateway.log"),
       logLevel: this.options.logLevel,
-      ipc: true
+      ipc: true,
+      executablePath: this.options.runtimeExecutable
     });
     this.ownership = "owned";
     this.ownedChild = child;
@@ -1044,6 +1096,9 @@ export class AgentGatewaySupervisor {
     }
     try {
       await this.spawnOwnedGateway(false);
+      if (!this.hasReachedReady) {
+        this.scheduleReplacement();
+      }
     } catch {
       this.scheduleReplacement();
     }
@@ -1080,8 +1135,26 @@ export class AgentGatewaySupervisor {
   }
 }
 
-function resolveRuntimeEntryPaths(options: StartPackagedRuntimeServicesOptions): RuntimeEntryPaths {
-  void options.resourcesPath;
+export function resolveDevelopmentRuntimeEntryPaths(mainDirectory: string): RuntimeEntryPaths {
+  const repoRoot = resolve(mainDirectory, "../../../../..");
+  return {
+    memoryEntry: join(repoRoot, "Memory", "dist", "src", "server", "index.js"),
+    agentEntry: join(repoRoot, "App", "memmy-agent", "dist", "main.js")
+  };
+}
+
+export function resolveDevelopmentRuntimeExecutable(
+  env: NodeJS.ProcessEnv = process.env
+): string {
+  return env.MEMMY_RUNTIME_NODE_PATH?.trim()
+    || env.npm_node_execpath?.trim()
+    || "node";
+}
+
+export function resolveRuntimeEntryPaths(options: StartManagedRuntimeServicesOptions): RuntimeEntryPaths {
+  if (options.runtimeEntries) {
+    return { ...options.runtimeEntries };
+  }
   return {
     memoryEntry: join(options.appPath, "dist/runtime/memory/src/server/index.js"),
     agentEntry: join(options.appPath, "dist/runtime/memmy-agent/dist/main.js")
@@ -1106,7 +1179,7 @@ export function spawnNodeService(
     ELECTRON_RUN_AS_NODE: "1",
     NODE_ENV: process.env.NODE_ENV ?? "production"
   };
-  const child = spawn(process.execPath, [entry, ...args], {
+  const child = spawn(logOptions.executablePath ?? process.execPath, [entry, ...args], {
     env: childEnv,
     stdio: logOptions.ipc ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
     windowsHide: true

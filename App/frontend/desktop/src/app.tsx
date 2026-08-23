@@ -1,7 +1,7 @@
 /** App module. */
 import { SseEventSchema, type AccountSessionView, type SseEvent } from "@memmy/local-api-contracts";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { setAnalyticsUserMode } from "./analytics/analytics-context.js";
+import { setAnalyticsUserId, setAnalyticsUserMode } from "./analytics/analytics-context.js";
 import { trackCloudAnalyticsEvent } from "./analytics/cloud-analytics.js";
 import { trackAgentSourceScanOutcome } from "./analytics/memory-ui-analytics.js";
 import { useAnalytics } from "./analytics/use-analytics.js";
@@ -87,6 +87,10 @@ function RuntimeApp() {
   useEffect(() => {
     setAnalyticsUserMode(state.bootstrap?.app.userMode ?? "unset");
   }, [state.bootstrap?.app.userMode]);
+
+  useEffect(() => {
+    setAnalyticsUserId(state.account.userId);
+  }, [state.account.userId]);
 
   useEffect(() => () => taskStateCoordinator?.dispose(), [taskStateCoordinator]);
 
@@ -191,6 +195,7 @@ function RuntimeApp() {
 
         setClients(clients);
         setAnalyticsUserMode(effectiveBootstrap.app.userMode);
+        setAnalyticsUserId(accountSession.authenticated ? accountSession.profile.userId : null);
         dispatch(appActions.bootstrapLoaded(effectiveBootstrap, initialPath));
         if (bootstrap.tokenUsage.totalTokens > 0) {
           const u = bootstrap.tokenUsage;
@@ -212,6 +217,7 @@ function RuntimeApp() {
         }
         if (accountSession.authenticated) {
           dispatch(appActions.accountUpdated({
+            userId: accountSession.profile.userId,
             email: accountSession.profile.email ?? "",
             phoneNumber: accountSession.profile.phoneNumber,
             nickname: accountSession.profile.nickname,

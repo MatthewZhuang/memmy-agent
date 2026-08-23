@@ -64,6 +64,7 @@ describe("MemmyMemoryHook", () => {
     const hook = new MemmyMemoryHook(client as any, { workspace: "/tmp/workspace", userId: "user_hook_1" });
     const spec = {
       sessionKey: "cli:direct",
+      turnId: "agent-turn-1",
       workspace: "/tmp/workspace",
       tools: { toolNames: ["read_file", "memmy_memory_search"] },
       contextWindowTokens: 4096,
@@ -82,6 +83,7 @@ describe("MemmyMemoryHook", () => {
     const openSessionBody = (client.openSession as any).mock.calls[0][0];
     const startBody = (client.startTurn as any).mock.calls[0][1];
     expect(client.openSession).toHaveBeenCalledTimes(1);
+    expect((client.startTurn as any).mock.calls[0][0]).toBe("agent-turn-1");
     expect(openSessionBody.sessionId).toBeUndefined();
     expect(openSessionBody.namespace).toMatchObject({
       source: "memmy-agent",
@@ -281,7 +283,9 @@ describe("MemmyMemoryHook", () => {
 
     await hook.beforeRun(new AgentHookContext({ spec, messages }));
 
-    expect((client.startTurn as any).mock.calls[0][1].query).toBe("请比较图片和文件里的内容");
+    expect((client.startTurn as any).mock.calls[0][1].query).toBe(
+      "[image: /tmp/original.png]\n请比较图片和文件里的内容",
+    );
     const injected = messages[1].content as Array<Record<string, any>>;
     expect(injected[0]?.text).toContain('<memmy_memory_context source="turn_start">');
     expect(injected[1]).toEqual({ type: "text", text: "<current_user_request>" });
@@ -298,6 +302,29 @@ describe("MemmyMemoryHook", () => {
     expect(reinjected.filter((block) => block.text === "</current_user_request>")).toHaveLength(1);
     expect(reinjected.filter((block) => block.type === "image_url")).toEqual([image]);
     expect(reinjected.filter((block) => block.type === "file")).toEqual([file]);
+  });
+
+  it("uses a stable placeholder when the user turn contains only an image", async () => {
+    const client = fakeClient();
+    const hook = new MemmyMemoryHook(client as any, { workspace: "/tmp/workspace", userId: "user_hook_1" });
+    const spec = {
+      sessionKey: "cli:image-only",
+      workspace: "/tmp/workspace",
+      contextWindowTokens: 4096,
+    };
+    const messages = [{
+      role: "user",
+      content: [{
+        type: "image_url",
+        image_url: { url: "data:image/png;base64,user-image" },
+        meta: { path: "/tmp/user-image.png" },
+      }],
+    }];
+
+    await hook.beforeRun(new AgentHookContext({ spec, messages }));
+
+    expect((client.startTurn as any).mock.calls[0][1].query).toBe("[image: /tmp/user-image.png]");
+    expect(JSON.stringify((client.startTurn as any).mock.calls[0][1])).not.toContain("data:image");
   });
 
   it("passes raw protocol content to memory service for storage-side sanitization", async () => {
@@ -334,6 +361,47 @@ describe("MemmyMemoryHook", () => {
       name: "memmy_memory_search",
       output: '<memmy_memory_context source="tool_search">\nHistorical User: old task\n</memmy_memory_context>',
     });
+  });
+
+  it("normalizes pure image tool results without sending data URLs to memory", async () => {
+    const client = fakeClient();
+    const hook = new MemmyMemoryHook(client as any, { workspace: "/tmp/workspace", userId: "user_hook_1" });
+    const spec = {
+      sessionKey: "cli:image-tool",
+      workspace: "/tmp/workspace",
+      contextWindowTokens: 4096,
+    };
+    const messages = [{ role: "user", content: "Inspect the image" }];
+
+    await hook.beforeRun(new AgentHookContext({ spec, messages }));
+    await hook.afterRun(new AgentHookContext({ spec }), {
+      finalContent: "Done",
+      messages: [{
+        role: "tool",
+        tool_call_id: "call-image",
+        name: "read_file",
+        content: [
+          {
+            type: "image_url",
+            image_url: { url: "data:image/png;base64,tool-image" },
+            meta: { path: "/tmp/tool-image.png" },
+          },
+          {
+            type: "image_url",
+            image_url: { url: "data:image/png;base64,no-path" },
+          },
+        ],
+      }],
+      toolCalls: [{
+        id: "call-image",
+        function: { name: "read_file", arguments: JSON.stringify({ path: "/tmp/tool-image.png" }) },
+      }],
+      stopReason: "completed",
+    });
+
+    const completeBody = (client.completeTurn as any).mock.calls[0][1];
+    expect(completeBody.toolResults[0].output).toBe("[image: /tmp/tool-image.png]\n[image]");
+    expect(JSON.stringify(completeBody)).not.toContain("data:image");
   });
 
   it("forwards current-turn assistant reasoning to memory", async () => {
@@ -569,7 +637,7 @@ describe("MemmyMemoryHook", () => {
 
       expect(warnSpy).toHaveBeenCalledTimes(1);
 
-      client.openSession = vi.fn(async (_body: any) => ({
+      client.openSession = vi.fn(async () => ({
         sessionId: "session-recovered",
         userId: "local-user",
         resumed: false,

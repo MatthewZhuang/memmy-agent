@@ -26,6 +26,7 @@ import {
   PanelOverviewOutputSchema,
   RawTurnSummarySchema,
   RecallHitSchema,
+  RecallEvidenceOutputSchema,
   SearchInputSchema,
   SearchOutputSchema,
   StartTurnInputSchema,
@@ -48,9 +49,18 @@ describe("memory runtime contracts", () => {
     })).not.toThrow();
   });
 
+  it("accepts User Memory as a panel-only memory layer", () => {
+    expect(() => PanelItemsInputSchema.parse({ layer: "UserMemory", page: 1 })).not.toThrow();
+    expect(() => MemoryListItemSchema.parse(memoryListItem({
+      kind: "user_memory",
+      memoryLayer: "UserMemory"
+    }))).not.toThrow();
+  });
+
   const outputCases: Array<{ name: string; schema: ZodType<unknown>; valid: unknown; invalid: unknown }> = [
     { name: "InjectedContext", schema: InjectedContextSchema, valid: injectedContext(), invalid: { markdown: "", sections: [{ id: "sec-1", kind: "bad" }] } },
     { name: "RecallHit", schema: RecallHitSchema, valid: recallHit(), invalid: { ...recallHit(), memoryLayer: "L4" } },
+    { name: "RecallEvidenceOutput", schema: RecallEvidenceOutputSchema, valid: { recallEventId: "recall-1", queryId: "turn-1", query: "remember", hits: [recallHit()], createdAt: ISO, serverTime: ISO }, invalid: { queryId: "", hits: [] } },
     { name: "MemoryListItem", schema: MemoryListItemSchema, valid: memoryListItem(), invalid: { ...memoryListItem(), status: "draft" } },
     { name: "MemoryDetailItem", schema: MemoryDetailItemSchema, valid: memoryDetailItem(), invalid: { ...memoryDetailItem(), createdAt: "not-a-date" } },
     { name: "RawTurnSummary", schema: RawTurnSummarySchema, valid: rawTurnSummary(), invalid: { ...rawTurnSummary(), rawTurnId: "" } },
@@ -266,7 +276,7 @@ function deleteMemoryOutput() {
 
 function panelOverviewOutput() {
   return {
-    counts: { memories: 1, skills: 4, experiences: 2, worldModels: 3 },
+    counts: { memories: 1, userMemories: 5, skills: 4, experiences: 2, worldModels: 3 },
     dailyActivity: panelDays(),
     sourceDistribution: [{ source: "codex", count: 10, percentage: 100 }]
   };

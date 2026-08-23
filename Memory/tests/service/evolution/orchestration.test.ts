@@ -545,6 +545,10 @@ describe("MemoryService / evolution / orchestration", () => {
           spanClustering: {
             ...DEFAULT_MEMMY_CONFIG.algorithm.spanClustering,
             enabled: false
+          },
+          l2Induction: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+            minEpisodesForActivation: 2
           }
         }
       }

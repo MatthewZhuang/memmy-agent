@@ -524,6 +524,31 @@ describe("AgentLoop turn persistence", () => {
     ]);
   });
 
+  it("persists a read_file image as one path placeholder without the data URL", () => {
+    const loop = makeLoop();
+    const session = new Session({ key: "read-file-image" });
+
+    loop.saveTurn(
+      session,
+      [{
+        role: "tool",
+        tool_call_id: "read_image",
+        name: "read_file",
+        content: [{
+          type: "image_url",
+          image_url: { url: "data:image/png;base64,abc" },
+          meta: { path: "/tmp/image.png" },
+        }],
+      }],
+      0,
+    );
+
+    expect(session.messages[0].content).toEqual([
+      { type: "text", text: "[image: /tmp/image.png]" },
+    ]);
+    expect(JSON.stringify(session.messages)).not.toContain("data:image");
+  });
+
   it("rehydrates runtime checkpoints with completed and pending tools", () => {
     const loop = makeLoop();
     const session = new Session({

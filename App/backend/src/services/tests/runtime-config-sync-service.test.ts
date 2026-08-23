@@ -26,7 +26,10 @@ describe("syncRuntimeConfigWithAppState", () => {
     context.store.repositories.bootstrap.updateAppSettings({ userMode: "account" });
     const legacyBefore = context.store.db.prepare("SELECT * FROM account_model_config ORDER BY uuid").all();
 
-    await expect(syncRuntimeConfigWithAppState(context)).resolves.toMatchObject({
+    await expect(syncRuntimeConfigWithAppState({
+      ...context,
+      accountChannel: "phone"
+    })).resolves.toMatchObject({
       source: "runtime_config",
       mode: "byok",
       provider: "openai",
@@ -47,7 +50,8 @@ describe("syncRuntimeConfigWithAppState", () => {
         rawProfile: { id: "owner-a", email: "a@example.test", userName: "a" }
       },
       uuid: "account-a",
-      cloudUuid: "cloud-token-a"
+      cloudUuid: "cloud-token-a",
+      authChannel: "email"
     });
     context.store.repositories.accountSession.upsert({
       profile: {
@@ -56,11 +60,15 @@ describe("syncRuntimeConfigWithAppState", () => {
         rawProfile: { id: "user-b", email: "b@example.test", userName: "b" }
       },
       uuid: "account-b",
-      cloudUuid: "cloud-token-b"
+      cloudUuid: "cloud-token-b",
+      authChannel: "email"
     });
     context.writeConfig(currentAccountCatalog());
 
-    await expect(syncRuntimeConfigWithAppState(context)).resolves.toMatchObject({
+    await expect(syncRuntimeConfigWithAppState({
+      ...context,
+      accountChannel: "email"
+    })).resolves.toMatchObject({
       source: "runtime_config", mode: "account", hydratedAppState: true, wroteConfig: false
     });
     expect(context.store.repositories.bootstrap.getAppSettings().userMode).toBe("account");
@@ -71,7 +79,113 @@ describe("syncRuntimeConfigWithAppState", () => {
     expect(context.store.db.prepare("SELECT uuid FROM cloud_accounts WHERE uuid = ?").get("cloud-token-a")).toBeUndefined();
   });
 
-  it("keeps BYOK active when a dormant account projection is also present", async () => {
+  it("keeps an unmarked legacy email session when the INTL package starts", async () => {
+    const context = createContext();
+    context.store.repositories.accountSession.upsert({
+      profile: {
+        userId: "owner-a", email: "a@example.test", phoneNumber: null, nickname: "a", avatarUrl: null,
+        planType: "free", hasFinishedGuide: false, region: null, registeredAt: "2026-06-02T10:00:00.000Z",
+        rawProfile: { id: "owner-a", email: "a@example.test", userName: "a" }
+      },
+      uuid: "account-a",
+      cloudUuid: "cloud-token-a"
+    });
+    context.writeConfig(currentAccountCatalog());
+
+    await expect(syncRuntimeConfigWithAppState({
+      ...context,
+      accountChannel: "email"
+    })).resolves.toMatchObject({
+      source: "runtime_config", mode: "account", hydratedAppState: true, wroteConfig: false
+    });
+    expect(context.store.repositories.accountSession.get()).toMatchObject({
+      authenticated: true,
+      profile: { userId: "owner-a" }
+    });
+  });
+
+  it("clears an email session before CN startup hydrates the shared account projection", async () => {
+    const context = createContext();
+    context.store.repositories.accountSession.upsert({
+      profile: {
+        userId: "owner-a", email: "a@example.test", phoneNumber: null, nickname: "a", avatarUrl: null,
+        planType: "free", hasFinishedGuide: false, region: null, registeredAt: "2026-06-02T10:00:00.000Z",
+        rawProfile: { id: "owner-a", email: "a@example.test", userName: "a" }
+      },
+      uuid: "account-a",
+      cloudUuid: "cloud-token-a",
+      authChannel: "email"
+    });
+    context.writeConfig(currentAccountCatalog());
+
+    await expect(syncRuntimeConfigWithAppState({
+      ...context,
+      accountChannel: "phone"
+    })).resolves.toMatchObject({
+      source: "none",
+      hydratedAppState: false,
+      reason: "account_session_channel_mismatch"
+    });
+
+    expect(context.store.repositories.accountSession.get()).toEqual({ authenticated: false });
+    const saved = YAML.parse(readFileSync(context.memmyConfigPath, "utf8"));
+    expect(saved.app.cloudUuid).toBeUndefined();
+    expect(saved.app.userId).toBeUndefined();
+    expect(saved.providers.memmy_account).toBeUndefined();
+  });
+
+  it("clears a phone session before INTL startup hydrates the shared account projection", async () => {
+    const context = createContext();
+    context.store.repositories.accountSession.upsert({
+      profile: {
+        userId: "owner-a", email: null, phoneNumber: "13800138000", nickname: "a", avatarUrl: null,
+        planType: "free", hasFinishedGuide: false, region: null, registeredAt: "2026-06-02T10:00:00.000Z",
+        rawProfile: { id: "owner-a", phoneNumber: "13800138000", userName: "a" }
+      },
+      uuid: "account-a",
+      cloudUuid: "cloud-token-a",
+      authChannel: "phone"
+    });
+    context.writeConfig(currentAccountCatalog());
+
+    await expect(syncRuntimeConfigWithAppState({
+      ...context,
+      accountChannel: "email"
+    })).resolves.toMatchObject({
+      source: "none",
+      hydratedAppState: false,
+      reason: "account_session_channel_mismatch"
+    });
+
+    expect(context.store.repositories.accountSession.get()).toEqual({ authenticated: false });
+  });
+
+  it("clears a mismatched active session even when the account projection is already incomplete", async () => {
+    const context = createContext();
+    context.store.repositories.accountSession.upsert({
+      profile: {
+        userId: "owner-a", email: "a@example.test", phoneNumber: null, nickname: "a", avatarUrl: null,
+        planType: "free", hasFinishedGuide: false, region: null, registeredAt: "2026-06-02T10:00:00.000Z",
+        rawProfile: { id: "owner-a", email: "a@example.test", userName: "a" }
+      },
+      uuid: "account-a",
+      cloudUuid: "cloud-token-a"
+    });
+    context.writeConfig({ app: { userMode: "account" } });
+
+    await expect(syncRuntimeConfigWithAppState({
+      ...context,
+      accountChannel: "phone"
+    })).resolves.toMatchObject({
+      source: "none",
+      hydratedAppState: false,
+      reason: "account_session_channel_mismatch"
+    });
+
+    expect(context.store.repositories.accountSession.get()).toEqual({ authenticated: false });
+  });
+
+  it("keeps BYOK active while clearing an untrusted dormant account projection", async () => {
     const context = createContext();
     const byok = currentByokCatalog() as any;
     const account = currentAccountCatalog() as any;
@@ -86,13 +200,100 @@ describe("syncRuntimeConfigWithAppState", () => {
       }
     });
 
-    await expect(syncRuntimeConfigWithAppState(context)).resolves.toMatchObject({
+    await expect(syncRuntimeConfigWithAppState({
+      ...context,
+      accountChannel: "phone"
+    })).resolves.toMatchObject({
       source: "runtime_config",
       mode: "byok",
       provider: "openai",
       model: "gpt-5"
     });
     expect(context.store.repositories.bootstrap.getAppSettings().userMode).toBe("byok");
+    const saved = YAML.parse(readFileSync(context.memmyConfigPath, "utf8"));
+    expect(saved.providers.memmy_account).toBeUndefined();
+  });
+
+  it("preserves a dormant account projection owned by the current package channel", async () => {
+    const context = createContext();
+    context.store.repositories.accountSession.upsert({
+      profile: {
+        userId: "owner-a", email: "a@example.test", phoneNumber: "13800138000", nickname: "a", avatarUrl: null,
+        planType: "free", hasFinishedGuide: false, region: null, registeredAt: "2026-06-02T10:00:00.000Z",
+        rawProfile: { id: "owner-a", email: "a@example.test", phoneNumber: "13800138000", userName: "a" }
+      },
+      uuid: "account-a",
+      cloudUuid: "cloud-token-a",
+      authChannel: "email"
+    });
+    const byok = currentByokCatalog() as any;
+    const account = currentAccountCatalog() as any;
+    context.writeConfig({
+      ...byok,
+      app: { ...account.app, userMode: "byok" },
+      providers: { ...byok.providers, ...account.providers },
+      modelPresets: { ...byok.modelPresets, ...account.modelPresets },
+      modelAssignments: { byok: byok.modelAssignments.byok, account: account.modelAssignments.account }
+    });
+
+    await expect(syncRuntimeConfigWithAppState({
+      ...context,
+      accountChannel: "email"
+    })).resolves.toMatchObject({ mode: "byok", wroteConfig: false });
+
+    const saved = YAML.parse(readFileSync(context.memmyConfigPath, "utf8"));
+    expect(saved.providers.memmy_account.apiKey).toBe("cloud-token-a");
+  });
+
+  it("clears an account projection that has no matching local credential", async () => {
+    const context = createContext();
+    context.writeConfig(currentAccountCatalog());
+
+    await expect(syncRuntimeConfigWithAppState({
+      ...context,
+      accountChannel: "phone"
+    })).resolves.toMatchObject({
+      source: "none",
+      hydratedAppState: false,
+      reason: "account_projection_has_no_matching_local_session",
+      wroteConfig: true
+    });
+
+    const saved = YAML.parse(readFileSync(context.memmyConfigPath, "utf8"));
+    expect(saved.app.cloudUuid).toBeUndefined();
+    expect(saved.providers.memmy_account).toBeUndefined();
+  });
+
+  it("clears conflicting app and provider account credentials before startup", async () => {
+    const context = createContext();
+    context.store.repositories.accountSession.upsert({
+      profile: {
+        userId: "owner-a", email: "a@example.test", phoneNumber: null, nickname: "a", avatarUrl: null,
+        planType: "free", hasFinishedGuide: false, region: null, registeredAt: "2026-06-02T10:00:00.000Z",
+        rawProfile: { id: "owner-a", email: "a@example.test", userName: "a" }
+      },
+      uuid: "account-a",
+      cloudUuid: "cloud-token-a",
+      authChannel: "email"
+    });
+    const config = currentAccountCatalog() as any;
+    config.providers.memmy_account.apiKey = "foreign-cloud-token";
+    context.writeConfig(config);
+
+    await expect(syncRuntimeConfigWithAppState({
+      ...context,
+      accountChannel: "email"
+    })).resolves.toMatchObject({
+      source: "none",
+      hydratedAppState: false,
+      wroteConfig: true,
+      reason: "cleared_conflicting_account_credentials"
+    });
+
+    expect(context.store.repositories.accountSession.get()).toEqual({ authenticated: false });
+    const saved = YAML.parse(readFileSync(context.memmyConfigPath, "utf8"));
+    expect(saved.app.cloudUuid).toBeUndefined();
+    expect(saved.providers.memmy_account).toBeUndefined();
   });
 
   it("persists account/BYOK mode switches through settings and honors them after restart", async () => {

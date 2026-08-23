@@ -214,9 +214,13 @@ export const ByokTokenUsageSummarySchema = z.object({
 });
 export type ByokTokenUsageSummary = z.infer<typeof ByokTokenUsageSummarySchema>;
 
+export const AgentGatewayStartupIssueSchema = z.enum(["model_config_invalid"]);
+export type AgentGatewayStartupIssue = z.infer<typeof AgentGatewayStartupIssueSchema>;
+
 export const AgentGatewayRuntimeConfigSchema = z.object({
     baseUrl: z.string().url(),
-    bootstrapSecret: z.string().min(1).optional()
+    bootstrapSecret: z.string().min(1).optional(),
+    startupIssue: AgentGatewayStartupIssueSchema.optional()
 });
 export type AgentGatewayRuntimeConfig = z.infer<typeof AgentGatewayRuntimeConfigSchema>;
 

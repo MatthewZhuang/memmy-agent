@@ -42,6 +42,7 @@ export const API_ROUTES = [
   "POST /api/v1/turns/start",
   "POST /api/v1/turns/:turnId/complete",
   "POST /api/v1/memory/search",
+  "GET /api/v1/memory/recalls/:queryId",
   "POST /api/v1/memory/add",
   "POST /api/v1/memory/processing/status",
   "POST /api/v1/memory/:id/processing/retry",
@@ -479,7 +480,8 @@ async function routeRequest(
       artifacts: request.artifacts,
       sourceMemoryIds: request.sourceMemoryIds,
       usage: request.usage,
-      status: request.status
+      status: request.status,
+      userMemoryCorrection: request.userMemoryCorrection
     };
     const result = await trackExternalHookCapture(
       pluginRuntimeAnalytics,
@@ -530,6 +532,14 @@ async function routeRequest(
     ));
   }
 
+  const recallEvidence = match(path, /^\/api\/v1\/memory\/recalls\/([^/]+)$/);
+  if (method === "GET" && recallEvidence) {
+    requireMemoryRead(principal);
+    const queryId = decodeMatchSegment(recallEvidence, 1);
+    const request = envelopeWithPrincipal({}, principal) as RequestEnvelope;
+    return service.recallEvidence(queryId, request);
+  }
+
   if (method === "POST" && path === "/api/v1/memory/add") {
     requireMemoryWrite(principal);
     const request = requestWithPrincipal<MemoryAddRequest>(body, "memory.add", principal);
@@ -547,7 +557,12 @@ async function routeRequest(
       sessionId: request.sessionId,
       turnId: request.turnId,
       createdAt: typeof request.createdAt === "string" ? request.createdAt : undefined,
-      deferProcessing: request.deferProcessing === true
+      deferProcessing: request.deferProcessing === true,
+      sourceAgentId: typeof request.sourceAgentId === "string" ? request.sourceAgentId : undefined,
+      sourceSkillId: typeof request.sourceSkillId === "string" ? request.sourceSkillId : undefined,
+      sourceSkillPath: typeof request.sourceSkillPath === "string" ? request.sourceSkillPath : undefined,
+      sourceSkillVersion: typeof request.sourceSkillVersion === "string" ? request.sourceSkillVersion : undefined,
+      sourceContentHash: typeof request.sourceContentHash === "string" ? request.sourceContentHash : undefined
     };
     const result = await trackExternalToolCall(
       pluginRuntimeAnalytics,
@@ -619,7 +634,7 @@ async function routeRequest(
     return publicPanelItemsResponse(service.panelItems({
       namespace: principal.namespace,
       timeZone: principal.timeZone,
-      layer: parseLayer(url.searchParams.get("layer")),
+      layer: parseRecallLayer(url.searchParams.get("layer")),
       status: parseStatus(url.searchParams.get("status")),
       q: url.searchParams.get("q") ?? undefined,
       sourceAgent: url.searchParams.get("sourceAgent") ?? undefined,
@@ -757,6 +772,8 @@ function publicCompleteTurnResponse(result: unknown): Record<string, unknown> {
     sessionId: record.sessionId,
     episodeId: record.episodeId,
     rawTurnId: record.rawTurnId,
+    userMemoryId: record.userMemoryId,
+    userMemoryIds: record.userMemoryIds,
     l1MemoryId: record.l1MemoryId,
     l1MemoryIds: record.l1MemoryIds,
     closedEpisodeIds: record.closedEpisodeIds,
@@ -1239,6 +1256,10 @@ function parseApiLogTools(value: string | null): Array<"memory_add" | "memory_se
 
 function parseLayer(value: string | null): MemoryLayer | undefined {
   return parseLayerValue(value);
+}
+
+function parseRecallLayer(value: string | null): MemoryLayer | "UserMemory" | undefined {
+  return value === "UserMemory" ? value : parseLayerValue(value);
 }
 
 function parseLayerValue(value: unknown): MemoryLayer | undefined {

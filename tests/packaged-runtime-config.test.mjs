@@ -159,6 +159,14 @@ describe("packaged desktop runtime configuration", () => {
     });
     expect(good.status, good.stderr).toBe(0);
 
+    const noLocksAsar = await createAsarFixture(root, "without-locks", "1.0.8", false, false);
+    const withoutLocks = spawnSync(
+      process.execPath,
+      [verifier, "--asar", noLocksAsar, "--expected", "1.0.8"],
+      { encoding: "utf8" },
+    );
+    expect(withoutLocks.status, withoutLocks.stderr).toBe(0);
+
     const staleAsar = await createAsarFixture(root, "stale", "1.0.7");
     const stale = spawnSync(process.execPath, [verifier, "--asar", staleAsar, "--expected", "1.0.8"], {
       encoding: "utf8",
@@ -175,7 +183,7 @@ describe("packaged desktop runtime configuration", () => {
   });
 });
 
-async function createAsarFixture(root, name, version, includeEnv = false) {
+async function createAsarFixture(root, name, version, includeEnv = false, includeLocks = true) {
   const source = join(root, `${name}-source`);
   const asar = join(root, `${name}.asar`);
   const manifest = { version };
@@ -186,7 +194,7 @@ async function createAsarFixture(root, name, version, includeEnv = false) {
   });
   for (const component of ["memory", "memmy-agent"]) {
     writeFixtureJson(join(source, `dist/runtime/${component}/package.json`), manifest);
-    writeFixtureJson(join(source, `dist/runtime/${component}/package-lock.json`), lock);
+    if (includeLocks) writeFixtureJson(join(source, `dist/runtime/${component}/package-lock.json`), lock);
   }
   const contracts = join(
     source,

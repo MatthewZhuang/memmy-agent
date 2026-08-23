@@ -12,6 +12,38 @@ const stylesSourceUrl = new URL("../../styles.css", import.meta.url);
 const WINDOWS_COMMAND_ERROR = "'node' 不是内部或外部命令，也不是可运行的程序\r\n或批处理文件。";
 
 describe("AgentThreadMessages", () => {
+  it("shows a per-answer control for inspecting injected memories", () => {
+    const html = renderToString(
+      <I18nProvider language="zh-CN">
+        <AgentThreadMessages
+          chatScopeKey="chat-memory-evidence"
+          memoryRuntimeClient={{
+            recallEvidence: vi.fn(),
+            deleteMemory: vi.fn()
+          }}
+          messages={[
+            {
+              id: "query-memory-evidence",
+              role: "user",
+              content: "检查记忆"
+            },
+            {
+              id: "answer-memory-evidence",
+              role: "assistant",
+              turnId: "turn-memory-evidence",
+              content: "已完成。"
+            }
+          ]}
+        />
+      </I18nProvider>
+    );
+
+    expect(html).toContain("查看本轮记忆依据");
+    expect(html).toContain('aria-expanded="false"');
+    expect(html).toContain("agent-memory-evidence-toggle");
+    expect(html.indexOf("查看本轮记忆依据")).toBeLessThan(html.indexOf("已完成。"));
+  });
+
   it("keeps memo boundaries around chat history rendering", () => {
     const threadSource = readFileSync(agentThreadMessagesSourceUrl, "utf8");
     const contentSource = readFileSync(agentMessageContentSourceUrl, "utf8");

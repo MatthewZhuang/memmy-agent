@@ -10,12 +10,14 @@ export const CursorSchema = z.string();
 export type Cursor = z.infer<typeof CursorSchema>;
 
 /** Schema for memory kind. */
-export const MemoryKindSchema = z.enum(["trace", "span", "policy", "world_model", "skill"]);
+export const MemoryKindSchema = z.enum(["user_memory", "trace", "span", "policy", "world_model", "skill"]);
 export type MemoryKind = z.infer<typeof MemoryKindSchema>;
 
 /** Schema for memory layer. */
 export const MemoryLayerSchema = z.enum(["L1", "L2", "L3", "Skill"]);
 export type MemoryLayer = z.infer<typeof MemoryLayerSchema>;
+export const RecallMemoryLayerSchema = z.enum(["UserMemory", "L1", "L2", "L3", "Skill"]);
+export type RecallMemoryLayer = z.infer<typeof RecallMemoryLayerSchema>;
 
 /** Schema for memory status. */
 export const MemoryStatusSchema = z.enum(["activated", "resolving", "archived", "deleted"]);
@@ -29,6 +31,7 @@ export type JobStatus = z.infer<typeof JobStatusSchema>;
 export const JobTypeSchema = z.enum([
   "episode_idle_close",
   "trace_summary",
+  "user_memory_embedding",
   "import_summary",
   "reflection",
   "embedding",
@@ -49,7 +52,7 @@ export const InjectedContextSectionSchema = z.object({
   id: NonEmptyStringSchema,
   title: NonEmptyStringSchema,
   kind: MemoryKindSchema,
-  memoryLayer: MemoryLayerSchema,
+  memoryLayer: RecallMemoryLayerSchema,
   memoryIds: z.array(NonEmptyStringSchema),
   content: z.string(),
   tokenEstimate: z.number().int().nonnegative().optional()
@@ -67,16 +70,44 @@ export type InjectedContext = z.infer<typeof InjectedContextSchema>;
 export const RecallHitSchema = z.object({
   id: NonEmptyStringSchema,
   kind: MemoryKindSchema,
-  memoryLayer: MemoryLayerSchema,
+  memoryLayer: RecallMemoryLayerSchema,
   status: MemoryStatusSchema,
   title: z.string().optional(),
   snippet: z.string(),
   score: z.number(),
   tags: z.array(z.string()),
+  createdAt: IsoTimeSchema.optional(),
   updatedAt: IsoTimeSchema.optional(),
-  source: z.enum(["search", "episode", "rule", "skill"])
+  source: z.enum(["search", "episode", "rule", "skill"]),
+  sourceTurnId: z.string().optional(),
+  memberMemoryIds: z.array(NonEmptyStringSchema).optional(),
+  retrievalRoutes: z.array(z.enum(["user_memory", "l1", "agent_memory"])).optional(),
+  sourceAgentId: z.string().optional(),
+  sourceSkillId: z.string().optional(),
+  sourceSkillVersion: z.string().optional(),
+  readOnly: z.boolean().optional(),
+  members: z.array(z.object({
+    id: NonEmptyStringSchema,
+    kind: MemoryKindSchema,
+    memoryLayer: RecallMemoryLayerSchema,
+    status: z.union([MemoryStatusSchema, z.enum(["active", "archived", "deleted"])]),
+    content: z.string(),
+    createdAt: IsoTimeSchema,
+    updatedAt: IsoTimeSchema,
+    retrievalRoute: z.enum(["user_memory", "l1", "agent_memory"])
+  })).optional()
 });
 export type RecallHit = z.infer<typeof RecallHitSchema>;
+
+export const RecallEvidenceOutputSchema = z.object({
+  recallEventId: NonEmptyStringSchema,
+  queryId: NonEmptyStringSchema,
+  query: z.string(),
+  hits: z.array(RecallHitSchema),
+  createdAt: IsoTimeSchema,
+  serverTime: IsoTimeSchema
+});
+export type RecallEvidenceOutput = z.infer<typeof RecallEvidenceOutputSchema>;
 
 /** Schema for memory metrics. */
 export const MemoryMetricsSchema = z.object({
@@ -116,7 +147,7 @@ export type MemoryProcessingRecord = z.infer<typeof MemoryProcessingRecordSchema
 export const MemoryListItemSchema = z.object({
   id: NonEmptyStringSchema,
   kind: MemoryKindSchema,
-  memoryLayer: MemoryLayerSchema,
+  memoryLayer: RecallMemoryLayerSchema,
   status: MemoryStatusSchema,
   title: NonEmptyStringSchema,
   summary: z.string(),
@@ -324,7 +355,11 @@ export const CompleteTurnInputSchema = RuntimeRequestFieldsSchema.extend({
   artifacts: z.array(z.unknown()).optional(),
   sourceMemoryIds: z.array(NonEmptyStringSchema).optional(),
   usage: z.record(z.string(), z.unknown()).optional(),
-  status: z.enum(["succeeded", "failed"]).optional()
+  status: z.enum(["succeeded", "failed"]).optional(),
+  userMemoryCorrection: z.object({
+    targetMemoryId: NonEmptyStringSchema,
+    revisedContent: NonEmptyStringSchema
+  }).optional()
 });
 export type CompleteTurnInput = z.infer<typeof CompleteTurnInputSchema>;
 
@@ -334,6 +369,8 @@ export const CompleteTurnOutputSchema = z.object({
   sessionId: NonEmptyStringSchema,
   episodeId: NonEmptyStringSchema,
   rawTurnId: NonEmptyStringSchema,
+  userMemoryId: z.string().optional(),
+  userMemoryIds: z.array(NonEmptyStringSchema).optional(),
   l1MemoryId: z.string(),
   l1MemoryIds: z.array(NonEmptyStringSchema),
   closedEpisodeIds: z.array(NonEmptyStringSchema),
@@ -388,7 +425,12 @@ export const AddMemoryInputSchema = RuntimeRequestFieldsSchema.extend({
   sessionId: z.string().optional(),
   turnId: z.string().optional(),
   createdAt: IsoTimeSchema.optional(),
-  deferProcessing: z.boolean().optional()
+  deferProcessing: z.boolean().optional(),
+  sourceAgentId: z.string().optional(),
+  sourceSkillId: z.string().optional(),
+  sourceSkillPath: z.string().optional(),
+  sourceSkillVersion: z.string().optional(),
+  sourceContentHash: z.string().optional()
 });
 export type AddMemoryInput = z.infer<typeof AddMemoryInputSchema>;
 
@@ -547,7 +589,7 @@ export type RetryMemoryProcessingOutput = z.infer<typeof RetryMemoryProcessingOu
 
 /** Schema for panel items input. */
 export const PanelItemsInputSchema = z.object({
-  layer: MemoryLayerSchema.optional(),
+  layer: RecallMemoryLayerSchema.optional(),
   status: MemoryStatusSchema.optional(),
   q: z.string().optional(),
   sourceAgent: z.string().trim().min(1).optional(),
@@ -606,6 +648,7 @@ export type PanelJobsInput = z.infer<typeof PanelJobsInputSchema>;
 export const PanelOverviewOutputSchema = z.object({
   counts: z.object({
     memories: z.number().int().nonnegative(),
+    userMemories: z.number().int().nonnegative().default(0),
     skills: z.number().int().nonnegative(),
     experiences: z.number().int().nonnegative(),
     worldModels: z.number().int().nonnegative()
