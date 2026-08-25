@@ -77,6 +77,16 @@ describe("repository sqlite schema contract", () => {
         "trace_policy_links",
         "episode_procedural_paths",
         "procedural_span_occurrences",
+        "procedural_step_occurrences",
+        "procedural_step_embeddings",
+        "procedural_step_clusters",
+        "procedural_step_cluster_members",
+        "step_sequence_patterns",
+        "step_sequence_pattern_occurrences",
+        "step_sequence_policy_versions",
+        "episode_step_policy_projections",
+        "step_policy_skill_patterns",
+        "step_policy_skill_pattern_occurrences",
         "procedural_span_occurrence_embeddings",
         "episode_span_credit_runs",
         "procedural_span_credits",
@@ -109,6 +119,34 @@ describe("repository sqlite schema contract", () => {
         "memory_embeddings",
         "memory_vectors"
       ]));
+      const spanCreditColumns = db.db.prepare(
+        `PRAGMA table_info(procedural_span_credits)`
+      ).all() as Array<{ name: string }>;
+      expect(spanCreditColumns.map((column) => column.name)).toContain("attribution_type");
+      const stepPatternColumns = db.db.prepare(
+        `PRAGMA table_info(step_sequence_patterns)`
+      ).all() as Array<{ name: string }>;
+      expect(stepPatternColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
+        "selected_occurrence_count",
+        "selected_episode_count",
+        "superseded_by_pattern_id"
+      ]));
+      const stepOccurrenceColumns = db.db.prepare(
+        `PRAGMA table_info(step_sequence_pattern_occurrences)`
+      ).all() as Array<{ name: string }>;
+      expect(stepOccurrenceColumns.map((column) => column.name)).toContain("is_selected");
+      const skillPatternColumns = db.db.prepare(
+        `PRAGMA table_info(step_policy_skill_patterns)`
+      ).all() as Array<{ name: string }>;
+      expect(skillPatternColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
+        "selected_occurrence_count",
+        "selected_episode_count",
+        "superseded_by_pattern_id"
+      ]));
+      const skillOccurrenceColumns = db.db.prepare(
+        `PRAGMA table_info(step_policy_skill_pattern_occurrences)`
+      ).all() as Array<{ name: string }>;
+      expect(skillOccurrenceColumns.map((column) => column.name)).toContain("is_selected");
       expect(db.db.prepare(`SELECT vec_version() AS version`).get()).toEqual({ version: "v0.1.9" });
       const memoryColumns = db.db.prepare(`PRAGMA table_info(memories)`).all() as Array<{ name: string }>;
       expect(memoryColumns.map((column) => column.name)).not.toEqual(expect.arrayContaining([

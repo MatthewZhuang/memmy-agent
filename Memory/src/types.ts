@@ -48,6 +48,7 @@ export type JobType =
   | "embedding"
   | "reward"
   | "procedural_path"
+  | "step_sequence_learning"
   | "span_credit"
   | "procedural_span_cluster"
   | "episode_policy_projection"

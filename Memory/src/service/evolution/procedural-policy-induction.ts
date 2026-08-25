@@ -417,8 +417,8 @@ function compareEvidence(left: LoadedOccurrence, right: LoadedOccurrence): numbe
 function creditEvidenceStrength(item: LoadedOccurrence): number {
   if (!item.credit) return 0;
   return item.member.evidenceRole === "support"
-    ? item.credit.creditScore + item.credit.processQuality * 0.1
-    : Math.max(-item.credit.creditScore, -item.credit.processQuality);
+    ? item.credit.rewardCredit
+    : -item.credit.rewardCredit;
 }
 
 function buildEvidenceContext(selected: LoadedOccurrence[]): {
@@ -452,6 +452,7 @@ function buildEvidenceContext(selected: LoadedOccurrence[]): {
       path_id: item.occurrence.pathId,
       span_id: item.occurrence.spanId,
       local_goal: item.occurrence.localGoal,
+      capability_goal: item.occurrence.capabilityGoal,
       entry_condition: item.occurrence.entryCondition,
       exit_condition: item.occurrence.exitCondition,
       termination_status: item.occurrence.terminationStatus,
@@ -473,6 +474,7 @@ function compactOccurrenceSummary(item: LoadedOccurrence): Record<string, unknow
     evidence_role: item.member.evidenceRole,
     match_similarity: item.member.similarity,
     local_goal: clip(item.occurrence.localGoal, 500),
+    capability_goal: clip(item.occurrence.capabilityGoal, 500),
     entry_condition: clip(item.occurrence.entryCondition, 500),
     exit_condition: clip(item.occurrence.exitCondition, 500),
     termination_status: item.occurrence.terminationStatus,
@@ -484,10 +486,9 @@ function compactOccurrenceSummary(item: LoadedOccurrence): Record<string, unknow
 
 function compactSpanCredit(credit: ProceduralSpanCreditRecord): Record<string, unknown> {
   return {
-    goal_credit: credit.goalCredit,
-    process_quality: credit.processQuality,
+    reward_credit: credit.rewardCredit,
+    attribution_type: credit.attributionType,
     confidence: credit.confidence,
-    credit_score: credit.creditScore,
     evidence_role: credit.evidenceRole,
     reason: clip(credit.reason, 500)
   };

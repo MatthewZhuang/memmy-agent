@@ -9,6 +9,7 @@ import {
   buildTurnStepCandidates,
   type EpisodeProceduralPathV2
 } from "../src/index.js";
+import type { LlmClient, LlmCompletionOptions, LlmMessage } from "../src/model/types.js";
 import { Repositories, type RawTurnRecord } from "../src/storage/repositories.js";
 import { redactSensitiveText } from "../src/utils/sensitive-data.js";
 import { clip } from "../src/utils/text.js";
@@ -26,6 +27,13 @@ interface ReplayArgs {
   outputPath?: string;
   full: boolean;
   structuralOnly: boolean;
+  traceBoundaries: boolean;
+}
+
+interface BoundaryTraceCall {
+  operation: string;
+  request: unknown;
+  response: unknown;
 }
 
 interface ReplayArtifact {
@@ -58,6 +66,7 @@ interface ReplayArtifact {
     }>;
   };
   executionPath: EpisodeProceduralPathV2;
+  boundaryTrace?: BoundaryTraceCall[];
 }
 
 async function main(): Promise<void> {
@@ -111,9 +120,13 @@ async function main(): Promise<void> {
       }, null, 2)}\n`);
       return;
     }
-    const llm = createLlmClient(resolveEvolutionConfig(loaded.config), {
+    const configuredLlm = createLlmClient(resolveEvolutionConfig(loaded.config), {
       modelRole: "memory_evolution"
     });
+    const boundaryTrace: BoundaryTraceCall[] = [];
+    const llm = args.traceBoundaries
+      ? traceBoundaryCalls(configuredLlm, boundaryTrace)
+      : configuredLlm;
     if (!llm.isConfigured()) throw new Error("The configured evolution/summary LLM is unavailable.");
     const remoteTurns = rawTurns.map(sanitizeRawTurn);
     const path = await new EpisodeProceduralReconstructor({ llm }).reconstruct({
@@ -150,7 +163,8 @@ async function main(): Promise<void> {
           toolCallCount: turn.toolCalls.length
         }))
       },
-      executionPath: path
+      executionPath: path,
+      ...(args.traceBoundaries ? { boundaryTrace } : {})
     };
     const persistedFile = args.outputPath ? persistJsonArtifact(args.outputPath, artifact) : undefined;
     const output = args.full
@@ -175,6 +189,7 @@ async function main(): Promise<void> {
           spans: path.spans.map((span) => ({
             spanIndex: span.spanIndex,
             localGoal: span.localGoal,
+            capabilityGoal: span.capabilityGoal,
             rawTurnIds: span.rawTurnIds,
             stepCount: span.cost.steps,
             toolCalls: span.cost.toolCalls,
@@ -185,6 +200,12 @@ async function main(): Promise<void> {
             exitCondition: span.termination.exitCondition,
             confidence: span.segmentation.confidence
           })),
+          ...(args.traceBoundaries
+            ? {
+                boundaryTraceCalls: boundaryTrace.length,
+                boundaryTraceOperations: boundaryTrace.map((call) => call.operation)
+              }
+            : {}),
           ...(persistedFile ? { persistedFile } : {})
         };
     process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
@@ -232,6 +253,47 @@ function sanitizeText(value: string): string {
   return clip(redactSensitiveText(value), REMOTE_STRING_MAX);
 }
 
+function traceBoundaryCalls(
+  delegate: LlmClient,
+  trace: BoundaryTraceCall[]
+): LlmClient {
+  return {
+    config: delegate.config,
+    isConfigured: () => delegate.isConfigured(),
+    complete: (messages, options) => delegate.complete(messages, options),
+    async completeJson<T extends Record<string, unknown>>(
+      messages: LlmMessage[],
+      options: LlmCompletionOptions
+    ): Promise<T> {
+      const result = await delegate.completeJson<T>(messages, options);
+      if (
+        options.operation.startsWith("procedural.span_segmentation.") ||
+        options.operation.startsWith("procedural.span_reconciliation.")
+      ) {
+        trace.push({
+          operation: options.operation,
+          request: sanitizeValue(llmRequestPayload(messages)),
+          response: sanitizeValue(result)
+        });
+      }
+      return result;
+    },
+    status: () => delegate.status()
+  };
+}
+
+function llmRequestPayload(messages: readonly LlmMessage[]): unknown {
+  const payload = [...messages].reverse().find(
+    (message) => message.role === "user" && message.content.trimStart().startsWith("{")
+  );
+  if (!payload) return {};
+  try {
+    return JSON.parse(payload.content) as unknown;
+  } catch {
+    return { parseError: true };
+  }
+}
+
 function persistJsonArtifact(outputPath: string, artifact: unknown): string {
   const resolved = resolve(outputPath);
   mkdirSync(dirname(resolved), { recursive: true });
@@ -248,6 +310,7 @@ function parseArgs(argv: readonly string[]): ReplayArgs {
   let outputPath: string | undefined;
   let full = false;
   let structuralOnly = false;
+  let traceBoundaries = false;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--episode") episodeId = requiredValue(argv, ++index, "--episode");
@@ -256,6 +319,7 @@ function parseArgs(argv: readonly string[]): ReplayArgs {
     else if (arg === "--output") outputPath = requiredValue(argv, ++index, "--output");
     else if (arg === "--full") full = true;
     else if (arg === "--structural-only") structuralOnly = true;
+    else if (arg === "--trace-boundaries") traceBoundaries = true;
     else throw new Error(`Unknown argument: ${arg}`);
   }
   if (!episodeId) throw new Error("Missing required --episode <episode-id>");
@@ -263,6 +327,7 @@ function parseArgs(argv: readonly string[]): ReplayArgs {
     episodeId,
     full,
     structuralOnly,
+    traceBoundaries,
     ...(dbPath ? { dbPath } : {}),
     ...(configPath ? { configPath } : {}),
     ...(outputPath ? { outputPath } : {})

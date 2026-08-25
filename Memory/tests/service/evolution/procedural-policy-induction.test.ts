@@ -110,11 +110,15 @@ describe("procedural Span Policy induction", () => {
     expect(initialPolicy).toMatchObject({
       status: "active",
       clusterMembershipVersion: initialCluster.membershipVersion,
-      evidenceOccurrenceIds: [supportA.occurrence.id, supportB.occurrence.id],
       compilerModel: "procedural-policy-test"
     });
+    expect(initialPolicy?.evidenceOccurrenceIds).toEqual(expect.arrayContaining([
+      supportA.occurrence.id,
+      supportB.occurrence.id
+    ]));
+    expect(initialPolicy?.evidenceOccurrenceIds).toHaveLength(2);
     const initialMappings = repos.proceduralPolicies.listOccurrences(initialPolicy!.id);
-    expect(initialMappings).toEqual([
+    expect(initialMappings).toEqual(expect.arrayContaining([
       expect.objectContaining({
         occurrenceId: supportA.occurrence.id,
         episodeId: supportA.episodeId,
@@ -129,7 +133,8 @@ describe("procedural Span Policy induction", () => {
         evidenceRole: "support",
         status: "active"
       })
-    ]);
+    ]));
+    expect(initialMappings).toHaveLength(2);
     const initialMemory = repos.memories.get(initialPolicy!.l2MemoryId!);
     expect(initialMemory).toMatchObject({
       status: "resolving",
@@ -190,14 +195,18 @@ describe("procedural Span Policy induction", () => {
     expect(calls).toHaveLength(3);
     const changedPolicy = repos.proceduralPolicies.getActiveForCluster(initialCluster.id);
     expect(changedPolicy?.id).not.toBe(initialPolicy!.id);
-    expect(changedPolicy?.policy.evidence).toMatchObject({
-      supportOccurrenceIds: [supportA.occurrence.id, supportB.occurrence.id],
-      counterexampleOccurrenceIds: [counterexample.occurrence.id]
-    });
-    expect(changedPolicy?.evidenceOccurrenceIds).toEqual([
+    expect(changedPolicy?.policy.evidence.supportOccurrenceIds).toEqual(expect.arrayContaining([
       supportA.occurrence.id,
       supportB.occurrence.id
-    ]);
+    ]));
+    expect(changedPolicy?.policy.evidence.supportOccurrenceIds).toHaveLength(2);
+    expect(changedPolicy?.policy.evidence.counterexampleOccurrenceIds)
+      .toEqual([counterexample.occurrence.id]);
+    expect(changedPolicy?.evidenceOccurrenceIds).toEqual(expect.arrayContaining([
+      supportA.occurrence.id,
+      supportB.occurrence.id
+    ]));
+    expect(changedPolicy?.evidenceOccurrenceIds).toHaveLength(2);
     expect(repos.proceduralPolicies.listOccurrences(changedPolicy!.id)).toContainEqual(
       expect.objectContaining({
         occurrenceId: counterexample.occurrence.id,
@@ -278,14 +287,14 @@ describe("procedural Span Policy induction", () => {
       terminationStatus: "blocked"
     });
     const neutral = persistProceduralPolicyEvidence(repos, "credit-policy-neutral");
-    saveCredit(repos, supportA, { goalCredit: 1, processQuality: 0.7, evidenceRole: "support" });
-    saveCredit(repos, supportB, { goalCredit: 1, processQuality: 0.5, evidenceRole: "support" });
+    saveCredit(repos, supportA, { rewardCredit: 1, attributionType: "helpful", evidenceRole: "support" });
+    saveCredit(repos, supportB, { rewardCredit: 1, attributionType: "helpful", evidenceRole: "support" });
     saveCredit(repos, counterexample, {
-      goalCredit: 0,
-      processQuality: -0.8,
+      rewardCredit: -1,
+      attributionType: "harmful",
       evidenceRole: "counterexample"
     });
-    saveCredit(repos, neutral, { goalCredit: 0, processQuality: 0.1, evidenceRole: "neutral" });
+    saveCredit(repos, neutral, { rewardCredit: 0, attributionType: "neutral", evidenceRole: "neutral" });
     let jobIndex = 0;
     const evidencePipeline = new ProceduralPolicyEvidencePipeline({
       repos,
@@ -333,11 +342,11 @@ describe("procedural Span Policy induction", () => {
         candidateSource: "test.semantic-neighborhood"
       }
     });
-    expect(repos.proceduralSpanClusters.listMembers(refreshed.cluster!.id)).toEqual([
+    expect(repos.proceduralSpanClusters.listMembers(refreshed.cluster!.id)).toEqual(expect.arrayContaining([
       expect.objectContaining({ occurrenceId: supportA.occurrence.id, evidenceRole: "support" }),
       expect.objectContaining({ occurrenceId: supportB.occurrence.id, evidenceRole: "support" }),
       expect.objectContaining({ occurrenceId: counterexample.occurrence.id, evidenceRole: "counterexample" })
-    ]);
+    ]));
     expect(refreshed.inductionJob).toMatchObject({
       jobType: "l2_induction",
       payload: {
@@ -362,7 +371,7 @@ describe("procedural Span Policy induction", () => {
         selected_path_evidence: Array<{
           occurrence_id: string;
           evidence_role: string;
-          span_credit?: { evidence_role: string; credit_score: number; process_quality: number };
+          span_credit?: { evidence_role: string; reward_credit: number; attribution_type: string };
         }>;
       };
     expect(promptPayload.selected_path_evidence).toEqual(expect.arrayContaining([
@@ -371,8 +380,8 @@ describe("procedural Span Policy induction", () => {
         evidence_role: "support",
         span_credit: expect.objectContaining({
           evidence_role: "support",
-          credit_score: 0.98,
-          process_quality: 0.7
+          reward_credit: 1,
+          attribution_type: "helpful"
         })
       }),
       expect.objectContaining({
@@ -382,10 +391,13 @@ describe("procedural Span Policy induction", () => {
       })
     ]));
     const policy = repos.proceduralPolicies.getActiveForCluster(refreshed.cluster!.id);
-    expect(policy?.policy.evidence).toMatchObject({
-      supportOccurrenceIds: [supportA.occurrence.id, supportB.occurrence.id],
-      counterexampleOccurrenceIds: [counterexample.occurrence.id]
-    });
+    expect(policy?.policy.evidence.supportOccurrenceIds).toEqual(expect.arrayContaining([
+      supportA.occurrence.id,
+      supportB.occurrence.id
+    ]));
+    expect(policy?.policy.evidence.supportOccurrenceIds).toHaveLength(2);
+    expect(policy?.policy.evidence.counterexampleOccurrenceIds)
+      .toEqual([counterexample.occurrence.id]);
     db.close();
   });
 });
@@ -394,8 +406,8 @@ function saveCredit(
   repos: Repositories,
   evidence: ReturnType<typeof persistProceduralPolicyEvidence>,
   input: {
-    goalCredit: number;
-    processQuality: number;
+    rewardCredit: number;
+    attributionType: "helpful" | "harmful" | "neutral";
     evidenceRole: "support" | "counterexample" | "neutral";
   }
 ): void {
@@ -406,29 +418,16 @@ function saveCredit(
     pathId: evidence.path.id,
     pathHash: evidence.path.pathHash,
     namespaceId: PROCEDURAL_POLICY_TEST_NAMESPACE,
-    rewardHash: `reward:${evidence.episodeId}:${input.goalCredit}`,
-    goalAchievement: input.goalCredit,
-    statePotentials: [{
-      boundaryIndex: 0,
-      stateId: preStateId,
-      progress: 0,
-      evidenceRefs: [preStateId],
-      reason: "Episode start anchor"
-    }, {
-      boundaryIndex: 1,
-      stateId: postStateId,
-      progress: input.goalCredit,
-      evidenceRefs: [postStateId],
-      reason: "Episode goal-achievement anchor"
-    }],
+    rewardHash: `reward:${evidence.episodeId}:${input.rewardCredit}`,
+    episodeReward: input.rewardCredit,
     credits: [{
       occurrenceId: evidence.occurrence.id,
       spanId: evidence.occurrence.spanId,
       spanIndex: evidence.occurrence.spanIndex,
       preStateId,
       postStateId,
-      goalCredit: input.goalCredit,
-      processQuality: input.processQuality,
+      rewardCredit: input.rewardCredit,
+      attributionType: input.attributionType,
       confidence: 0.98,
       evidenceRole: input.evidenceRole,
       evidenceRefs: [evidence.occurrence.id],

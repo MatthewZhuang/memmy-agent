@@ -1,10 +1,14 @@
 import type Database from "better-sqlite3";
 import type {
-  EpisodeSpanCreditRunV1,
+  EpisodeSpanCreditRunV2,
+  SpanCreditAttributionType,
   SpanCreditEvidenceRole,
-  SpanCreditV1
+  SpanCreditV2
 } from "../service/evolution/span-credit-model.js";
-import { SPAN_CREDIT_ALGORITHM_VERSION } from "../service/evolution/span-credit-model.js";
+import {
+  SPAN_CREDIT_ALGORITHM_VERSION,
+  SPAN_CREDIT_SCHEMA_VERSION
+} from "../service/evolution/span-credit-model.js";
 import { stableHash } from "../utils/id.js";
 import { parseJson, toJson } from "../utils/json.js";
 
@@ -20,17 +24,17 @@ export interface EpisodeSpanCreditRunRecord {
   algorithmVersion: string;
   promptVersion: string;
   rewardHash: string;
-  goalAchievement: number;
+  episodeReward: number;
   status: EpisodeSpanCreditRunStatus;
   scorerModel?: string;
   contentHash: string;
-  run: EpisodeSpanCreditRunV1;
+  run: EpisodeSpanCreditRunV2;
   createdAt: string;
   activatedAt?: string | null;
   deactivatedAt?: string | null;
 }
 
-export interface ProceduralSpanCreditRecord extends SpanCreditV1 {
+export interface ProceduralSpanCreditRecord extends SpanCreditV2 {
   runId: string;
   episodeId: string;
   pathId: string;
@@ -82,6 +86,7 @@ interface SpanCreditSqlRow {
   process_quality: number;
   confidence: number;
   credit_score: number;
+  attribution_type: SpanCreditAttributionType;
   evidence_role: SpanCreditEvidenceRole;
   evidence_refs_json: string;
   reason: string;
@@ -91,7 +96,7 @@ interface SpanCreditSqlRow {
 export class ProceduralSpanCreditRepository {
   constructor(private readonly db: Database.Database) {}
 
-  saveAndActivate(run: EpisodeSpanCreditRunV1, at: string): SaveEpisodeSpanCreditRunResult {
+  saveAndActivate(run: EpisodeSpanCreditRunV2, at: string): SaveEpisodeSpanCreditRunResult {
     const existing = this.get(run.id);
     if (existing) {
       if (existing.contentHash !== run.contentHash) {
@@ -120,7 +125,7 @@ export class ProceduralSpanCreditRepository {
         run.algorithmVersion,
         run.promptVersion,
         run.rewardHash,
-        run.goalAchievement,
+        run.episodeReward,
         run.scorerModel ?? null,
         run.contentHash,
         toJson(run),
@@ -131,9 +136,9 @@ export class ProceduralSpanCreditRepository {
         `INSERT INTO procedural_span_credits (
           id, run_id, occurrence_id, span_id, span_index, episode_id, path_id,
           path_hash, reward_hash, schema_version, pre_state_id, post_state_id,
-          goal_credit, process_quality, confidence, credit_score, evidence_role,
+          goal_credit, process_quality, confidence, credit_score, attribution_type, evidence_role,
           evidence_refs_json, reason, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       for (const credit of run.credits) {
         insertCredit.run(
@@ -149,10 +154,11 @@ export class ProceduralSpanCreditRepository {
           credit.schemaVersion,
           credit.preStateId,
           credit.postStateId,
-          credit.goalCredit,
-          credit.processQuality,
+          credit.rewardCredit,
+          0,
           credit.confidence,
-          credit.creditScore,
+          credit.rewardCredit,
+          credit.attributionType,
           credit.evidenceRole,
           toJson(credit.evidenceRefs),
           credit.reason,
@@ -289,7 +295,7 @@ export class ProceduralSpanCreditRepository {
     ).run(at, episodeId);
   }
 
-  private assertRunSources(run: EpisodeSpanCreditRunV1): void {
+  private assertRunSources(run: EpisodeSpanCreditRunV2): void {
     const path = this.db.prepare(
       `SELECT id, episode_id, path_hash, namespace_id, status
        FROM episode_procedural_paths WHERE id = ?`
@@ -323,7 +329,7 @@ export class ProceduralSpanCreditRepository {
 }
 
 function runFromSql(row: CreditRunSqlRow): EpisodeSpanCreditRunRecord {
-  const run = parseJson<EpisodeSpanCreditRunV1 | null>(row.payload_json, null);
+  const run = parseJson<EpisodeSpanCreditRunV2 | null>(row.payload_json, null);
   if (!run) throw new Error(`stored SpanCredit run payload is invalid: ${row.id}`);
   return {
     id: row.id,
@@ -335,7 +341,7 @@ function runFromSql(row: CreditRunSqlRow): EpisodeSpanCreditRunRecord {
     algorithmVersion: row.algorithm_version,
     promptVersion: row.prompt_version,
     rewardHash: row.reward_hash,
-    goalAchievement: row.goal_achievement,
+    episodeReward: row.goal_achievement,
     status: row.status,
     ...(row.scorer_model ? { scorerModel: row.scorer_model } : {}),
     contentHash: row.content_hash,
@@ -357,16 +363,27 @@ function creditFromSql(row: SpanCreditSqlRow): ProceduralSpanCreditRecord {
     pathId: row.path_id,
     pathHash: row.path_hash,
     rewardHash: row.reward_hash,
-    schemaVersion: row.schema_version as SpanCreditV1["schemaVersion"],
+    schemaVersion: SPAN_CREDIT_SCHEMA_VERSION,
     preStateId: row.pre_state_id,
     postStateId: row.post_state_id,
-    goalCredit: row.goal_credit,
-    processQuality: row.process_quality,
+    rewardCredit: row.goal_credit,
+    attributionType: row.schema_version === SPAN_CREDIT_SCHEMA_VERSION
+      ? row.attribution_type
+      : legacyAttributionType(row.evidence_role, row.goal_credit),
     confidence: row.confidence,
-    creditScore: row.credit_score,
     evidenceRole: row.evidence_role,
     evidenceRefs: parseJson<string[]>(row.evidence_refs_json, []),
     reason: row.reason,
     createdAt: row.created_at
   };
+}
+
+function legacyAttributionType(
+  evidenceRole: SpanCreditEvidenceRole,
+  rewardCredit: number
+): SpanCreditAttributionType {
+  if (evidenceRole === "support" || rewardCredit > 0.05) return "helpful";
+  if (evidenceRole === "counterexample" || rewardCredit < -0.05) return "harmful";
+  if (evidenceRole === "uncertain") return "uncertain";
+  return "neutral";
 }

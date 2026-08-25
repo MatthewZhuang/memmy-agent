@@ -12,6 +12,7 @@ export interface LlmCompletionOptions {
   maxTokens?: number;
   timeoutMs?: number;
   maxRetries?: number;
+  maxLengthRetries?: number;
   jsonMode?: boolean;
 }
 

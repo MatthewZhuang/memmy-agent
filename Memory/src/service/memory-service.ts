@@ -289,6 +289,7 @@ export class MemoryService {
           associateL2: (job) => this.evolutionJobs.associateL2(job),
           splitBigTurn: (job) => this.evolutionJobs.splitBigTurn(job),
           reconstructProceduralPath: (job) => this.evolutionJobs.reconstructProceduralPath(job),
+          learnStepSequences: (job) => this.evolutionJobs.learnStepSequences(job),
           scoreSpanCredit: (job) => this.evolutionJobs.scoreSpanCredit(job),
           clusterProceduralSpans: (job) => this.evolutionJobs.clusterProceduralSpans(job),
           projectEpisodePolicies: (job) => this.evolutionJobs.projectEpisodePolicies(job),
@@ -1855,6 +1856,15 @@ export class MemoryService {
   }) {
     return this.withModelTaskContext(() =>
       this.evolutionJobs.reconstructProceduralPathForReplay(input)
+    );
+  }
+
+  learnStepSequencesForReplay(input: {
+    episodeId: string;
+    at?: string;
+  }) {
+    return this.withModelTaskContext(() =>
+      this.evolutionJobs.learnStepSequencesForReplay(input)
     );
   }
 

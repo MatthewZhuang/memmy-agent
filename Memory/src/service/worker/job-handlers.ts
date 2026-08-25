@@ -64,6 +64,7 @@ export interface WorkerJobProcessors {
     associateL2(job: EvolutionJobRecord): MaybePromise<void>;
     splitBigTurn(job: EvolutionJobRecord): MaybePromise<void>;
     reconstructProceduralPath(job: EvolutionJobRecord): MaybePromise<void>;
+    learnStepSequences(job: EvolutionJobRecord): MaybePromise<void>;
     scoreSpanCredit(job: EvolutionJobRecord): MaybePromise<void>;
     clusterProceduralSpans(job: EvolutionJobRecord): MaybePromise<void>;
     projectEpisodePolicies(job: EvolutionJobRecord): MaybePromise<void>;
@@ -248,6 +249,9 @@ export async function processJob(
       return;
     case "procedural_path":
       await deps.processors.evolution.reconstructProceduralPath(job);
+      return;
+    case "step_sequence_learning":
+      await deps.processors.evolution.learnStepSequences(job);
       return;
     case "span_credit":
       await deps.processors.evolution.scoreSpanCredit(job);
@@ -572,13 +576,17 @@ export function evolutionJobDedupeKey(input: Pick<EnqueueJobInput, "jobType" | "
       return input.episodeId
         ? `procedural_path:${input.episodeId}:${payloadString("rewardHash") ?? "unrewarded"}`
         : undefined;
+    case "step_sequence_learning":
+      return input.episodeId && payloadString("pathHash")
+        ? `step_sequence_learning:${input.episodeId}:${payloadString("pathHash")}`
+        : undefined;
     case "span_credit":
       return input.episodeId && payloadString("pathHash") && payloadString("rewardHash")
         ? `span_credit:${input.episodeId}:${payloadString("pathHash")}:${payloadString("rewardHash")}`
         : undefined;
     case "procedural_span_cluster":
       return payloadString("creditRunId")
-        ? `procedural_span_cluster:${payloadString("creditRunId")}:${payloadString("algorithmVersion") ?? "procedural-span-semantic-cluster.v5"}`
+        ? `procedural_span_cluster:${payloadString("creditRunId")}:${payloadString("algorithmVersion") ?? "procedural-span-semantic-cluster.v8"}`
         : undefined;
     case "episode_policy_projection":
       return input.episodeId && payloadString("pathHash")

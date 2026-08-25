@@ -7,9 +7,13 @@ import {
 } from "../../../src/index.js";
 import type { RawTurnRecord } from "../../../src/storage/repositories.js";
 import {
+  EXECUTION_STEP_SEMANTICS_PROMPT,
   EpisodeProceduralReconstructor,
+  PROCEDURAL_SPAN_CAPABILITY_PROMPT,
+  PROCEDURAL_SPAN_STATE_PROMPT,
   PROCEDURAL_SPAN_RECONCILIATION_PROMPT,
   PROCEDURAL_SPAN_SEGMENTATION_PROMPT,
+  TASK_CONTRACT_PROMPT,
   buildTurnStepCandidates
 } from "../../../src/service/evolution/episode-procedural-reconstructor.js";
 import {
@@ -27,6 +31,68 @@ describe("EpisodeProceduralReconstructor", () => {
     expect(PROCEDURAL_SPAN_RECONCILIATION_PROMPT).toContain(
       "Treat every provisional localGoal as a proposal, not authoritative truth"
     );
+    expect(PROCEDURAL_SPAN_CAPABILITY_PROMPT).toContain(
+      "capability_goal answers WHAT reusable outcome is produced"
+    );
+    expect(PROCEDURAL_SPAN_CAPABILITY_PROMPT).toContain("procedure_semantic answers HOW");
+    expect(PROCEDURAL_SPAN_CAPABILITY_PROMPT).toContain("Span boundaries");
+  });
+
+  it("keeps the Step LLM contract minimal and moves task/state semantics out of it", () => {
+    expect(EXECUTION_STEP_SEMANTICS_PROMPT).toContain("intent");
+    expect(EXECUTION_STEP_SEMANTICS_PROMPT).toContain("summary");
+    expect(EXECUTION_STEP_SEMANTICS_PROMPT).not.toContain('"observations"');
+    expect(EXECUTION_STEP_SEMANTICS_PROMPT).not.toContain('"operations"');
+    expect(EXECUTION_STEP_SEMANTICS_PROMPT).not.toContain("retry_of_candidate_id");
+    expect(TASK_CONTRACT_PROMPT).toContain("acceptance_criteria");
+    expect(PROCEDURAL_SPAN_STATE_PROMPT).toContain("issues_resolved");
+    expect(PROCEDURAL_SPAN_STATE_PROMPT).toContain("verification");
+    expect(PROCEDURAL_SPAN_STATE_PROMPT).toContain("exactly created, updated, or verified");
+  });
+
+  it("skips every Span LLM stage in Step-sequence mode", async () => {
+    const operations: string[] = [];
+    const base = createProceduralLlm((stepIds) => [stepIds]);
+    const llm: LlmClient = {
+      ...base,
+      async completeJson<T extends Record<string, unknown>>(
+        messages: LlmMessage[],
+        options: LlmCompletionOptions
+      ): Promise<T> {
+        operations.push(options.operation);
+        if (options.operation.includes("span_")) {
+          throw new Error(`unexpected Span LLM call: ${options.operation}`);
+        }
+        return base.completeJson<T>(messages, options);
+      }
+    };
+    const rawTurns = [makeRawTurn({
+      id: "raw-step-sequence-mode",
+      episodeId: "episode-step-sequence-mode",
+      userText: "Inspect and verify the build",
+      assistantText: "The build is verified.",
+      toolCalls: [
+        tool("read_file", "package.json", "configuration loaded"),
+        tool("npm_test", "focused suite", "18 tests passed")
+      ]
+    })];
+
+    const path = await new EpisodeProceduralReconstructor({
+      llm,
+      mode: "step_sequence"
+    }).reconstruct({
+      episodeId: "episode-step-sequence-mode",
+      rawTurns,
+      terminalReward: 1
+    });
+
+    expect(path.steps).toHaveLength(2);
+    expect(path.spans).toHaveLength(1);
+    expect(path.spans[0]!.stepIds).toEqual(path.steps.map((step) => step.id));
+    expect(path.spans[0]!.segmentation.reason).toContain("compatibility envelope");
+    expect(operations.some((operation) => operation.startsWith("procedural.task_contract"))).toBe(true);
+    expect(operations.some((operation) => operation.startsWith("procedural.step_semantics"))).toBe(true);
+    expect(operations.some((operation) => operation.includes("span_"))).toBe(false);
   });
 
   it("treats protocol-level errors embedded in tool output as failed step evidence", () => {
@@ -98,6 +164,8 @@ describe("EpisodeProceduralReconstructor", () => {
     expect(path.steps).toHaveLength(6);
     expect(path.spans).toHaveLength(1);
     expect(path.spans[0]).toMatchObject({
+      capabilityGoal: "execute reusable subproblem 1 with an observable result",
+      procedureSemantic: "inspect inputs -> execute reusable subproblem -> verify the result",
       rawTurnIds: ["raw-recovery"],
       cost: { steps: 6, toolCalls: 6, errorCount: 1, retryCount: 0, recoveryCount: 1 },
       termination: { status: "success" }
@@ -111,6 +179,11 @@ describe("EpisodeProceduralReconstructor", () => {
     expect(replayed.pathHash).toBe(path.pathHash);
     expect(path.steps[2]).toMatchObject({ outcome: { status: "failure" }, cost: { errorCount: 1 } });
     expect(path.steps[3]?.recoveryFromStepId).toBe(path.steps[2]?.id);
+    expect(path.steps.slice(0, -1).every((step) => step.actionEffectDelta.length === 0)).toBe(true);
+    expect(path.steps.at(-1)?.actionEffectDelta.length).toBeGreaterThan(0);
+    const finalState = path.states.find((state) => state.id === path.spans[0]?.postStateId);
+    expect(finalState?.summary).toContain("facts=");
+    expect(finalState?.taskStatus).toBe("completed");
     expect(() => validateExecutionStepContinuity(path.steps)).not.toThrow();
     expect(() => validateProceduralSpanCoverage(path.steps, path.spans)).not.toThrow();
   });
@@ -149,7 +222,7 @@ describe("EpisodeProceduralReconstructor", () => {
     expect(path.spans[0]?.rawTurnIds).toEqual(["raw-multi-1", "raw-multi-2"]);
     expect(path.steps[0]?.externalObservationDelta).toContainEqual(expect.objectContaining({
       op: "constraint.upsert",
-      subject: "user_constraint_raw-multi-2"
+      subject: "保持 NodeNext，不要降级 TypeScript"
     }));
     expect(path.steps[0]?.postStateId).toBe(path.steps[1]?.preStateId);
   });
@@ -182,7 +255,7 @@ describe("EpisodeProceduralReconstructor", () => {
     expect(path.spans.every((span) => span.rawTurnIds.length === 1)).toBe(true);
   });
 
-  it("uses targeted then full-regeneration repair for an operation/op schema mismatch", async () => {
+  it("repairs an incomplete minimal Step response without reintroducing state operations", async () => {
     const baseLlm = createProceduralLlm((stepIds) => [stepIds]);
     const repairPrompts: string[] = [];
     let stepSemanticCalls = 0;
@@ -193,13 +266,13 @@ describe("EpisodeProceduralReconstructor", () => {
         options: LlmCompletionOptions
       ): Promise<T> {
         const valid = await baseLlm.completeJson<T>(messages, options);
-        if (!options.operation.startsWith("procedural.step_semantics.v1")) return valid;
+        if (!options.operation.startsWith("procedural.step_semantics.v2")) return valid;
         stepSemanticCalls += 1;
         if (options.operation.includes(".repair.")) {
           repairPrompts.push(messages.at(-1)?.content ?? "");
         }
         if (stepSemanticCalls <= 2) {
-          return JSON.parse(JSON.stringify(valid).replaceAll('"op":', '"operation":')) as T;
+          return { steps: [] } as unknown as T;
         }
         return valid;
       }
@@ -219,20 +292,101 @@ describe("EpisodeProceduralReconstructor", () => {
 
     expect(stepSemanticCalls).toBe(3);
     expect(repairPrompts).toHaveLength(2);
-    expect(repairPrompts[0]).toContain('"operation"');
-    expect(repairPrompts[0]).toContain('exact field name "op"');
-    expect(repairPrompts[0]).toContain("INVALID:");
+    expect(repairPrompts[0]).toContain("candidate");
+    expect(repairPrompts[0]).toContain("intent");
+    expect(repairPrompts[0]).toContain("summary");
     expect(repairPrompts[1]).toContain("Discard the previous JSON");
-    expect(repairPrompts[1]).toContain('literal key "op"');
     expect(path.steps).toHaveLength(1);
-    expect(path.steps[0]?.actionEffectDelta.every((operation) => Boolean(operation.op))).toBe(true);
+    expect(path.steps[0]?.actionEffectDelta.length).toBeGreaterThan(0);
+  });
+
+  it("normalizes an unambiguous camelCase Step candidate ID", async () => {
+    const baseLlm = createProceduralLlm((stepIds) => [stepIds]);
+    const llm: LlmClient = {
+      ...baseLlm,
+      async completeJson<T extends Record<string, unknown>>(
+        messages: LlmMessage[],
+        options: LlmCompletionOptions
+      ): Promise<T> {
+        const valid = await baseLlm.completeJson<Record<string, unknown>>(messages, options);
+        if (!options.operation.startsWith("procedural.step_semantics.v2")) return valid as T;
+        const steps = valid.steps as Array<Record<string, unknown>>;
+        return {
+          steps: steps.map(({ candidate_id: candidateId, ...step }) => ({
+            candidateId,
+            ...step
+          }))
+        } as unknown as T;
+      }
+    };
+    const rawTurns = [makeRawTurn({
+      id: "raw-camel-case-step-id",
+      episodeId: "episode-camel-case-step-id",
+      userText: "验证构建",
+      assistantText: "构建验证完成。",
+      toolCalls: [tool("npm_run", "build", "build passed")]
+    })];
+
+    const path = await new EpisodeProceduralReconstructor({ llm }).reconstruct({
+      episodeId: "episode-camel-case-step-id",
+      rawTurns
+    });
+
+    expect(path.steps).toHaveLength(1);
+    expect(path.steps[0]?.action.intent).toContain("active subproblem");
+  });
+
+  it("drops unsupported Span-state claims after bounded evidence-ref repairs", async () => {
+    const baseLlm = createProceduralLlm((stepIds) => [stepIds]);
+    let spanStateCalls = 0;
+    const llm: LlmClient = {
+      ...baseLlm,
+      async completeJson<T extends Record<string, unknown>>(
+        messages: LlmMessage[],
+        options: LlmCompletionOptions
+      ): Promise<T> {
+        const valid = await baseLlm.completeJson<Record<string, unknown>>(messages, options);
+        if (!options.operation.startsWith("procedural.span_state.v1")) return valid as T;
+        spanStateCalls += 1;
+        const spans = valid.spans as Array<Record<string, unknown>>;
+        return {
+          spans: spans.map((span) => ({
+            ...span,
+            effects: [{
+              summary: "unsupported hallucinated effect",
+              evidence_refs: ["step_invented"]
+            }]
+          }))
+        } as unknown as T;
+      }
+    };
+    const rawTurns = [makeRawTurn({
+      id: "raw-span-state-invalid-ref",
+      episodeId: "episode-span-state-invalid-ref",
+      userText: "验证构建",
+      assistantText: "构建验证完成。",
+      toolCalls: [tool("npm_run", "build", "build passed")]
+    })];
+
+    const path = await new EpisodeProceduralReconstructor({ llm }).reconstruct({
+      episodeId: "episode-span-state-invalid-ref",
+      rawTurns
+    });
+
+    expect(spanStateCalls).toBe(3);
+    expect(path.states.map((state) => state.summary).join("\n"))
+      .not.toContain("unsupported hallucinated effect");
+    expect(path.spans).toHaveLength(1);
   });
 
   it("bounds a long turn into 30-step windows with five preceding context steps", async () => {
     const baseLlm = createProceduralLlm((stepIds) => [stepIds]);
     const stepPayloads: Array<Record<string, unknown>> = [];
+    const taskContractPayloads: Array<Record<string, unknown>> = [];
     const segmentationPayloads: Array<Record<string, unknown>> = [];
     const reconciliationPayloads: Array<Record<string, unknown>> = [];
+    const capabilityPayloads: Array<Record<string, unknown>> = [];
+    const operations: string[] = [];
     const llm: LlmClient = {
       ...baseLlm,
       async completeJson<T extends Record<string, unknown>>(
@@ -240,9 +394,12 @@ describe("EpisodeProceduralReconstructor", () => {
         options: LlmCompletionOptions
       ): Promise<T> {
         const payload = llmRequestPayload(messages);
-        if (options.operation === "procedural.step_semantics.v1.window") stepPayloads.push(payload);
+        operations.push(options.operation);
+        if (options.operation === "procedural.task_contract.v1") taskContractPayloads.push(payload);
+        if (options.operation === "procedural.step_semantics.v2.window") stepPayloads.push(payload);
         if (options.operation === "procedural.span_segmentation.v3.window") segmentationPayloads.push(payload);
         if (options.operation === "procedural.span_reconciliation.v2") reconciliationPayloads.push(payload);
+        if (options.operation === "procedural.span_capability.v1") capabilityPayloads.push(payload);
         return baseLlm.completeJson<T>(messages, options);
       }
     };
@@ -254,7 +411,7 @@ describe("EpisodeProceduralReconstructor", () => {
     const rawTurns = [makeRawTurn({
       id: "raw-long-windowed-turn",
       episodeId: "episode-long-windowed-turn",
-      userText: "完成一个包含大量检查步骤的长任务",
+      userText: `完成一个包含大量检查步骤的长任务：${"约束与验收条件。".repeat(300)}`,
       assistantText: "所有检查均已完成。",
       toolCalls
     })];
@@ -266,8 +423,12 @@ describe("EpisodeProceduralReconstructor", () => {
 
     expect(path.steps).toHaveLength(65);
     expect(path.spans).toHaveLength(1);
+    expect(taskContractPayloads).toHaveLength(1);
+    expect(((taskContractPayloads[0]?.observations as Array<{ userText: string }>)[0]?.userText.length ?? 0))
+      .toBeGreaterThan(1_500);
     expect(stepPayloads.map((payload) => (payload.stepCandidates as unknown[]).length)).toEqual([30, 30, 6]);
     expect(stepPayloads.map((payload) => (payload.precedingStepContext as unknown[]).length)).toEqual([0, 5, 5]);
+    expect(stepPayloads.every((payload) => !("observations" in payload))).toBe(true);
     const transmittedEvidence = stepPayloads.flatMap((payload) => payload.stepCandidates as Array<{ evidence?: string }>);
     expect(Math.max(...transmittedEvidence.map((candidate) => candidate.evidence?.length ?? 0))).toBeLessThanOrEqual(900);
     expect(segmentationPayloads.map((payload) => (payload.steps as unknown[]).length)).toEqual([30, 30, 5]);
@@ -283,6 +444,84 @@ describe("EpisodeProceduralReconstructor", () => {
         ])
       })
     ]));
+    expect(capabilityPayloads).toHaveLength(1);
+    expect(capabilityPayloads[0]?.spans).toEqual([
+      expect.objectContaining({
+        spanIndex: 0,
+        localGoal: "solve reconciled subproblem 1"
+      })
+    ]);
+    expect(operations.indexOf("procedural.span_capability.v1"))
+      .toBeGreaterThan(operations.indexOf("procedural.span_reconciliation.v2"));
+    expect(segmentationPayloads.every((payload) =>
+      !(payload.steps as Array<Record<string, unknown>>).some((step) => "capabilityGoal" in step)
+    )).toBe(true);
+  });
+
+  it("repairs a later window that copies an ID from read-only preceding context", async () => {
+    const baseLlm = createProceduralLlm((stepIds) => [stepIds]);
+    let precedingCandidateId = "";
+    let repairPrompt = "";
+    let repairCount = 0;
+    const laterWindowPayloads: Array<Record<string, unknown>> = [];
+    const llm: LlmClient = {
+      ...baseLlm,
+      async completeJson<T extends Record<string, unknown>>(
+        messages: LlmMessage[],
+        options: LlmCompletionOptions
+      ): Promise<T> {
+        const payload = llmRequestPayload(messages);
+        if (options.operation === "procedural.step_semantics.v2.window") {
+          const window = payload.window as { windowIndex: number };
+          const candidates = payload.stepCandidates as Array<{ candidateId: string }>;
+          if (window.windowIndex === 0) {
+            precedingCandidateId = candidates[0]!.candidateId;
+          } else {
+            laterWindowPayloads.push(payload);
+            return {
+              steps: [{
+                candidate_id: precedingCandidateId,
+                include: true,
+                intent: "copied the preceding context candidate",
+                summary: "This item does not belong to the target window."
+              }]
+            } as unknown as T;
+          }
+        }
+        if (options.operation === "procedural.step_semantics.v2.repair.1") {
+          repairCount += 1;
+          repairPrompt = messages.at(-1)?.content ?? "";
+        }
+        return baseLlm.completeJson<T>(messages, options);
+      }
+    };
+    const rawTurns = [makeRawTurn({
+      id: "raw-preceding-context-id-repair",
+      episodeId: "episode-preceding-context-id-repair",
+      userText: "完成一组连续检查",
+      assistantText: "连续检查已完成。",
+      toolCalls: Array.from({ length: 31 }, (_, index) => tool(
+        "inspect",
+        `target-${index}`,
+        `observed-${index}`
+      ))
+    })];
+
+    const path = await new EpisodeProceduralReconstructor({ llm }).reconstruct({
+      episodeId: "episode-preceding-context-id-repair",
+      rawTurns
+    });
+
+    expect(path.steps).toHaveLength(31);
+    expect(repairCount).toBe(1);
+    expect(laterWindowPayloads).toHaveLength(1);
+    expect(laterWindowPayloads[0]?.precedingStepContext).toEqual(expect.arrayContaining([
+      expect.not.objectContaining({ candidateId: expect.anything() })
+    ]));
+    const laterCandidateIds = (laterWindowPayloads[0]?.stepCandidates as Array<{ candidateId: string }>)
+      .map((candidate) => candidate.candidateId);
+    expect(repairPrompt).toContain(JSON.stringify(laterCandidateIds));
+    expect(repairPrompt).toContain("exclusive allowed candidate_id list");
   });
 
   it("limits each turn window to the previous three turn summaries and carries openSpan", async () => {
@@ -362,12 +601,22 @@ function createProceduralLlm(
         (message) => message.role === "user" && message.content.trimStart().startsWith("{")
       );
       const payload = JSON.parse(payloadMessage?.content ?? "{}") as Record<string, unknown>;
-      if (options.operation.startsWith("procedural.step_semantics.v1")) {
+      if (options.operation.startsWith("procedural.task_contract.v1")) {
         const observations = payload.observations as Array<{
           sourceId: string;
           rawTurnId: string;
           userText?: string;
         }>;
+        return {
+          contracts: observations.map((observation, index) => ({
+            source_id: observation.sourceId,
+            goal: index === 0 ? observation.userText ?? "complete the task" : null,
+            constraints: index === 0 ? [] : [observation.userText ?? "follow-up constraint"],
+            acceptance_criteria: index === 0 ? ["the requested result is verified"] : []
+          }))
+        } as unknown as T;
+      }
+      if (options.operation.startsWith("procedural.step_semantics.v2")) {
         const candidates = payload.stepCandidates as Array<{
           candidateId: string;
           rawTurnId: string;
@@ -378,45 +627,23 @@ function createProceduralLlm(
           sourceRefs: string[];
         }>;
         return {
-          observations: observations.map((observation) => ({
-            source_id: observation.sourceId,
-            operations: Array.isArray(payload.previousTurns) && payload.previousTurns.length > 0
-              ? [{
-                  op: "constraint.upsert",
-                  subject: `user_constraint_${observation.rawTurnId}`,
-                  value: observation.userText ?? "follow-up constraint",
-                  source_refs: [observation.sourceId]
+          ...(isRecordForTest(payload.window) && Number(payload.window.windowIndex) > 0
+            ? {
+                observations: [{
+                  source_id: "turn:invented:later-window",
+                  operations: [{ operation: "fact.verify" }]
                 }]
-              : [{
-                  op: "goal.set",
-                  subject: "task_goal",
-                  value: observation.userText ?? "complete the task",
-                  source_refs: [observation.sourceId]
-                }]
-          })),
+              }
+            : {}),
           steps: candidates.map((candidate, candidateIndex) => {
             const include = candidate.kind === "tool_action";
-            const evidenceRef = candidate.sourceRefs.at(-1)!;
-            const previous = candidates[candidateIndex - 1];
             return {
               candidate_id: candidate.candidateId,
               include,
               intent: include ? `${candidate.action} for the active subproblem` : "report completion",
-              summary: include ? `${candidate.toolName ?? candidate.action} produced observable evidence.` : "Social report only.",
-              outcome_status: candidate.heuristicSuccess ? "success" : "failure",
-              evidence_refs: [evidenceRef],
-              retry_of_candidate_id: null,
-              recovery_from_candidate_id: include && previous?.heuristicSuccess === false
-                ? previous.candidateId
-                : null,
-              operations: include
-                ? [{
-                    op: candidate.heuristicSuccess ? "fact.upsert" : "issue.upsert",
-                    subject: `step_effect_${candidate.candidateId}`,
-                    value: candidate.heuristicSuccess ? "observed" : "failed",
-                    source_refs: [evidenceRef]
-                  }]
-                : []
+              summary: include
+                ? `${candidate.toolName ?? candidate.action} produced observable evidence ${candidateIndex}.`
+                : "Social report only."
             };
           })
         } as unknown as T;
@@ -473,6 +700,47 @@ function createProceduralLlm(
           })
         } as unknown as T;
       }
+      if (options.operation.startsWith("procedural.span_capability.v1")) {
+        const spans = payload.spans as Array<{ spanIndex: number }>;
+        return {
+          spans: spans.map((span) => ({
+            span_index: span.spanIndex,
+            capability_goal: `execute reusable subproblem ${span.spanIndex + 1} with an observable result`,
+            procedure_semantic: "inspect inputs -> execute reusable subproblem -> verify the result"
+          }))
+        } as unknown as T;
+      }
+      if (options.operation.startsWith("procedural.span_state.v1")) {
+        const spans = payload.spans as Array<{
+          spanIndex: number;
+          terminationStatus: string;
+          evidenceRefs: string[];
+          exitCondition: string;
+        }>;
+        return {
+          spans: spans.map((span) => ({
+            span_index: span.spanIndex,
+            effects: [{
+              summary: span.exitCondition,
+              evidence_refs: [span.evidenceRefs.at(-1)]
+            }],
+            artifacts: [],
+            issues_opened: span.terminationStatus === "success" ? [] : [{
+              issue: span.exitCondition,
+              evidence_refs: [span.evidenceRefs.at(-1)]
+            }],
+            issues_resolved: span.terminationStatus === "success" ? [{
+              issue: span.exitCondition,
+              evidence_refs: [span.evidenceRefs.at(-1)]
+            }] : [],
+            verification: [{
+              criterion: span.exitCondition,
+              status: span.terminationStatus === "success" ? "passed" : "failed",
+              evidence_refs: [span.evidenceRefs.at(-1)]
+            }]
+          }))
+        } as unknown as T;
+      }
       throw new Error(`unexpected operation: ${options.operation}`);
     },
     status() {
@@ -491,6 +759,10 @@ function llmRequestPayload(messages: LlmMessage[]): Record<string, unknown> {
     (message) => message.role === "user" && message.content.trimStart().startsWith("{")
   );
   return JSON.parse(payloadMessage?.content ?? "{}") as Record<string, unknown>;
+}
+
+function isRecordForTest(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function tool(name: string, input: string, output: string): Record<string, unknown> {

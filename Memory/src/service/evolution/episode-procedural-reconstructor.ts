@@ -1,4 +1,5 @@
 import type { LlmClient, LlmMessage } from "../../model/types.js";
+import { createMemoryLogger } from "../../logging/logger.js";
 import type { RawTurnRecord } from "../../storage/repositories.js";
 import { stableHash, stableStringify } from "../../utils/id.js";
 import { isRecord } from "../../utils/json.js";
@@ -8,7 +9,6 @@ import {
   applyStateDelta,
   emptyObservedState,
   type ObservedStateV1,
-  type StateDeltaOp,
   type StateDeltaOperation
 } from "./span-v3-model.js";
 import {
@@ -24,11 +24,16 @@ import {
 } from "./procedural-path-model.js";
 import { buildSpanTrajectory, type SpanTrajectoryAction } from "./span-trajectory.js";
 
-export const EPISODE_PROCEDURAL_RECONSTRUCTION_VERSION = "episode-procedural-reconstruction.v3" as const;
+export const EPISODE_PROCEDURAL_RECONSTRUCTION_VERSION = "episode-procedural-reconstruction.v6" as const;
 
-const STEP_SEMANTICS_OPERATION = "procedural.step_semantics.v1";
+const proceduralReconstructorLogger = createMemoryLogger("procedural-reconstructor");
+
+const TASK_CONTRACT_OPERATION = "procedural.task_contract.v1";
+const STEP_SEMANTICS_OPERATION = "procedural.step_semantics.v2";
 const SPAN_SEGMENTATION_OPERATION = "procedural.span_segmentation.v3.window";
 const SPAN_RECONCILIATION_OPERATION = "procedural.span_reconciliation.v2";
+const SPAN_CAPABILITY_OPERATION = "procedural.span_capability.v1";
+const SPAN_STATE_OPERATION = "procedural.span_state.v1";
 const MAX_SEMANTIC_REPAIR_ATTEMPTS = 2;
 const STEP_WINDOW_MAX_CANDIDATES = 30;
 const STEP_WINDOW_INPUT_CHAR_BUDGET = 30_000;
@@ -37,83 +42,76 @@ const PREVIOUS_TURN_CONTEXT_COUNT = 3;
 const TURN_CONTEXT_TEXT_MAX = 700;
 const STEP_CONTEXT_TEXT_MAX = 500;
 const RECONCILIATION_PROCEDURE_INTENT_MAX = 10;
+const MAX_STATE_COMPILATION_STEPS = 20;
 const TEXT_PREVIEW_MAX = 1_500;
 const EVENT_EVIDENCE_MAX = 900;
-const STATE_OPERATION_OUTPUT_KEYS = new Set(["op", "subject", "value", "status", "source_refs"]);
 
-export const EXECUTION_STEP_SEMANTICS_PROMPT = `You reconstruct evidence-grounded execution steps from an agent episode.
+export const TASK_CONTRACT_PROMPT = `You extract the user-authored task contract for one complete agent Episode.
 
-Each supplied step candidate is one observable action and its immediate result. Annotate what the action attempted, what happened, and only the state changes supported by supplied evidence. Do not group candidates into subtasks in this pass.
+Each observation is an immutable user message. Read its complete text and extract only information explicitly introduced by that message:
+- goal: the active task objective, or null when the message does not establish or change it;
+- constraints: requirements that restrict how the task may be performed;
+- acceptance_criteria: observable conditions that determine whether the requested result is acceptable.
 
-Tool-action candidates are procedural and must include=true. A response-generation candidate may include=false only when it is purely social or reports no substantive task effect. Every candidate must appear exactly once.
-
-Observation operations describe exogenous goals, constraints, corrections, feedback, or acceptance introduced by the user/environment. Step operations describe effects actually produced or discovered by that action. Never claim user-provided information as an action effect.
-
-Use retry_of_candidate_id only when the current action directly repeats substantially the same action against the same target after failure or inadequate progress. A changed query, alternate source, or changed strategy is not a retry.
-
-Use recovery_from_candidate_id when the current action changes strategy, source, or method in response to a prior failed/inadequate candidate. Both fields must reference an earlier supplied candidate and must not both be set on one step.
-
-A tool result with deterministic failure evidence must use outcome_status=failure. Use unknown only when the result is genuinely indeterminate, not for an observed error, HTTP failure, or failed command.
-
-Allowed operations:
-- goal.set, goal.refine, goal.complete
-- constraint.upsert, constraint.remove
-- fact.upsert, fact.invalidate
-- artifact.upsert, artifact.verify
-- issue.upsert, issue.resolve
-- verification.set
-- status.set, whose value/status must be one of: active, blocked, completed, failed
-
-HARD JSON CONTRACT FOR STATE OPERATIONS (exact and case-sensitive):
-- Every item in observations[*].operations and steps[*].operations must use exactly these field names: op, subject, optional value, optional status, source_refs.
-- The operation name field MUST be named "op". Never use "operation", "operation_type", "action", or any other alias.
-- The evidence field MUST be named "source_refs". Never use "sourceRefs", "sources", or any other alias.
-- Do not add fields outside: op, subject, value, status, source_refs.
-- If there is no evidence-grounded state change, return an empty operations array.
-- Every operation must contain a non-empty subject and a non-empty source_refs array.
-- Every operation and outcome evidence reference must cite supplied source_refs. Never invent a source reference.
-
-The only valid operation object shape is:
-{
-  "op": "fact.upsert",
-  "subject": "dependency_status",
-  "value": "incompatible versions observed",
-  "source_refs": ["turn:...:tool_result:0"]
-}
+Do not summarize tool execution, infer hidden requirements, or emit state operations. Every supplied source_id must appear exactly once. Keep concrete paths, formats, quantities, and named deliverables when they matter.
 
 Return JSON only:
 {
-  "observations": [
+  "contracts": [
     {
       "source_id": "turn:...:user",
-      "operations": [
-        {
-          "op": "goal.set",
-          "subject": "task_goal",
-          "value": "restore the failing tests",
-          "source_refs": ["turn:...:user"]
-        }
-      ]
+      "goal": "restore the failing build",
+      "constraints": ["keep NodeNext module resolution"],
+      "acceptance_criteria": ["the target build and tests pass"]
     }
-  ],
+  ]
+}`;
+
+export const EXECUTION_STEP_SEMANTICS_PROMPT = `You reconstruct evidence-grounded execution steps from an agent episode.
+
+Each supplied step candidate is one observable action and its immediate result. Compress it into:
+- intent: what the action attempted;
+- summary: what the supplied result actually established.
+
+Do not extract task state, observations, state operations, retries, recoveries, outcome labels, or evidence references. Those fields are derived elsewhere from immutable inputs. Do not group candidates into subtasks in this pass.
+
+Tool-action candidates are procedural and must include=true. A response-generation candidate may include=false only when it is purely social or reports no substantive task effect. Only objects inside stepCandidates are output candidates; precedingStepContext is read-only continuity context and must never be returned. Every stepCandidates item must appear exactly once.
+
+Return JSON only:
+{
   "steps": [
     {
       "candidate_id": "candidate_...",
       "include": true,
       "intent": "inspect the failing dependency resolution",
-      "summary": "Read the lockfile and observed incompatible versions.",
-      "outcome_status": "success",
-      "evidence_refs": ["turn:...:tool_result:0"],
-      "retry_of_candidate_id": null,
-      "recovery_from_candidate_id": null,
-      "operations": [
-        {
-          "op": "fact.upsert",
-          "subject": "dependency_status",
-          "value": "incompatible versions observed",
-          "source_refs": ["turn:...:tool_result:0"]
-        }
-      ]
+      "summary": "Read the lockfile and observed incompatible versions."
+    }
+  ]
+}`;
+
+export const PROCEDURAL_SPAN_STATE_PROMPT = `You compile evidence-grounded state changes for already segmented procedural spans.
+
+The Step pass has already compressed individual actions. Work at Span granularity: one output item describes the durable result of one complete local-subproblem lifecycle. Do not restate every Step and do not emit generic state-operation objects.
+
+Fields:
+- effects: durable facts or state changes established by the Span;
+- artifacts: files, documents, datasets, configurations, or other deliverables created, updated, or verified. Each artifact status must be exactly created, updated, or verified. Do not emit an artifact merely because it was read or inspected;
+- issues_opened: unresolved problems newly established by evidence;
+- issues_resolved: problems demonstrably resolved by the Span;
+- verification: observable checks and their result.
+
+Use only supplied evidence_refs. Empty arrays are valid. Every span_index must appear exactly once.
+
+Return JSON only:
+{
+  "spans": [
+    {
+      "span_index": 0,
+      "effects": [{"summary": "the incompatible dependency was corrected", "evidence_refs": ["step_..."]}],
+      "artifacts": [{"name": "package.json", "status": "updated", "evidence_refs": ["step_..."]}],
+      "issues_opened": [],
+      "issues_resolved": [{"issue": "dependency incompatibility", "evidence_refs": ["step_..."]}],
+      "verification": [{"criterion": "target tests pass", "status": "passed", "evidence_refs": ["step_..."]}]
     }
   ]
 }`;
@@ -141,7 +139,7 @@ Important rules:
 Local-goal rules:
 - local_goal is the canonical core objective of this Span, not a copy of the parent Episode goal.
 - Express it as one concise clause containing the concrete target object or capability and the desired observable outcome.
-- Ground both the target and outcome in the supplied step intents, summaries, pre/post states, and evidence.
+- Ground both the target and outcome in the supplied task contract, step intents, summaries, outcomes, and evidence.
 - Do not introduce a problem category, object, cause, or technology that is absent from the supplied evidence.
 - Prefer stable domain semantics over transient wording so equivalent executions in different Episodes receive semantically equivalent local_goal values.
 - Exclude phase numbers, turn references, user-facing reporting instructions, tool names, implementation sequence, and incidental failed attempts unless they define the subproblem.
@@ -180,7 +178,7 @@ Rules:
 - evidence_refs may cite only supplied step IDs or evidence references.
 
 Final local-goal rules:
-- Recompute final local_goal from procedureIntents, entryState, exitState, and evidence. Treat every provisional localGoal as a proposal, not authoritative truth.
+- Recompute final local_goal from the task contract, procedureIntents, entry/exit conditions, and evidence. Treat every provisional localGoal as a proposal, not authoritative truth.
 - If a provisional localGoal conflicts with the supplied procedureIntents or state transition, correct it.
 - Express local_goal as one concise clause containing the concrete target object or capability and the desired observable outcome.
 - When merging provisional Spans, describe their shared local subproblem instead of concatenating their labels.
@@ -201,6 +199,43 @@ type Output = {
     confidence: number;
   }>;
 };`;
+
+export const PROCEDURAL_SPAN_CAPABILITY_PROMPT = `You normalize already-final procedural spans into two independent reusable views.
+
+Span boundaries and concrete local_goal values are final and must not be changed.
+
+Definitions:
+- capability_goal answers WHAT reusable outcome is produced. Express one canonical operation over a functional input/output class.
+- procedure_semantic answers HOW the outcome is reached. Express an ordered strategy of 2-6 canonical verb phrases separated by " -> ".
+
+Shared abstraction rules:
+- Remove concrete subject matter, named entities, dates, quantities, filenames, paths, brands, organizations, locations, and tool or vendor names.
+- Normalize equivalent operations to stable vocabulary across unrelated Episodes.
+- File containers are not capability identity unless they change the functional artifact class: normalize Word/Markdown/plain text to document, but retain spreadsheet, presentation, dataset, code change, and configuration when materially relevant.
+- Do not use vague labels such as "complete the task", "process information", "perform research", or "generate output".
+- Distinguish evidence acquisition, artifact synthesis, revision, and verification when they are separate final Spans.
+
+capability_goal rules:
+- Keep only the core operation, functional input class, functional output/artifact class, and observable result.
+- Exclude method, tool, implementation sequence, retries, debugging, iterative refinement, formatting constraints, quality criteria, and incidental failure/recovery details. Those belong to procedure_semantic or the state contract.
+- Prefer a medium-grained canonical clause such as "generate a formatted document from source material", not a task-specific paraphrase.
+
+procedure_semantic rules:
+- Preserve the reusable control flow that distinguishes materially different ways to achieve the same goal.
+- Normalize concrete calls into canonical phases such as inspect inputs, acquire evidence, synthesize, transform, render, validate, revise, or verify.
+- Include recovery/revision only when it is a meaningful part of the demonstrated strategy; omit one-off errors and concrete outcomes.
+- Do not repeat the capability_goal, domain nouns, file names, libraries, commands, or vendor/tool names.
+
+Every supplied span_index must appear exactly once. Return JSON only:
+{
+  "spans": [
+    {
+      "span_index": 0,
+      "capability_goal": "generate a formatted document from source material",
+      "procedure_semantic": "inspect requirements and inputs -> synthesize document content -> render the artifact -> validate structure and constraints -> revise until compliant"
+    }
+  ]
+}`;
 
 export interface ExecutionStepCandidateV1 {
   id: string;
@@ -225,9 +260,11 @@ interface TurnFrame {
   candidates: ExecutionStepCandidateV1[];
 }
 
-interface ObservationSemantics {
+interface TaskContractSemantics {
   sourceId: string;
-  operations: StateDeltaOperation[];
+  goal?: string;
+  constraints: string[];
+  acceptanceCriteria: string[];
 }
 
 interface StepSemantics {
@@ -235,11 +272,28 @@ interface StepSemantics {
   include: boolean;
   intent: string;
   summary: string;
-  outcomeStatus: ExecutionStepOutcome;
+}
+
+interface SpanStateEvidenceItem {
+  text: string;
   evidenceRefs: string[];
-  retryOfCandidateId?: string;
-  recoveryFromCandidateId?: string;
-  operations: StateDeltaOperation[];
+}
+
+interface SpanArtifactStateItem extends SpanStateEvidenceItem {
+  status: "created" | "updated" | "verified";
+}
+
+interface SpanVerificationStateItem extends SpanStateEvidenceItem {
+  status: "passed" | "failed" | "partial" | "unknown";
+}
+
+interface SpanStateSemantics {
+  spanIndex: number;
+  effects: SpanStateEvidenceItem[];
+  artifacts: SpanArtifactStateItem[];
+  issuesOpened: SpanStateEvidenceItem[];
+  issuesResolved: SpanStateEvidenceItem[];
+  verification: SpanVerificationStateItem[];
 }
 
 interface ProvisionalSpanDecision extends SpanSegmentationDecisionV1 {
@@ -252,6 +306,7 @@ interface ProvisionalSpanDecision extends SpanSegmentationDecisionV1 {
 
 interface ReconstructorDeps {
   llm: LlmClient;
+  mode?: "span" | "step_sequence";
 }
 
 export class EpisodeProceduralReconstructor {
@@ -275,19 +330,65 @@ export class EpisodeProceduralReconstructor {
       userSourceId: userSourceId(rawTurn.id),
       candidates: buildTurnStepCandidates(rawTurn, turnIndex)
     }));
+    const taskContracts = await this.extractTaskContracts(input.episodeId, frames);
     const semantics = await this.extractStepSemantics(input.episodeId, frames);
-    const materialized = materializeExecutionSteps({
+    const skeleton = materializeExecutionSteps({
       episodeId: input.episodeId,
       frames,
+      taskContracts,
       semantics,
       sourceSnapshotHash,
       model: this.deps.llm.config.model
     });
-    const decisions = await this.segmentSpans({
+    if (this.deps.mode === "step_sequence") {
+      const decisions = compatibilitySpanDecisions(
+        skeleton.steps,
+        taskContracts,
+        input.terminalReward
+      );
+      const spans = compileProceduralSpans({
+        episodeId: input.episodeId,
+        steps: skeleton.steps,
+        decisions,
+        sourceSnapshotHash,
+        model: this.deps.llm.config.model
+      });
+      return buildEpisodeProceduralPath({
+        episodeId: input.episodeId,
+        states: skeleton.states,
+        steps: skeleton.steps,
+        spans,
+        segmentationDecisions: decisions,
+        sourceSnapshotHash,
+        ...(input.terminalReward === undefined ? {} : { terminalReward: input.terminalReward })
+      });
+    }
+    const boundaryDecisions = await this.segmentSpans({
       episodeId: input.episodeId,
       rawTurns,
-      steps: materialized.steps,
-      states: materialized.states
+      taskContracts,
+      steps: skeleton.steps
+    });
+    const decisions = await this.compileSpanCapabilities({
+      episodeId: input.episodeId,
+      steps: skeleton.steps,
+      decisions: boundaryDecisions
+    });
+    const spanStates = await this.compileSpanStates({
+      episodeId: input.episodeId,
+      taskContracts,
+      steps: skeleton.steps,
+      decisions
+    });
+    const materialized = materializeExecutionSteps({
+      episodeId: input.episodeId,
+      frames,
+      taskContracts,
+      semantics,
+      decisions,
+      spanStates,
+      sourceSnapshotHash,
+      model: this.deps.llm.config.model
     });
     const spans = compileProceduralSpans({
       episodeId: input.episodeId,
@@ -307,14 +408,60 @@ export class EpisodeProceduralReconstructor {
     });
   }
 
+  private async extractTaskContracts(
+    episodeId: string,
+    frames: readonly TurnFrame[]
+  ): Promise<TaskContractSemantics[]> {
+    if (frames.length === 0) return [];
+    type TaskContractResult = { contracts?: unknown };
+    const messages: LlmMessage[] = [
+      { role: "system", content: TASK_CONTRACT_PROMPT },
+      {
+        role: "user",
+        content: stableStringify({
+          episodeId,
+          observations: frames.map((frame) => ({
+            sourceId: frame.userSourceId,
+            rawTurnId: frame.rawTurn.id,
+            userText: fullTaskText(frame.rawTurn.userText)
+          }))
+        })
+      }
+    ];
+    const options = {
+      operation: TASK_CONTRACT_OPERATION,
+      thinkingMode: "disabled" as const,
+      temperature: 0,
+      maxTokens: Math.max(1_600, Math.min(6_000, frames.length * 600))
+    };
+    let result = await this.deps.llm.completeJson<TaskContractResult>(messages, options);
+    for (let repairAttempt = 0; ; repairAttempt += 1) {
+      try {
+        return parseTaskContracts(result.contracts, frames);
+      } catch (error) {
+        if (repairAttempt >= MAX_SEMANTIC_REPAIR_ATTEMPTS) throw error;
+        const repairNumber = repairAttempt + 1;
+        result = await this.deps.llm.completeJson<TaskContractResult>([
+          ...messages,
+          { role: "assistant", content: stableStringify(result) },
+          {
+            role: "user",
+            content: contractRepairInstruction(error, repairNumber)
+          }
+        ], {
+          ...options,
+          operation: `${TASK_CONTRACT_OPERATION}.repair.${repairNumber}`
+        });
+      }
+    }
+  }
+
   private async extractStepSemantics(
     episodeId: string,
     frames: readonly TurnFrame[]
-  ): Promise<{ observations: ObservationSemantics[]; steps: StepSemantics[] }> {
+  ): Promise<StepSemantics[]> {
     const allCandidates = frames.flatMap((frame) => frame.candidates);
-    if (allCandidates.length === 0) return { observations: [], steps: [] };
-    const allowedRefs = candidateSourceRefs(frames);
-    const observations: ObservationSemantics[] = [];
+    if (allCandidates.length === 0) return [];
     const steps: StepSemantics[] = [];
     const processedCandidates: ExecutionStepCandidateV1[] = [];
     const semanticsByCandidate = new Map<string, StepSemantics>();
@@ -330,20 +477,16 @@ export class EpisodeProceduralReconstructor {
             frame.turnIndex
           ),
           windowIndex,
-          observationFrames: windowIndex === 0 ? [frame] : [],
           precedingCandidates,
           candidates,
-          referenceCandidates: [...processedCandidates, ...candidates],
-          semanticsByCandidate,
-          allowedRefs
+          semanticsByCandidate
         });
-        observations.push(...parsed.observations);
-        steps.push(...parsed.steps);
-        for (const semantics of parsed.steps) semanticsByCandidate.set(semantics.candidateId, semantics);
+        steps.push(...parsed);
+        for (const semantics of parsed) semanticsByCandidate.set(semantics.candidateId, semantics);
         processedCandidates.push(...candidates);
       }
     }
-    return { observations, steps };
+    return steps;
   }
 
   private async extractStepSemanticsWindow(input: {
@@ -351,14 +494,11 @@ export class EpisodeProceduralReconstructor {
     frame: TurnFrame;
     previousTurns: readonly TurnFrame[];
     windowIndex: number;
-    observationFrames: readonly TurnFrame[];
     precedingCandidates: readonly ExecutionStepCandidateV1[];
     candidates: readonly ExecutionStepCandidateV1[];
-    referenceCandidates: readonly ExecutionStepCandidateV1[];
     semanticsByCandidate: ReadonlyMap<string, StepSemantics>;
-    allowedRefs: ReadonlySet<string>;
-  }): Promise<{ observations: ObservationSemantics[]; steps: StepSemantics[] }> {
-    type StepSemanticResult = { observations?: unknown; steps?: unknown };
+  }): Promise<StepSemantics[]> {
+    type StepSemanticResult = { steps?: unknown };
     const messages: LlmMessage[] = [
       { role: "system", content: EXECUTION_STEP_SEMANTICS_PROMPT },
       {
@@ -376,24 +516,13 @@ export class EpisodeProceduralReconstructor {
           precedingStepContext: input.precedingCandidates.map((candidate) => {
             const semantics = input.semanticsByCandidate.get(candidate.id);
             return {
-              candidateId: candidate.id,
-              rawTurnId: candidate.rawTurnId,
               action: candidate.action,
               toolName: candidate.toolName,
               heuristicSuccess: candidate.heuristicSuccess,
               intent: semantics?.intent,
-              summary: contextText(semantics?.summary),
-              outcome: semantics?.outcomeStatus,
-              retryOfCandidateId: semantics?.retryOfCandidateId,
-              recoveryFromCandidateId: semantics?.recoveryFromCandidateId
+              summary: contextText(semantics?.summary)
             };
           }),
-          observations: input.observationFrames.map((frame) => ({
-            sourceId: frame.userSourceId,
-            sourceRefs: [frame.userSourceId],
-            rawTurnId: frame.rawTurn.id,
-            userText: preview(frame.rawTurn.userText)
-          })),
           stepCandidates: input.candidates.map((candidate) => ({
             candidateId: candidate.id,
             rawTurnId: candidate.rawTurnId,
@@ -413,25 +542,22 @@ export class EpisodeProceduralReconstructor {
       operation: `${STEP_SEMANTICS_OPERATION}.window`,
       thinkingMode: "disabled" as const,
       temperature: 0,
-      maxTokens: Math.max(3_000, Math.min(12_000, input.candidates.length * 450))
+      maxTokens: Math.max(1_600, Math.min(5_000, input.candidates.length * 160))
     };
     let result = await this.deps.llm.completeJson<StepSemanticResult>(messages, options);
     for (let repairAttempt = 0; ; repairAttempt += 1) {
       try {
-        return parseStepSemanticResult(
-          result,
-          input.observationFrames,
-          input.candidates,
-          input.referenceCandidates,
-          input.allowedRefs
-        );
+        return parseStepSemantics(result.steps, input.candidates);
       } catch (error) {
         if (repairAttempt >= MAX_SEMANTIC_REPAIR_ATTEMPTS) throw error;
         const repairNumber = repairAttempt + 1;
         result = await this.deps.llm.completeJson<StepSemanticResult>([
           ...messages,
           { role: "assistant", content: stableStringify(result) },
-          { role: "user", content: stepSemanticRepairInstruction(error, repairNumber) }
+          {
+            role: "user",
+            content: stepSemanticRepairInstruction(error, repairNumber, input.candidates)
+          }
         ], {
           ...options,
           operation: `${STEP_SEMANTICS_OPERATION}.repair.${repairNumber}`
@@ -440,14 +566,148 @@ export class EpisodeProceduralReconstructor {
     }
   }
 
+  private async compileSpanCapabilities(input: {
+    episodeId: string;
+    steps: readonly ExecutionStepV1[];
+    decisions: readonly SpanSegmentationDecisionV1[];
+  }): Promise<SpanSegmentationDecisionV1[]> {
+    if (input.decisions.length === 0) return [];
+    type SpanCapabilityResult = { spans?: unknown };
+    const stepById = new Map(input.steps.map((step) => [step.id, step]));
+    const messages: LlmMessage[] = [
+      { role: "system", content: PROCEDURAL_SPAN_CAPABILITY_PROMPT },
+      {
+        role: "user",
+        content: stableStringify({
+          episodeId: input.episodeId,
+          spans: input.decisions.map((decision) => ({
+            spanIndex: decision.spanIndex,
+            localGoal: decision.localGoal,
+            entryCondition: decision.entryCondition,
+            exitCondition: decision.exitCondition,
+            terminationStatus: decision.terminationStatus,
+            procedure: selectStateCompilationSteps(
+              decision.stepIds.map((stepId) => stepById.get(stepId)!)
+            ).map((step) => ({
+              intent: contextText(step.action.intent),
+              summary: contextText(step.action.summary),
+              outcome: step.outcome.status
+            }))
+          }))
+        })
+      }
+    ];
+    const options = {
+      operation: SPAN_CAPABILITY_OPERATION,
+      thinkingMode: "disabled" as const,
+      temperature: 0,
+      maxTokens: Math.max(1_600, Math.min(5_000, input.decisions.length * 500))
+    };
+    let result = await this.deps.llm.completeJson<SpanCapabilityResult>(messages, options);
+    for (let repairAttempt = 0; ; repairAttempt += 1) {
+      try {
+        const abstractions = parseSpanCapabilities(result.spans, input.decisions);
+        return input.decisions.map((decision) => ({
+          ...decision,
+          capabilityGoal: abstractions.get(decision.spanIndex)!.capabilityGoal,
+          procedureSemantic: abstractions.get(decision.spanIndex)!.procedureSemantic
+        }));
+      } catch (error) {
+        if (repairAttempt >= MAX_SEMANTIC_REPAIR_ATTEMPTS) throw error;
+        const repairNumber = repairAttempt + 1;
+        result = await this.deps.llm.completeJson<SpanCapabilityResult>([
+          ...messages,
+          { role: "assistant", content: stableStringify(result) },
+          { role: "user", content: spanCapabilityRepairInstruction(error, repairNumber) }
+        ], {
+          ...options,
+          operation: `${SPAN_CAPABILITY_OPERATION}.repair.${repairNumber}`
+        });
+      }
+    }
+  }
+
+  private async compileSpanStates(input: {
+    episodeId: string;
+    taskContracts: readonly TaskContractSemantics[];
+    steps: readonly ExecutionStepV1[];
+    decisions: readonly SpanSegmentationDecisionV1[];
+  }): Promise<SpanStateSemantics[]> {
+    if (input.decisions.length === 0) return [];
+    type SpanStateResult = { spans?: unknown };
+    const stepById = new Map(input.steps.map((step) => [step.id, step]));
+    const messages: LlmMessage[] = [
+      { role: "system", content: PROCEDURAL_SPAN_STATE_PROMPT },
+      {
+        role: "user",
+        content: stableStringify({
+          episodeId: input.episodeId,
+          taskContract: compactTaskContracts(input.taskContracts),
+          spans: input.decisions.map((decision) => {
+            const steps = decision.stepIds.map((stepId) => stepById.get(stepId)!);
+            const stateCompilationSteps = selectStateCompilationSteps(steps);
+            return {
+              spanIndex: decision.spanIndex,
+              localGoal: decision.localGoal,
+              entryCondition: decision.entryCondition,
+              exitCondition: decision.exitCondition,
+              terminationStatus: decision.terminationStatus,
+              evidenceRefs: unique([
+                ...decision.evidenceRefs,
+                ...steps.flatMap(stepEvidenceRefs)
+              ]),
+              stepCount: steps.length,
+              steps: stateCompilationSteps.map(compactExecutionStep)
+            };
+          })
+        })
+      }
+    ];
+    const options = {
+      operation: SPAN_STATE_OPERATION,
+      thinkingMode: "disabled" as const,
+      temperature: 0,
+      maxTokens: Math.max(2_000, Math.min(8_000, input.decisions.length * 800))
+    };
+    let result = await this.deps.llm.completeJson<SpanStateResult>(messages, options);
+    for (let repairAttempt = 0; ; repairAttempt += 1) {
+      try {
+        return parseSpanStates(result.spans, input.decisions, stepById);
+      } catch (error) {
+        if (repairAttempt >= MAX_SEMANTIC_REPAIR_ATTEMPTS) {
+          const sanitized = parseSpanStates(result.spans, input.decisions, stepById, {
+            dropInvalidEvidenceRefs: true
+          });
+          proceduralReconstructorLogger.warn("span_state.invalid_evidence_refs_dropped", {
+            episodeId: input.episodeId,
+            repairAttempts: repairAttempt,
+            validationError: error instanceof Error ? error.message : String(error)
+          });
+          return sanitized;
+        }
+        const repairNumber = repairAttempt + 1;
+        result = await this.deps.llm.completeJson<SpanStateResult>([
+          ...messages,
+          { role: "assistant", content: stableStringify(result) },
+          {
+            role: "user",
+            content: spanStateRepairInstruction(error, repairNumber)
+          }
+        ], {
+          ...options,
+          operation: `${SPAN_STATE_OPERATION}.repair.${repairNumber}`
+        });
+      }
+    }
+  }
+
   private async segmentSpans(input: {
     episodeId: string;
     rawTurns: readonly RawTurnRecord[];
+    taskContracts: readonly TaskContractSemantics[];
     steps: readonly ExecutionStepV1[];
-    states: readonly ObservedStateV1[];
   }): Promise<SpanSegmentationDecisionV1[]> {
     if (input.steps.length === 0) return [];
-    const stateById = new Map(input.states.map((state) => [state.id, state]));
     const allowedRefs = new Set(input.steps.flatMap((step) => [
       step.id,
       ...step.action.eventRefs,
@@ -479,7 +739,7 @@ export class EpisodeProceduralReconstructor {
           precedingSteps,
           steps,
           openSpan,
-          stateById,
+          taskContracts: input.taskContracts,
           allowedRefs
         });
         proposals.push(...local);
@@ -496,7 +756,7 @@ export class EpisodeProceduralReconstructor {
       rawTurns: input.rawTurns,
       proposals,
       steps: input.steps,
-      stateById,
+      taskContracts: input.taskContracts,
       allowedRefs
     });
   }
@@ -512,7 +772,7 @@ export class EpisodeProceduralReconstructor {
     precedingSteps: readonly ExecutionStepV1[];
     steps: readonly ExecutionStepV1[];
     openSpan?: ProvisionalSpanDecision;
-    stateById: ReadonlyMap<string, ObservedStateV1>;
+    taskContracts: readonly TaskContractSemantics[];
     allowedRefs: ReadonlySet<string>;
   }): Promise<ProvisionalSpanDecision[]> {
     type SegmentationResult = { spans?: unknown };
@@ -530,11 +790,12 @@ export class EpisodeProceduralReconstructor {
             hasFollowingWindow: input.hasFollowingWindow,
             hasFollowingTurn: input.hasFollowingTurn
           },
+          taskContract: compactTaskContracts(input.taskContracts),
           previousTurns: input.previousTurns.map(compactRawTurn),
           currentTurn: compactRawTurn(input.rawTurn),
-          precedingStepContext: input.precedingSteps.map((step) => compactExecutionStep(step, input.stateById)),
+          precedingStepContext: input.precedingSteps.map(compactExecutionStep),
           openSpan: input.openSpan ? compactProvisionalSpan(input.openSpan) : null,
-          steps: input.steps.map((step) => compactExecutionStep(step, input.stateById))
+          steps: input.steps.map(compactExecutionStep)
         })
       }
     ];
@@ -568,7 +829,7 @@ export class EpisodeProceduralReconstructor {
     rawTurns: readonly RawTurnRecord[];
     proposals: readonly ProvisionalSpanDecision[];
     steps: readonly ExecutionStepV1[];
-    stateById: ReadonlyMap<string, ObservedStateV1>;
+    taskContracts: readonly TaskContractSemantics[];
     allowedRefs: ReadonlySet<string>;
   }): Promise<SpanSegmentationDecisionV1[]> {
     type ReconciliationResult = { spans?: unknown };
@@ -580,6 +841,7 @@ export class EpisodeProceduralReconstructor {
         content: stableStringify({
           episodeId: input.episodeId,
           episodeGoal: contextText(input.rawTurns.find((turn) => turn.userText?.trim())?.userText),
+          taskContract: compactTaskContracts(input.taskContracts),
           turnCount: input.rawTurns.length,
           stepCount: input.steps.length,
           provisionalSpans: input.proposals.map((proposal) => ({
@@ -599,13 +861,7 @@ export class EpisodeProceduralReconstructor {
             openAtWindowEnd: proposal.openAtWindowEnd,
             reason: proposal.reason,
             confidence: proposal.confidence,
-            procedureIntents: reconciliationProcedureIntents(proposal, stepById),
-            entryState: input.stateById.get(
-              stepById.get(proposal.stepIds[0] ?? "")?.preStateId ?? ""
-            )?.summary,
-            exitState: input.stateById.get(
-              stepById.get(proposal.stepIds.at(-1) ?? "")?.postStateId ?? ""
-            )?.summary
+            procedureIntents: reconciliationProcedureIntents(proposal, stepById)
           }))
         })
       }
@@ -636,27 +892,85 @@ export class EpisodeProceduralReconstructor {
   }
 }
 
-function parseStepSemanticResult(
-  result: { observations?: unknown; steps?: unknown },
-  frames: readonly TurnFrame[],
-  candidates: readonly ExecutionStepCandidateV1[],
-  referenceCandidates: readonly ExecutionStepCandidateV1[],
-  allowedRefs: ReadonlySet<string>
-): { observations: ObservationSemantics[]; steps: StepSemantics[] } {
-  return {
-    observations: parseObservationSemantics(result.observations, frames, allowedRefs),
-    steps: parseStepSemantics(result.steps, candidates, referenceCandidates, allowedRefs)
-  };
+function stepSemanticRepairInstruction(
+  error: unknown,
+  repairNumber: number,
+  candidates: readonly ExecutionStepCandidateV1[]
+): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const allowedCandidateIds = candidates.map((candidate) => candidate.id);
+  const common = `Deterministic validation error: ${message}\nThe complete and exclusive allowed candidate_id list is: ${stableStringify(allowedCandidateIds)}. Return each ID from this list exactly once and return no other ID. precedingStepContext is read-only and is not output. Return the complete corrected JSON object only. Each item must contain only candidate_id, include, intent, and summary. Do not add state, outcome, retry, recovery, or evidence fields. Do not add markdown, explanation, comments, or extra top-level fields.`;
+  if (repairNumber === 1) {
+    return `This is a strict schema-repair task, not a request to reinterpret the episode. Correct the previous JSON.\n${common}`;
+  }
+  return `The previous repair still failed. Discard the previous JSON and regenerate the entire response from the original episode payload and schema. Do not patch or paraphrase the malformed object.\n${common}\nBefore returning, verify that the complete response is one JSON object and every supplied candidate appears exactly once.`;
 }
 
-function stepSemanticRepairInstruction(error: unknown, repairNumber: number): string {
+function contractRepairInstruction(error: unknown, repairNumber: number): string {
   const message = error instanceof Error ? error.message : String(error);
-  const exactContract = `Every observations[*].operations[*] and steps[*].operations[*] object MUST use the exact case-sensitive field names "op", "subject", optional "value", optional "status", and "source_refs". The operation field MUST be "op"; "operation", "operation_type", and "action" are forbidden. The evidence field MUST be "source_refs"; "sourceRefs" and "sources" are forbidden. The only allowed op values are: goal.set, goal.refine, goal.complete, constraint.upsert, constraint.remove, fact.upsert, fact.invalidate, artifact.upsert, artifact.verify, issue.upsert, issue.resolve, verification.set, status.set.`;
-  const common = `Deterministic validation error: ${message}\n${exactContract}\nReturn the complete corrected JSON object only. Preserve every supplied observation source and candidate exactly once. Use only supplied source references. Do not add markdown, explanation, comments, or extra top-level fields.`;
-  if (repairNumber === 1) {
-    return `This is a strict schema-repair task, not a request to reinterpret the episode. Correct the previous JSON.\n${common}\nINVALID: {"operation":"fact.upsert","subject":"dependency_status","source_refs":["turn:...:tool_result:0"]}\nVALID: {"op":"fact.upsert","subject":"dependency_status","source_refs":["turn:...:tool_result:0"]}`;
-  }
-  return `The previous repair still failed. Discard the previous JSON and regenerate the entire response from the original episode payload and schema. Do not patch or paraphrase the malformed object.\n${common}\nBefore returning, verify that every operation object contains the literal key "op", contains no key named "operation", and that the complete response is one JSON object.`;
+  const prefix = repairNumber === 1
+    ? "Correct the previous task-contract JSON."
+    : "The previous repair still failed. Discard it and regenerate the complete task-contract JSON.";
+  return `${prefix}\nDeterministic validation error: ${message}\nReturn every supplied source_id exactly once with goal, constraints, and acceptance_criteria. Return JSON only.`;
+}
+
+function spanStateRepairInstruction(error: unknown, repairNumber: number): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const prefix = repairNumber === 1
+    ? "Correct the previous Span-state JSON."
+    : "The previous repair still failed. Discard it and regenerate the complete Span-state JSON.";
+  return `${prefix}\nDeterministic validation error: ${message}\nReturn every supplied span_index exactly once. Use only supplied evidence_refs. Artifact status must be exactly created, updated, or verified; omit merely read or inspected artifacts. Verification status must be exactly passed, failed, partial, or unknown. Return JSON only.`;
+}
+
+function spanCapabilityRepairInstruction(error: unknown, repairNumber: number): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const prefix = repairNumber === 1
+    ? "Correct the previous capability-goal JSON without changing any Span boundary."
+    : "Discard the previous repair and regenerate the complete capability-goal JSON.";
+  return `${prefix}\nDeterministic validation error: ${message}\nReturn every supplied span_index exactly once with only span_index, capability_goal, and procedure_semantic. Keep WHAT and HOW independent. Return JSON only.`;
+}
+
+/**
+ * The Step-sequence learner does not use semantic Span boundaries. A single
+ * deterministic compatibility Span keeps the versioned Path readable by
+ * older diagnostics without paying for segmentation, reconciliation,
+ * capability compilation, or Span-state LLM calls.
+ */
+function compatibilitySpanDecisions(
+  steps: readonly ExecutionStepV1[],
+  taskContracts: readonly TaskContractSemantics[],
+  terminalReward: number | undefined
+): SpanSegmentationDecisionV1[] {
+  if (steps.length === 0) return [];
+  const first = steps[0]!;
+  const last = steps.at(-1)!;
+  const explicitGoal = taskContracts.find((contract) => contract.goal)?.goal;
+  const localGoal = (contextText(explicitGoal ?? first.action.intent) ?? "Execute the observed procedure")
+    .slice(0, 600);
+  const procedureSemantic = steps
+    .map((step) => contextText(step.action.intent))
+    .filter(Boolean)
+    .join(" -> ")
+    .slice(0, 2_000);
+  const terminationStatus = terminalReward !== undefined && terminalReward < 0
+    ? "failure" as const
+    : last.outcome.status === "failure"
+      ? "failure" as const
+      : "success" as const;
+  return [{
+    spanIndex: 0,
+    stepIds: steps.map((step) => step.id),
+    localGoal,
+    capabilityGoal: localGoal,
+    procedureSemantic: procedureSemantic ||
+      (contextText(last.action.summary) ?? "Complete the observed execution").slice(0, 2_000),
+    entryCondition: `Episode execution starts before Step ${first.stepIndex}`,
+    exitCondition: (contextText(last.action.summary) ?? "Episode execution completed").slice(0, 1_000),
+    terminationStatus,
+    evidenceRefs: unique(steps.flatMap((step) => [step.id, ...step.outcome.evidenceRefs])).slice(0, 64),
+    reason: "Deterministic compatibility envelope for Step-sequence learning; not a learned Span boundary.",
+    confidence: 1
+  }];
 }
 
 function segmentationRepairInstruction(error: unknown, coverageField: string, repairNumber: number): string {
@@ -702,10 +1016,7 @@ function compactRawTurn(turn: RawTurnRecord): Record<string, unknown> {
   };
 }
 
-function compactExecutionStep(
-  step: ExecutionStepV1,
-  stateById: ReadonlyMap<string, ObservedStateV1>
-): Record<string, unknown> {
+function compactExecutionStep(step: ExecutionStepV1): Record<string, unknown> {
   return {
     stepId: step.id,
     stepIndex: step.stepIndex,
@@ -716,14 +1027,23 @@ function compactExecutionStep(
     intent: contextText(step.action.intent),
     summary: contextText(step.action.summary),
     outcome: step.outcome.status,
-    retryOfStepId: step.retryOfStepId,
-    recoveryFromStepId: step.recoveryFromStepId,
-    evidenceRefs: [...new Set([...step.action.eventRefs, ...step.outcome.evidenceRefs])],
-    preState: contextText(stateById.get(step.preStateId)?.summary),
-    postState: contextText(stateById.get(step.postStateId)?.summary),
-    actionDeltaOps: step.actionEffectDelta.map((operation) => operation.op),
-    externalObservationOps: step.externalObservationDelta.map((operation) => operation.op)
+    evidenceRefs: stepEvidenceRefs(step)
   };
+}
+
+function stepEvidenceRefs(step: ExecutionStepV1): string[] {
+  return unique([step.id, ...step.action.eventRefs, ...step.outcome.evidenceRefs]);
+}
+
+function compactTaskContracts(
+  taskContracts: readonly TaskContractSemantics[]
+): Array<Record<string, unknown>> {
+  return taskContracts.map((contract) => ({
+    sourceId: contract.sourceId,
+    goal: contract.goal,
+    constraints: contract.constraints,
+    acceptanceCriteria: contract.acceptanceCriteria
+  }));
 }
 
 function compactProvisionalSpan(proposal: ProvisionalSpanDecision): Record<string, unknown> {
@@ -749,6 +1069,27 @@ function reconciliationProcedureIntents(
   const intents = proposal.stepIds.map((stepId) => contextText(stepById.get(stepId)?.action.intent))
     .filter((intent): intent is string => Boolean(intent));
   return [...new Set(intents)].slice(0, RECONCILIATION_PROCEDURE_INTENT_MAX);
+}
+
+function selectStateCompilationSteps(steps: readonly ExecutionStepV1[]): ExecutionStepV1[] {
+  if (steps.length <= MAX_STATE_COMPILATION_STEPS) return [...steps];
+  const selected = new Map<number, ExecutionStepV1>();
+  const add = (step: ExecutionStepV1 | undefined): void => {
+    if (step) selected.set(step.stepIndex, step);
+  };
+  add(steps[0]);
+  add(steps.at(-1));
+  for (const step of steps) {
+    if (step.outcome.status === "failure" || step.retryOfStepId || step.recoveryFromStepId) add(step);
+  }
+  const remaining = Math.max(0, MAX_STATE_COMPILATION_STEPS - selected.size);
+  for (let slot = 1; slot <= remaining; slot += 1) {
+    const index = Math.round((slot * (steps.length - 1)) / (remaining + 1));
+    add(steps[index]);
+  }
+  return [...selected.values()]
+    .sort((left, right) => left.stepIndex - right.stepIndex)
+    .slice(0, MAX_STATE_COMPILATION_STEPS);
 }
 
 function finalDecisionsFromProposals(
@@ -825,15 +1166,18 @@ export function buildTurnStepCandidates(
 function materializeExecutionSteps(input: {
   episodeId: string;
   frames: readonly TurnFrame[];
-  semantics: { observations: readonly ObservationSemantics[]; steps: readonly StepSemantics[] };
+  taskContracts: readonly TaskContractSemantics[];
+  semantics: readonly StepSemantics[];
+  decisions?: readonly SpanSegmentationDecisionV1[];
+  spanStates?: readonly SpanStateSemantics[];
   sourceSnapshotHash: string;
   model?: string;
 }): { states: ObservedStateV1[]; steps: ExecutionStepV1[] } {
-  const observationBySource = new Map(
-    input.semantics.observations.map((observation) => [observation.sourceId, observation.operations])
+  const taskContractBySource = new Map(
+    input.taskContracts.map((contract) => [contract.sourceId, contract])
   );
   const semanticsByCandidate = new Map(
-    input.semantics.steps.map((semantics) => [semantics.candidateId, semantics])
+    input.semantics.map((semantics) => [semantics.candidateId, semantics])
   );
   const includedCandidates = input.frames
     .flatMap((frame) => frame.candidates)
@@ -849,9 +1193,16 @@ function materializeExecutionSteps(input: {
   ]));
   const states: ObservedStateV1[] = [];
   const steps: ExecutionStepV1[] = [];
+  const decisionByFinalStepId = new Map(
+    (input.decisions ?? []).map((decision) => [decision.stepIds.at(-1)!, decision])
+  );
+  const spanStateByIndex = new Map(
+    (input.spanStates ?? []).map((spanState) => [spanState.spanIndex, spanState])
+  );
   let state = emptyObservedState();
   states.push(state);
   let pendingObservationOps: StateDeltaOperation[] = [];
+  let previousIncludedCandidate: ExecutionStepCandidateV1 | undefined;
 
   const applyPendingObservation = (): void => {
     if (pendingObservationOps.length === 0) return;
@@ -867,24 +1218,33 @@ function materializeExecutionSteps(input: {
   };
 
   for (const frame of input.frames) {
-    pendingObservationOps.push(...(observationBySource.get(frame.userSourceId) ?? []));
+    const taskContract = taskContractBySource.get(frame.userSourceId);
+    if (taskContract) {
+      pendingObservationOps.push(...taskContractOperations(taskContract, state));
+    }
     for (const candidate of frame.candidates) {
       const semantics = semanticsByCandidate.get(candidate.id);
       if (!semantics?.include) continue;
       applyPendingObservation();
       const preState = state;
-      const actionPostState = applyStateDelta(preState, semantics.operations);
-      states.push(actionPostState);
       const stepId = stepIdByCandidate.get(candidate.id)!;
-      const retryOfStepId = semantics.retryOfCandidateId
-        ? stepIdByCandidate.get(semantics.retryOfCandidateId)
-        : undefined;
-      const recoveryFromStepId = semantics.recoveryFromCandidateId
-        ? stepIdByCandidate.get(semantics.recoveryFromCandidateId)
-        : undefined;
-      const outcomeStatus = candidate.heuristicSuccess
-        ? semantics.outcomeStatus
-        : "failure";
+      const decision = decisionByFinalStepId.get(stepId);
+      const actionEffectDelta = decision
+        ? spanStateOperations(
+            spanStateByIndex.get(decision.spanIndex),
+            decision,
+            decision.spanIndex === (input.decisions?.length ?? 0) - 1
+          )
+        : [];
+      const actionPostState = applyStateDelta(preState, actionEffectDelta);
+      states.push(actionPostState);
+      const previousStep = steps.at(-1);
+      const relationship = inferFailureRelationship({
+        candidate,
+        previousCandidate: previousIncludedCandidate,
+        previousStep
+      });
+      const outcomeStatus: ExecutionStepOutcome = candidate.heuristicSuccess ? "success" : "failure";
       steps.push({
         id: stepId,
         schemaVersion: EXECUTION_STEP_SCHEMA_VERSION,
@@ -902,16 +1262,15 @@ function materializeExecutionSteps(input: {
           ...(candidate.toolName ? { toolName: candidate.toolName } : {}),
           ...(candidate.toolCallIndex === undefined ? {} : { toolCallIndex: candidate.toolCallIndex })
         },
-        actionEffectDelta: semantics.operations,
+        actionEffectDelta,
         actionPostStateId: actionPostState.id,
         externalObservationDelta: [],
         postStateId: actionPostState.id,
         outcome: {
           status: outcomeStatus,
-          evidenceRefs: semantics.evidenceRefs
+          evidenceRefs: [...candidate.sourceRefs]
         },
-        ...(retryOfStepId ? { retryOfStepId } : {}),
-        ...(recoveryFromStepId ? { recoveryFromStepId } : {}),
+        ...relationship,
         cost: {
           toolCalls: candidate.toolCalls,
           errorCount: outcomeStatus === "failure" ? Math.max(1, candidate.errorCount) : candidate.errorCount
@@ -923,10 +1282,117 @@ function materializeExecutionSteps(input: {
         }
       });
       state = actionPostState;
+      previousIncludedCandidate = candidate;
     }
   }
   applyPendingObservation();
   return { states, steps };
+}
+
+function taskContractOperations(
+  contract: TaskContractSemantics,
+  state: ObservedStateV1
+): StateDeltaOperation[] {
+  const operations: StateDeltaOperation[] = [];
+  if (contract.goal) {
+    operations.push({
+      op: state.goal ? "goal.refine" : "goal.set",
+      subject: "task_goal",
+      value: contract.goal,
+      status: "in_progress",
+      sourceRefs: [contract.sourceId]
+    });
+  }
+  for (const constraint of contract.constraints) {
+    operations.push({
+      op: "constraint.upsert",
+      subject: clip(constraint, 300),
+      value: constraint,
+      sourceRefs: [contract.sourceId]
+    });
+  }
+  for (const criterion of contract.acceptanceCriteria) {
+    operations.push({
+      op: "verification.set",
+      subject: clip(criterion, 300),
+      value: criterion,
+      status: "pending",
+      sourceRefs: [contract.sourceId]
+    });
+  }
+  return operations;
+}
+
+function spanStateOperations(
+  semantics: SpanStateSemantics | undefined,
+  decision: SpanSegmentationDecisionV1,
+  finalSpan: boolean
+): StateDeltaOperation[] {
+  if (!semantics) return [];
+  const operations: StateDeltaOperation[] = [
+    ...semantics.effects.map((item): StateDeltaOperation => ({
+      op: "fact.upsert",
+      subject: clip(item.text, 300),
+      value: item.text,
+      status: "observed",
+      sourceRefs: item.evidenceRefs
+    })),
+    ...semantics.artifacts.map((item): StateDeltaOperation => ({
+      op: item.status === "verified" ? "artifact.verify" : "artifact.upsert",
+      subject: clip(item.text, 300),
+      value: item.text,
+      status: item.status,
+      sourceRefs: item.evidenceRefs
+    })),
+    ...semantics.issuesOpened.map((item): StateDeltaOperation => ({
+      op: "issue.upsert",
+      subject: clip(item.text, 300),
+      value: item.text,
+      status: "open",
+      sourceRefs: item.evidenceRefs
+    })),
+    ...semantics.issuesResolved.map((item): StateDeltaOperation => ({
+      op: "issue.resolve",
+      subject: clip(item.text, 300),
+      value: item.text,
+      status: "resolved",
+      sourceRefs: item.evidenceRefs
+    })),
+    ...semantics.verification.map((item): StateDeltaOperation => ({
+      op: "verification.set",
+      subject: clip(item.text, 300),
+      value: item.text,
+      status: item.status,
+      sourceRefs: item.evidenceRefs
+    }))
+  ];
+  if (finalSpan) {
+    const taskStatus = decision.terminationStatus === "success"
+      ? "completed"
+      : decision.terminationStatus === "blocked"
+        ? "blocked"
+        : "failed";
+    operations.push({
+      op: "status.set",
+      subject: "episode_status",
+      status: taskStatus,
+      sourceRefs: decision.evidenceRefs
+    });
+  }
+  return operations;
+}
+
+function inferFailureRelationship(input: {
+  candidate: ExecutionStepCandidateV1;
+  previousCandidate?: ExecutionStepCandidateV1;
+  previousStep?: ExecutionStepV1;
+}): Pick<ExecutionStepV1, "retryOfStepId" | "recoveryFromStepId"> {
+  if (!input.previousCandidate || input.previousStep?.outcome.status !== "failure") return {};
+  const repeatsSameAction = input.candidate.action === input.previousCandidate.action &&
+    input.candidate.toolName === input.previousCandidate.toolName;
+  return repeatsSameAction
+    ? { retryOfStepId: input.previousStep.id }
+    : { recoveryFromStepId: input.previousStep.id };
 }
 
 function compileProceduralSpans(input: {
@@ -958,6 +1424,10 @@ function compileProceduralSpans(input: {
       episodeId: input.episodeId,
       spanIndex: decision.spanIndex,
       localGoal: decision.localGoal,
+      capabilityGoal: decision.capabilityGoal ?? decision.localGoal,
+      ...(decision.procedureSemantic
+        ? { procedureSemantic: decision.procedureSemantic }
+        : {}),
       entryCondition: decision.entryCondition,
       stepIds: [...decision.stepIds],
       rawTurnIds: [...new Set(steps.map((step) => step.rawTurnId))],
@@ -990,47 +1460,60 @@ function compileProceduralSpans(input: {
   });
 }
 
-function parseObservationSemantics(
+function parseTaskContracts(
   value: unknown,
-  frames: readonly TurnFrame[],
-  allowedRefs: ReadonlySet<string>
-): ObservationSemantics[] {
-  if (!Array.isArray(value)) throw new Error("procedural step LLM returned invalid observations");
+  frames: readonly TurnFrame[]
+): TaskContractSemantics[] {
+  if (!Array.isArray(value)) throw new Error("procedural task contract LLM returned invalid contracts");
   const known = new Set(frames.map((frame) => frame.userSourceId));
-  const parsed = new Map<string, ObservationSemantics>();
+  const parsed = new Map<string, TaskContractSemantics>();
   for (const item of value) {
     if (!isRecord(item) || typeof item.source_id !== "string" || !known.has(item.source_id)) {
-      throw new Error("procedural step LLM returned unknown observation source");
+      throw new Error("procedural task contract LLM returned unknown source");
     }
-    if (parsed.has(item.source_id)) throw new Error("procedural step LLM duplicated observation source");
+    if (parsed.has(item.source_id)) throw new Error("procedural task contract LLM duplicated source");
+    const goal = cleanText(item.goal, 4_000);
     parsed.set(item.source_id, {
       sourceId: item.source_id,
-      operations: parseStateDeltaOperations(item.operations, allowedRefs)
+      ...(goal ? { goal } : {}),
+      constraints: cleanStringArray(item.constraints, 2_000),
+      acceptanceCriteria: cleanStringArray(item.acceptance_criteria, 2_000)
     });
   }
-  return frames.map((frame) => parsed.get(frame.userSourceId) ?? {
-    sourceId: frame.userSourceId,
-    operations: []
+  return frames.map((frame, index) => {
+    const item = parsed.get(frame.userSourceId);
+    if (item) return item;
+    const fallbackGoal = index === 0 ? cleanText(frame.rawTurn.userText, 4_000) : undefined;
+    return {
+      sourceId: frame.userSourceId,
+      ...(fallbackGoal ? { goal: fallbackGoal } : {}),
+      constraints: [],
+      acceptanceCriteria: []
+    };
   });
 }
 
 function parseStepSemantics(
   value: unknown,
-  candidates: readonly ExecutionStepCandidateV1[],
-  referenceCandidates: readonly ExecutionStepCandidateV1[],
-  allowedRefs: ReadonlySet<string>
+  candidates: readonly ExecutionStepCandidateV1[]
 ): StepSemantics[] {
   if (!Array.isArray(value)) throw new Error("procedural step LLM returned invalid steps");
   const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
-  const candidateIndex = new Map(referenceCandidates.map((candidate, index) => [candidate.id, index]));
   const parsed = new Map<string, StepSemantics>();
   for (const item of value) {
-    if (!isRecord(item) || typeof item.candidate_id !== "string") {
+    if (!isRecord(item)) {
       throw new Error("procedural step LLM returned invalid candidate ID");
     }
-    const candidate = candidateById.get(item.candidate_id);
-    if (!candidate) throw new Error(`procedural step LLM invented candidate: ${item.candidate_id}`);
-    if (parsed.has(item.candidate_id)) throw new Error(`procedural step LLM duplicated candidate: ${item.candidate_id}`);
+    const snakeCaseCandidateId = typeof item.candidate_id === "string" ? item.candidate_id : undefined;
+    const camelCaseCandidateId = typeof item.candidateId === "string" ? item.candidateId : undefined;
+    if (snakeCaseCandidateId && camelCaseCandidateId && snakeCaseCandidateId !== camelCaseCandidateId) {
+      throw new Error("procedural step LLM returned conflicting candidate IDs");
+    }
+    const candidateId = snakeCaseCandidateId ?? camelCaseCandidateId;
+    if (!candidateId) throw new Error("procedural step LLM returned invalid candidate ID");
+    const candidate = candidateById.get(candidateId);
+    if (!candidate) throw new Error(`procedural step LLM invented candidate: ${candidateId}`);
+    if (parsed.has(candidateId)) throw new Error(`procedural step LLM duplicated candidate: ${candidateId}`);
     if (typeof item.include !== "boolean") throw new Error("procedural step LLM omitted include flag");
     if (candidate.kind === "tool_action" && item.include !== true) {
       throw new Error(`procedural step LLM excluded tool action: ${candidate.id}`);
@@ -1040,41 +1523,175 @@ function parseStepSemantics(
     if (item.include && (!intent || !summary)) {
       throw new Error(`procedural step LLM returned incomplete semantics: ${candidate.id}`);
     }
-    const evidenceRefs = stringArray(item.evidence_refs);
-    assertAllowedRefs(evidenceRefs, allowedRefs);
-    const retryOfCandidateId = typeof item.retry_of_candidate_id === "string" && item.retry_of_candidate_id.trim()
-      ? item.retry_of_candidate_id.trim()
-      : undefined;
-    const recoveryFromCandidateId = typeof item.recovery_from_candidate_id === "string" && item.recovery_from_candidate_id.trim()
-      ? item.recovery_from_candidate_id.trim()
-      : undefined;
-    if (retryOfCandidateId && recoveryFromCandidateId) {
-      throw new Error(`procedural step LLM set both retry and recovery references: ${candidate.id}`);
-    }
-    for (const referencedCandidateId of [retryOfCandidateId, recoveryFromCandidateId]) {
-      if (!referencedCandidateId) continue;
-      const retryIndex = candidateIndex.get(referencedCandidateId);
-      const currentIndex = candidateIndex.get(candidate.id)!;
-      if (retryIndex === undefined || retryIndex >= currentIndex) {
-        throw new Error(`procedural step LLM returned invalid retry/recovery reference: ${referencedCandidateId}`);
-      }
-    }
-    parsed.set(candidate.id, {
+    parsed.set(candidateId, {
       candidateId: candidate.id,
       include: item.include,
       intent: intent ?? "non-procedural response",
-      summary: summary ?? "No substantive task effect.",
-      outcomeStatus: parseExecutionStepOutcome(item.outcome_status),
-      evidenceRefs,
-      ...(retryOfCandidateId ? { retryOfCandidateId } : {}),
-      ...(recoveryFromCandidateId ? { recoveryFromCandidateId } : {}),
-      operations: parseStateDeltaOperations(item.operations, allowedRefs)
+      summary: summary ?? "No substantive task effect."
     });
   }
   for (const candidate of candidates) {
     if (!parsed.has(candidate.id)) throw new Error(`procedural step LLM omitted candidate: ${candidate.id}`);
   }
   return candidates.map((candidate) => parsed.get(candidate.id)!);
+}
+
+function parseSpanCapabilities(
+  value: unknown,
+  decisions: readonly SpanSegmentationDecisionV1[]
+): Map<number, { capabilityGoal: string; procedureSemantic: string }> {
+  if (!Array.isArray(value)) throw new Error("procedural Span capability LLM returned invalid spans");
+  const knownIndexes = new Set(decisions.map((decision) => decision.spanIndex));
+  const parsed = new Map<number, { capabilityGoal: string; procedureSemantic: string }>();
+  for (const item of value) {
+    if (!isRecord(item) || typeof item.span_index !== "number" ||
+      !Number.isInteger(item.span_index) || !knownIndexes.has(item.span_index)) {
+      throw new Error("procedural Span capability LLM returned unknown span_index");
+    }
+    if (parsed.has(item.span_index)) {
+      throw new Error(`procedural Span capability LLM duplicated span_index: ${item.span_index}`);
+    }
+    const capabilityGoal = cleanText(item.capability_goal, 600);
+    const procedureSemantic = cleanText(item.procedure_semantic, 2_000);
+    if (!capabilityGoal || !procedureSemantic) {
+      throw new Error(
+        `procedural Span capability LLM omitted capability_goal or procedure_semantic: ${item.span_index}`
+      );
+    }
+    parsed.set(item.span_index, { capabilityGoal, procedureSemantic });
+  }
+  for (const decision of decisions) {
+    if (!parsed.has(decision.spanIndex)) {
+      throw new Error(`procedural Span capability LLM omitted span_index: ${decision.spanIndex}`);
+    }
+  }
+  return parsed;
+}
+
+function parseSpanStates(
+  value: unknown,
+  decisions: readonly SpanSegmentationDecisionV1[],
+  stepById: ReadonlyMap<string, ExecutionStepV1>,
+  options: { dropInvalidEvidenceRefs?: boolean } = {}
+): SpanStateSemantics[] {
+  if (!Array.isArray(value)) throw new Error("procedural Span state LLM returned invalid spans");
+  const decisionByIndex = new Map(decisions.map((decision) => [decision.spanIndex, decision]));
+  const parsed = new Map<number, SpanStateSemantics>();
+  for (const item of value) {
+    if (!isRecord(item) || typeof item.span_index !== "number" || !Number.isInteger(item.span_index)) {
+      throw new Error("procedural Span state LLM returned invalid span_index");
+    }
+    const decision = decisionByIndex.get(item.span_index);
+    if (!decision) throw new Error(`procedural Span state LLM invented span_index: ${item.span_index}`);
+    if (parsed.has(item.span_index)) {
+      throw new Error(`procedural Span state LLM duplicated span_index: ${item.span_index}`);
+    }
+    const allowedRefs = new Set(unique([
+      ...decision.evidenceRefs,
+      ...decision.stepIds.flatMap((stepId) => stepEvidenceRefs(stepById.get(stepId)!))
+    ]));
+    parsed.set(item.span_index, {
+      spanIndex: item.span_index,
+      effects: parseSpanStateItems(item.effects, "summary", allowedRefs, options),
+      artifacts: parseArtifactStateItems(item.artifacts, allowedRefs, options),
+      issuesOpened: parseSpanStateItems(item.issues_opened, "issue", allowedRefs, options),
+      issuesResolved: parseSpanStateItems(item.issues_resolved, "issue", allowedRefs, options),
+      verification: parseVerificationStateItems(item.verification, allowedRefs, options)
+    });
+  }
+  for (const decision of decisions) {
+    if (!parsed.has(decision.spanIndex)) {
+      throw new Error(`procedural Span state LLM omitted span_index: ${decision.spanIndex}`);
+    }
+  }
+  return decisions.map((decision) => parsed.get(decision.spanIndex)!);
+}
+
+function parseSpanStateItems(
+  value: unknown,
+  textField: "summary" | "issue",
+  allowedRefs: ReadonlySet<string>,
+  options: { dropInvalidEvidenceRefs?: boolean } = {}
+): SpanStateEvidenceItem[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error(`procedural Span state ${textField} items must be an array`);
+  return value.flatMap((item) => {
+    if (!isRecord(item)) throw new Error(`procedural Span state ${textField} item must be an object`);
+    const itemText = cleanText(item[textField], 1_500);
+    const evidenceRefs = validatedEvidenceRefs(item.evidence_refs, allowedRefs, options);
+    if (!itemText) {
+      throw new Error(`procedural Span state ${textField} item is incomplete`);
+    }
+    if (evidenceRefs.length === 0 && options.dropInvalidEvidenceRefs) return [];
+    if (evidenceRefs.length === 0) {
+      throw new Error(`procedural Span state ${textField} item is incomplete`);
+    }
+    return [{ text: itemText, evidenceRefs }];
+  });
+}
+
+function parseArtifactStateItems(
+  value: unknown,
+  allowedRefs: ReadonlySet<string>,
+  options: { dropInvalidEvidenceRefs?: boolean } = {}
+): SpanArtifactStateItem[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("procedural Span state artifacts must be an array");
+  return value.flatMap((item) => {
+    if (!isRecord(item)) throw new Error("procedural Span state artifact item must be an object");
+    const name = cleanText(item.name, 1_500);
+    const status = item.status;
+    const evidenceRefs = validatedEvidenceRefs(item.evidence_refs, allowedRefs, options);
+    if (!name ||
+      (status !== "created" && status !== "updated" && status !== "verified")) {
+      throw new Error(
+        `procedural Span state artifact item is invalid (keys=${Object.keys(item).sort().join(",")}, ` +
+        `status=${typeof status === "string" ? status : typeof status}, evidenceRefs=${evidenceRefs.length})`
+      );
+    }
+    if (evidenceRefs.length === 0 && options.dropInvalidEvidenceRefs) return [];
+    if (evidenceRefs.length === 0) {
+      throw new Error("procedural Span state artifact item has no valid evidence refs");
+    }
+    return [{ text: name, status, evidenceRefs }];
+  });
+}
+
+function parseVerificationStateItems(
+  value: unknown,
+  allowedRefs: ReadonlySet<string>,
+  options: { dropInvalidEvidenceRefs?: boolean } = {}
+): SpanVerificationStateItem[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("procedural Span state verification must be an array");
+  return value.flatMap((item) => {
+    if (!isRecord(item)) throw new Error("procedural Span state verification item must be an object");
+    const criterion = cleanText(item.criterion, 1_500);
+    const status = item.status;
+    const evidenceRefs = validatedEvidenceRefs(item.evidence_refs, allowedRefs, options);
+    if (!criterion ||
+      (status !== "passed" && status !== "failed" && status !== "partial" && status !== "unknown")) {
+      throw new Error("procedural Span state verification item is invalid");
+    }
+    if (evidenceRefs.length === 0 && options.dropInvalidEvidenceRefs) return [];
+    if (evidenceRefs.length === 0) {
+      throw new Error("procedural Span state verification item has no valid evidence refs");
+    }
+    return [{ text: criterion, status, evidenceRefs }];
+  });
+}
+
+function validatedEvidenceRefs(
+  value: unknown,
+  allowedRefs: ReadonlySet<string>,
+  options: { dropInvalidEvidenceRefs?: boolean }
+): string[] {
+  const refs = stringArray(value);
+  if (!options.dropInvalidEvidenceRefs) {
+    assertAllowedRefs(refs, allowedRefs);
+    return refs;
+  }
+  return refs.filter((ref) => allowedRefs.has(ref));
 }
 
 function parseSpanSegmentationDecisions(
@@ -1221,57 +1838,6 @@ function parseReconciledSpanDecisions(
   return decisions.map(({ provisionalSpanIds: _provisionalSpanIds, ...decision }) => decision);
 }
 
-function parseStateDeltaOperations(value: unknown, allowedRefs: ReadonlySet<string>): StateDeltaOperation[] {
-  if (!Array.isArray(value)) return [];
-  return value.map((item, operationIndex): StateDeltaOperation => {
-    if (!isRecord(item)) {
-      throw new Error(`procedural step LLM returned invalid state operation at index ${operationIndex}: expected an object, received ${typeof item}`);
-    }
-    if (!("op" in item) && "operation" in item) {
-      throw new Error(`procedural step LLM used forbidden field "operation" at state operation index ${operationIndex}; use the exact field name "op"`);
-    }
-    if (!isStateDeltaOp(item.op)) {
-      const operationName = isRecord(item) ? stableStringify(item.op) : typeof item;
-      const keys = Object.keys(item).sort().join(",");
-      throw new Error(`procedural step LLM returned invalid state operation at index ${operationIndex}: op=${operationName}, keys=${keys}`);
-    }
-    const unexpectedKeys = Object.keys(item).filter((key) => !STATE_OPERATION_OUTPUT_KEYS.has(key));
-    if (unexpectedKeys.length > 0) {
-      throw new Error(`procedural step LLM returned unexpected state operation fields at index ${operationIndex}: ${unexpectedKeys.sort().join(",")}`);
-    }
-    const subject = cleanText(item.subject, 300);
-    const sourceRefs = stringArray(item.source_refs);
-    if (!subject || sourceRefs.length === 0) {
-      throw new Error(`procedural state operation at index ${operationIndex} (${item.op}) requires subject and source_refs`);
-    }
-    assertAllowedRefs(sourceRefs, allowedRefs);
-    const operation: StateDeltaOperation = {
-      op: item.op,
-      subject,
-      ...(item.value === undefined ? {} : { value: item.value }),
-      ...(typeof item.status === "string" && item.status.trim()
-        ? { status: clip(redactSensitiveText(item.status.trim()), 120) }
-        : {}),
-      sourceRefs
-    };
-    if (operation.op === "status.set") {
-      const status = operation.status ?? (typeof operation.value === "string" ? operation.value : undefined);
-      if (status !== "active" && status !== "blocked" && status !== "completed" && status !== "failed") {
-        throw new Error("procedural status.set requires active, blocked, completed, or failed");
-      }
-    }
-    return operation;
-  });
-}
-
-function candidateSourceRefs(frames: readonly TurnFrame[]): Set<string> {
-  return new Set(frames.flatMap((frame) => [
-    frame.userSourceId,
-    assistantSourceId(frame.rawTurn.id),
-    ...frame.candidates.flatMap((candidate) => candidate.sourceRefs)
-  ]));
-}
-
 function enrichToolCall(
   rawCall: unknown,
   index: number,
@@ -1350,6 +1916,11 @@ function preview(value: string | undefined): string | undefined {
   return clip(redactSensitiveText(value.trim()), TEXT_PREVIEW_MAX);
 }
 
+function fullTaskText(value: string | undefined): string | undefined {
+  if (!value?.trim()) return undefined;
+  return redactSensitiveText(value.trim());
+}
+
 function cleanText(value: unknown, maxChars: number): string | undefined {
   if (typeof value !== "string" || !value.trim()) return undefined;
   return clip(redactSensitiveText(value.trim()), maxChars);
@@ -1365,16 +1936,22 @@ function stringArray(value: unknown): string[] {
     .map((item) => item.trim());
 }
 
+function cleanStringArray(value: unknown, maxChars: number): string[] {
+  if (!Array.isArray(value)) return [];
+  return unique(value.flatMap((item) => {
+    const cleaned = cleanText(item, maxChars);
+    return cleaned ? [cleaned] : [];
+  }));
+}
+
+function unique(values: readonly string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
+}
+
 function assertAllowedRefs(refs: readonly string[], allowedRefs: ReadonlySet<string>): void {
   for (const ref of refs) {
     if (!allowedRefs.has(ref)) throw new Error(`procedural reconstruction invented source ref: ${ref}`);
   }
-}
-
-function parseExecutionStepOutcome(value: unknown): ExecutionStepOutcome {
-  return value === "success" || value === "failure" || value === "partial" || value === "unknown"
-    ? value
-    : "unknown";
 }
 
 function parseTerminationStatus(value: unknown): ProceduralSpanTermination {
@@ -1382,22 +1959,6 @@ function parseTerminationStatus(value: unknown): ProceduralSpanTermination {
     return value;
   }
   throw new Error("procedural span LLM returned invalid termination status");
-}
-
-function isStateDeltaOp(value: unknown): value is StateDeltaOp {
-  return value === "goal.set" ||
-    value === "goal.refine" ||
-    value === "goal.complete" ||
-    value === "constraint.upsert" ||
-    value === "constraint.remove" ||
-    value === "fact.upsert" ||
-    value === "fact.invalidate" ||
-    value === "artifact.upsert" ||
-    value === "artifact.verify" ||
-    value === "issue.upsert" ||
-    value === "issue.resolve" ||
-    value === "verification.set" ||
-    value === "status.set";
 }
 
 function isNumber(value: number | undefined): value is number {

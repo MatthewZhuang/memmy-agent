@@ -45,6 +45,7 @@ import { ProceduralSpanEmbeddingRepository } from "./procedural-span-embedding-r
 import { EpisodePolicyProjectionRepository } from "./episode-policy-projection-repository.js";
 import { EpisodeCapabilityRepository } from "./episode-capability-repository.js";
 import { PolicySequencePatternRepository } from "./policy-sequence-pattern-repository.js";
+import { StepSequenceLearningRepository } from "./step-sequence-learning-repository.js";
 
 type SqlValue = string | number | Buffer | null;
 const BUNDLE_TABLES = [
@@ -3925,6 +3926,7 @@ export class Repositories {
   readonly episodePolicyProjections: EpisodePolicyProjectionRepository;
   readonly episodeCapabilities: EpisodeCapabilityRepository;
   readonly policySequencePatterns: PolicySequencePatternRepository;
+  readonly stepSequenceLearning: StepSequenceLearningRepository;
 
   constructor(readonly db: Database.Database) {
     this.vectors = new SqliteVecStore(db);
@@ -3941,6 +3943,7 @@ export class Repositories {
     this.episodePolicyProjections = new EpisodePolicyProjectionRepository(db);
     this.episodeCapabilities = new EpisodeCapabilityRepository(db);
     this.policySequencePatterns = new PolicySequencePatternRepository(db);
+    this.stepSequenceLearning = new StepSequenceLearningRepository(db);
   }
 
   transaction<T>(fn: () => T): T {
@@ -5458,6 +5461,7 @@ function evolutionJobPrioritySql(): string {
              WHEN job_type = 'reward' THEN 30
              WHEN job_type = 'procedural_path' THEN 32
              WHEN job_type = 'span_credit' THEN 34
+             WHEN job_type = 'step_sequence_learning' THEN 35
              WHEN job_type = 'span_big_turn' THEN 35
              WHEN job_type = 'procedural_span_cluster' THEN 36
              WHEN job_type = 'l2_association' THEN 40

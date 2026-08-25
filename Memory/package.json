@@ -25,6 +25,7 @@
     "span:procedural:replay": "node --import tsx scripts/procedural-span-replay.ts",
     "span:v3:replay": "node --import tsx scripts/span-v3-replay.ts",
     "trace2skill:replay": "node --import tsx scripts/trace2skill-replay.ts",
+    "step-sequence:kw": "node --import tsx scripts/step-sequence-kw-replay.ts",
     "test": "vitest run --dir tests",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "package:npm": "node src/cli/npm/build-package.mjs",

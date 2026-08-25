@@ -58,6 +58,10 @@ export interface SpanSegmentationDecisionV1 {
   spanIndex: number;
   stepIds: string[];
   localGoal: string;
+  /** Populated after final Span boundaries are fixed; absent only on legacy paths. */
+  capabilityGoal?: string;
+  /** Canonical reusable strategy, compiled with capabilityGoal after boundaries are fixed. */
+  procedureSemantic?: string;
   entryCondition: string;
   exitCondition: string;
   terminationStatus: ProceduralSpanTermination;
@@ -72,6 +76,10 @@ export interface ProceduralSpanV1 {
   episodeId: string;
   spanIndex: number;
   localGoal: string;
+  /** Optional only so paths persisted before reconstruction v5 remain readable. */
+  capabilityGoal?: string;
+  /** Optional only so legacy paths can fall back to their ordered Step intents. */
+  procedureSemantic?: string;
   entryCondition: string;
   stepIds: string[];
   rawTurnIds: string[];

@@ -20,6 +20,7 @@ export interface EpisodeProceduralPathPersistencePipelineDeps {
   repos: Repositories;
   reconstructor: EpisodeProceduralPathReconstructor;
   enqueueJob?(input: EnqueueJobInput): EvolutionJobRecord;
+  learningMode?: "span" | "step_sequence";
 }
 
 export class EpisodeProceduralPathPersistencePipeline {
@@ -38,8 +39,7 @@ export class EpisodeProceduralPathPersistencePipeline {
       activePath &&
       activePath.reconstructionAlgorithmVersion === EPISODE_PROCEDURAL_RECONSTRUCTION_VERSION
     ) {
-      this.enqueueSpanCredit(episode, activePath, job.updatedAt);
-      this.enqueueProjection(episode.id, job.updatedAt, "procedural_path_reused");
+      this.enqueueLearning(episode, activePath, job.updatedAt, "procedural_path_reused");
       return undefined;
     }
     return this.reconstructAndPersist({
@@ -86,8 +86,7 @@ export class EpisodeProceduralPathPersistencePipeline {
       createdAt
     });
     if (saved.record.status === "active") {
-      this.enqueueSpanCredit(episode, saved.record, createdAt);
-      this.enqueueProjection(episode.id, createdAt, "procedural_path_activated");
+      this.enqueueLearning(episode, saved.record, createdAt, "procedural_path_activated");
     }
     return saved;
   }
@@ -120,5 +119,31 @@ export class EpisodeProceduralPathPersistencePipeline {
       repos: this.deps.repos,
       enqueueJob: this.deps.enqueueJob
     }, { episodeId, at, trigger });
+  }
+
+  private enqueueLearning(
+    episode: NonNullable<ReturnType<Repositories["runtime"]["getEpisode"]>>,
+    path: SaveEpisodeProceduralPathResult["record"],
+    at: string,
+    trigger: string
+  ): void {
+    if (this.deps.learningMode !== "step_sequence") {
+      this.enqueueSpanCredit(episode, path, at);
+      this.enqueueProjection(episode.id, at, trigger);
+      return;
+    }
+    if (!this.deps.enqueueJob || path.path.steps.length === 0) return;
+    this.deps.enqueueJob({
+      jobType: "step_sequence_learning",
+      userId: episode.userId,
+      sessionId: episode.sessionId,
+      episodeId: episode.id,
+      payload: {
+        pathId: path.id,
+        pathHash: path.pathHash,
+        trigger
+      },
+      createdAt: at
+    });
   }
 }

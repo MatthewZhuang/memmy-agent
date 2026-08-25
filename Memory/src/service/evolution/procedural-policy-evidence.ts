@@ -64,10 +64,9 @@ export class ProceduralPolicyEvidencePipeline {
         creditId: credit.id,
         runId: credit.runId,
         evidenceRole: credit.evidenceRole,
-        goalCredit: credit.goalCredit,
-        processQuality: credit.processQuality,
+        rewardCredit: credit.rewardCredit,
+        attributionType: credit.attributionType,
         confidence: credit.confidence,
-        creditScore: credit.creditScore
       });
     }
     if (members.length === 0) return { excludedOccurrenceIds };

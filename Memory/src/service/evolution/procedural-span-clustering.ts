@@ -19,9 +19,9 @@ import {
 } from "./procedural-policy-evidence.js";
 import { enqueueEpisodePolicyProjection } from "./episode-policy-projection.js";
 
-export const PROCEDURAL_SPAN_EMBEDDING_VERSION = "procedural-span-embedding.v3" as const;
-export const PROCEDURAL_SPAN_SEMANTIC_CLUSTER_VERSION = "procedural-span-semantic-cluster.v5" as const;
-const CLUSTER_CENTER_BASIS_VERSION = "procedural-span-cluster-center.v1" as const;
+export const PROCEDURAL_SPAN_EMBEDDING_VERSION = "procedural-span-embedding.v5" as const;
+export const PROCEDURAL_SPAN_SEMANTIC_CLUSTER_VERSION = "procedural-span-semantic-cluster.v8" as const;
+const CLUSTER_CENTER_BASIS_VERSION = "procedural-span-cluster-center.v2" as const;
 const MAX_COUNTER_BACKFILL_CANDIDATES = 64;
 const EMBEDDING_READ_BATCH_SIZE = 500;
 
@@ -419,13 +419,13 @@ export class ProceduralSpanSemanticClusteringPipeline {
       clusterBasis: {
         discoveredAutomatically: true,
         assignmentMode: "incremental-cluster-center",
-        membershipSimilarityBasis: "current-cluster-center-goal-procedure",
+        membershipSimilarityBasis: "current-cluster-center-capability-goal-normalized-procedure",
         embeddingVersion: PROCEDURAL_SPAN_EMBEDDING_VERSION,
         embeddingProvider: embeddingProviderName(this.deps.embedder),
         embeddingModel: embeddingModelName(this.deps.embedder),
         similarityThreshold: settings.proceduralSimilarityThreshold,
-        views: ["goal_core", "state_contract", "procedure_semantic"],
-        matchingViews: ["goal_core", "procedure_semantic"],
+        views: ["capability_goal", "state_contract", "procedure_semantic"],
+        matchingViews: ["capability_goal", "procedure_semantic"],
         maxCounterBackfillCandidates: MAX_COUNTER_BACKFILL_CANDIDATES,
         centerEmbedding: {
           version: CLUSTER_CENTER_BASIS_VERSION,
@@ -727,7 +727,7 @@ function embeddingTexts(
   procedureText: string
 ): [string, string, string] {
   return [
-    `Goal core:\n${occurrence.localGoal}`,
+    `Capability goal:\n${occurrence.capabilityGoal}`,
     `Procedure semantics:\n${procedureText}`,
     `State contract:\nEntry: ${occurrence.entryCondition}\nExit: ${occurrence.exitCondition}`
   ];

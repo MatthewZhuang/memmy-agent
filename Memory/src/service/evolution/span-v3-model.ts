@@ -251,6 +251,9 @@ export function observedStateSummary(state: Omit<ObservedStateV1, "id" | "summar
   if (openIssues.length > 0) {
     parts.push(`open_issues=${openIssues.map((entry) => entry.subject).join(", ")}`);
   }
+  if (state.facts.length > 0) {
+    parts.push(`facts=${state.facts.map(entryLabel).join(", ")}`);
+  }
   if (state.artifacts.length > 0) {
     parts.push(`artifacts=${state.artifacts.map(entryLabel).join(", ")}`);
   }

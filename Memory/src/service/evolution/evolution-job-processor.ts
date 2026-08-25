@@ -57,6 +57,8 @@ import {
   Trace2SkillReplayService,
   type Trace2SkillReplayResultV1
 } from "./trace2skill-replay.js";
+import { StepSequenceLearningPipeline } from "./step-sequence-learning.js";
+import type { StepSequenceLearningResult } from "./step-sequence-learning.js";
 
 type TraceMeta = NonNullable<ReturnType<typeof traceMetaFromMemory>>;
 type PolicyMeta = NonNullable<ReturnType<typeof policyMetaFromMemory>>;
@@ -112,6 +114,7 @@ export class EvolutionJobProcessor {
   private readonly spanPolicy: SpanPolicyInductionPipeline;
   private readonly proceduralSpanPolicy: ProceduralPolicyInductionPipeline;
   private readonly proceduralPath: EpisodeProceduralPathPersistencePipeline;
+  private readonly stepSequenceLearning: StepSequenceLearningPipeline;
   private readonly spanCredit: SpanCreditPipeline;
   private readonly proceduralSpanClustering: ProceduralSpanSemanticClusteringPipeline;
   private readonly episodePolicyProjection: EpisodePolicyProjectionPipeline;
@@ -210,8 +213,19 @@ export class EvolutionJobProcessor {
     this.proceduralPath = new EpisodeProceduralPathPersistencePipeline({
       repos: deps.repos,
       reconstructor: new EpisodeProceduralReconstructor({
-        get llm() { return owner.deps.skillLlm; }
+        get llm() { return owner.deps.skillLlm; },
+        mode: "step_sequence"
       }),
+      enqueueJob: deps.enqueueJob,
+      learningMode: "step_sequence"
+    });
+    this.stepSequenceLearning = new StepSequenceLearningPipeline({
+      repos: deps.repos,
+      get config() { return owner.deps.config; },
+      get embedder() { return owner.deps.embedder; },
+      get skillLlm() { return owner.deps.skillLlm; },
+      buildMemory: deps.buildMemory,
+      upsertEvolutionMemory: this.upsertEvolutionMemory.bind(this),
       enqueueJob: deps.enqueueJob
     });
     this.spanCredit = new SpanCreditPipeline({
@@ -309,6 +323,19 @@ export class EvolutionJobProcessor {
 
   async reconstructProceduralPath(job: EvolutionJobRecord): Promise<void> {
     await this.proceduralPath.reconstructJob(job);
+  }
+
+  async learnStepSequences(job: EvolutionJobRecord): Promise<void> {
+    await this.stepSequenceLearning.learnJob(job);
+  }
+
+  async learnStepSequencesForReplay(input: {
+    episodeId: string;
+    at?: string;
+  }): Promise<StepSequenceLearningResult> {
+    const path = this.deps.repos.proceduralPaths.getActiveForEpisode(input.episodeId);
+    if (!path) throw new Error(`active procedural Path not found: ${input.episodeId}`);
+    return this.stepSequenceLearning.learnPath(path, input.at ?? nowIso());
   }
 
   async reconstructProceduralPathForReplay(input: {

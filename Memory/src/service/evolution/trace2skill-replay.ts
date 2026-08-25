@@ -19,7 +19,7 @@ import {
 } from "./procedural-sequence-skill-compilation.js";
 
 const ACTIVE_PROCEDURAL_CLUSTER_ALGORITHM_VERSION =
-  "procedural-span-semantic-cluster.v5";
+  "procedural-span-semantic-cluster.v8";
 
 export const TRACE2SKILL_DIAGNOSTIC_SCHEMA_VERSION =
   "trace2skill-diagnostic.v1" as const;
@@ -51,6 +51,8 @@ export interface Trace2SkillDiagnosticReportV1 {
       spanId: string;
       spanIndex: number;
       localGoal: string;
+      capabilityGoal: string;
+      procedureSemantic: string;
       entryCondition: string;
       exitCondition: string;
       terminationStatus: string;
@@ -58,10 +60,9 @@ export interface Trace2SkillDiagnosticReportV1 {
       stepIds: string[];
       cost: Record<string, number | undefined>;
       credit?: {
-        goalCredit: number;
-        processQuality: number;
+        rewardCredit: number;
+        attributionType: string;
         confidence: number;
-        creditScore: number;
         evidenceRole: string;
         reason: string;
       };
@@ -370,6 +371,8 @@ export function inspectTrace2SkillEpisode(
             spanId: span.id,
             spanIndex: span.spanIndex,
             localGoal: span.localGoal,
+            capabilityGoal: occurrence.capabilityGoal,
+            procedureSemantic: occurrence.projection.procedureText,
             entryCondition: span.entryCondition,
             exitCondition: span.termination.exitCondition,
             terminationStatus: span.termination.status,
@@ -378,10 +381,9 @@ export function inspectTrace2SkillEpisode(
             cost: { ...span.cost },
             ...(credit ? {
               credit: {
-                goalCredit: credit.goalCredit,
-                processQuality: credit.processQuality,
+                rewardCredit: credit.rewardCredit,
+                attributionType: credit.attributionType,
                 confidence: credit.confidence,
-                creditScore: credit.creditScore,
                 evidenceRole: credit.evidenceRole,
                 reason: credit.reason
               }

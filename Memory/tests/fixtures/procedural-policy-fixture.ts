@@ -27,6 +27,7 @@ export function persistProceduralPolicyEvidence(
   suffix: string,
   input: {
     terminationStatus?: ProceduralSpanTermination;
+    rTask?: number;
     at?: string;
     namespaceId?: string;
   } = {}
@@ -63,7 +64,7 @@ export function persistProceduralPolicyEvidence(
     l3WorldModelIds: [],
     skillMemoryIds: [],
     turnCount: 1,
-    rTask: terminationStatus === "success" ? 1 : 0,
+    rTask: input.rTask ?? (terminationStatus === "success" ? 1 : 0),
     rewardDetail: {},
     pipelineStatus: "succeeded",
     meta: {},
@@ -233,6 +234,7 @@ export function buildProceduralPolicyPath(input: {
     spanIndex: 0,
     stepIds: steps.map((step) => step.id),
     localGoal: "Resolve a dependency failure",
+    capabilityGoal: "Diagnose, repair, and verify a dependency constraint failure",
     entryCondition: "A focused build fails because dependency constraints conflict",
     exitCondition,
     terminationStatus: input.terminationStatus,
@@ -246,6 +248,7 @@ export function buildProceduralPolicyPath(input: {
     episodeId: input.episodeId,
     spanIndex: 0,
     localGoal: decision.localGoal,
+    capabilityGoal: decision.capabilityGoal,
     entryCondition: decision.entryCondition,
     stepIds: [...decision.stepIds],
     rawTurnIds: [input.rawTurnId],

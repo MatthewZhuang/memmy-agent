@@ -114,6 +114,33 @@ describe("memory LLM JSON length retry", () => {
     expect(requestBodies(fetchMock).map((body) => body.max_tokens)).toEqual([4096, 8192]);
   });
 
+  it("supports an explicit second length retry for reasoning-heavy structured tasks", async () => {
+    const fetchMock = sequenceFetch([
+      openAiMessageResponse({
+        content: null,
+        reasoning_content: "The first budget was spent reasoning."
+      }, "length"),
+      openAiMessageResponse({
+        content: null,
+        reasoning_content: "The expanded budget was also spent reasoning."
+      }, "length"),
+      openAiResponse('{"ok":true}', "stop")
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = createLlmClient(llmConfig({ malformedRetries: 1 }));
+    await expect(client.completeJson<{ ok: boolean }>(
+      [{ role: "user", content: "generate" }],
+      { operation: "span_credit.score.v2", maxLengthRetries: 2 }
+    )).resolves.toEqual({ ok: true });
+
+    expect(requestBodies(fetchMock).map((body) => body.max_tokens)).toEqual([
+      4096,
+      8192,
+      16384
+    ]);
+  });
+
   it("doubles max tokens for a length stop without exposed reasoning content", async () => {
     const fetchMock = sequenceFetch([
       openAiMessageResponse({ content: null }, "length"),

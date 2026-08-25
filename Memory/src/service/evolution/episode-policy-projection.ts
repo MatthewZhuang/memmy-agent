@@ -16,7 +16,7 @@ import type {
   SaveEpisodePolicyProjectionResult
 } from "../../storage/episode-policy-projection-repository.js";
 
-const ACTIVE_PROCEDURAL_CLUSTER_ALGORITHM_VERSION = "procedural-span-semantic-cluster.v5";
+const ACTIVE_PROCEDURAL_CLUSTER_ALGORITHM_VERSION = "procedural-span-semantic-cluster.v8";
 
 export interface EpisodePolicyProjectionPipelineDeps {
   repos: Repositories;

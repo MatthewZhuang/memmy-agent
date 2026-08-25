@@ -21,8 +21,8 @@ describe("repository procedural SpanCredit", () => {
       const evidence = persistProceduralPolicyEvidence(repos, "credit-repository");
       const firstRun = creditRun(evidence, {
         rewardHash: "reward-hash-v1",
-        goalAchievement: 1,
-        processQuality: 0.4,
+        episodeReward: 1,
+        attributionType: "helpful",
         evidenceRole: "support"
       });
       const first = repos.proceduralSpanCredits.saveAndActivate(
@@ -43,15 +43,14 @@ describe("repository procedural SpanCredit", () => {
         namespaceId: PROCEDURAL_POLICY_TEST_NAMESPACE,
         rewardHash: "reward-hash-v1",
         status: "active",
-        goalAchievement: 1
+        episodeReward: 1
       });
       expect(first.credits).toEqual([
         expect.objectContaining({
           occurrenceId: evidence.occurrence.id,
-          goalCredit: 1,
-          processQuality: 0.4,
+          rewardCredit: 1,
+          attributionType: "helpful",
           confidence: 0.98,
-          creditScore: 0.98,
           evidenceRole: "support"
         })
       ]);
@@ -67,8 +66,8 @@ describe("repository procedural SpanCredit", () => {
 
       const secondRun = creditRun(evidence, {
         rewardHash: "reward-hash-v2",
-        goalAchievement: 0,
-        processQuality: -0.6,
+        episodeReward: -1,
+        attributionType: "harmful",
         evidenceRole: "counterexample"
       });
       repos.proceduralSpanCredits.saveAndActivate(secondRun, "2026-08-20T00:02:00.000Z");
@@ -96,10 +95,9 @@ describe("repository procedural SpanCredit", () => {
       pathHash: "path-hash",
       namespaceId: "namespace",
       rewardHash: "reward-hash",
-      goalAchievement: 1,
-      statePotentials: [],
+      episodeReward: 1,
       credits: []
-    })).toThrow(/one more boundary state/);
+    })).toThrow(/at least one Span credit/);
   });
 });
 
@@ -107,8 +105,8 @@ function creditRun(
   evidence: ReturnType<typeof persistProceduralPolicyEvidence>,
   input: {
     rewardHash: string;
-    goalAchievement: number;
-    processQuality: number;
+    episodeReward: number;
+    attributionType: "helpful" | "harmful";
     evidenceRole: "support" | "counterexample";
   }
 ) {
@@ -120,28 +118,15 @@ function creditRun(
     pathHash: evidence.path.pathHash,
     namespaceId: PROCEDURAL_POLICY_TEST_NAMESPACE,
     rewardHash: input.rewardHash,
-    goalAchievement: input.goalAchievement,
-    statePotentials: [{
-      boundaryIndex: 0,
-      stateId: preStateId,
-      progress: 0,
-      evidenceRefs: [preStateId],
-      reason: "Episode start anchor"
-    }, {
-      boundaryIndex: 1,
-      stateId: postStateId,
-      progress: input.goalAchievement,
-      evidenceRefs: [postStateId],
-      reason: "Episode goal-achievement anchor"
-    }],
+    episodeReward: input.episodeReward,
     credits: [{
       occurrenceId: evidence.occurrence.id,
       spanId: evidence.occurrence.spanId,
       spanIndex: 0,
       preStateId,
       postStateId,
-      goalCredit: input.goalAchievement,
-      processQuality: input.processQuality,
+      rewardCredit: input.episodeReward,
+      attributionType: input.attributionType,
       confidence: 0.98,
       evidenceRole: input.evidenceRole,
       evidenceRefs: [evidence.occurrence.id],

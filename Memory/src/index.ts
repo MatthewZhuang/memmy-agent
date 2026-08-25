@@ -245,6 +245,46 @@ export type {
   EpisodeProceduralPathReconstructor
 } from "./service/evolution/episode-procedural-path-pipeline.js";
 export {
+  STEP_CLUSTER_ALGORITHM_VERSION,
+  STEP_CLUSTER_SIMILARITY_THRESHOLD,
+  STEP_EMBEDDING_VERSION,
+  STEP_OCCURRENCE_SCHEMA_VERSION,
+  STEP_POLICY_SKILL_COMPILER_VERSION,
+  STEP_POLICY_SKILL_MINING_ALGORITHM_VERSION,
+  STEP_SEQUENCE_MINING_ALGORITHM_VERSION,
+  STEP_SEQUENCE_POLICY_INDUCTION_VERSION,
+  STEP_SEQUENCE_POLICY_SCHEMA_VERSION,
+  buildEpisodeStepPolicyProjection,
+  buildStepOccurrence,
+  buildStepSequencePolicy,
+  contiguousWindows,
+  containsContiguousSequence,
+  selectLongestNonOverlapping,
+  sequenceOccurrencesFullyCovered,
+  stepSequenceIdentity
+} from "./service/evolution/step-sequence-learning-model.js";
+export type {
+  EpisodeStepPolicyProjectionNodeV1,
+  EpisodeStepPolicyProjectionV1,
+  ProceduralStepOccurrenceV1,
+  SequenceIntervalCandidate,
+  SequenceOccurrenceInterval,
+  StepPolicySequenceSkillDraftV1,
+  StepSequencePolicyV1
+} from "./service/evolution/step-sequence-learning-model.js";
+export {
+  STEP_POLICY_SKILL_OPERATION,
+  STEP_POLICY_SKILL_PROMPT,
+  STEP_SEQUENCE_LEARNING_OPERATION,
+  STEP_SEQUENCE_POLICY_OPERATION,
+  STEP_SEQUENCE_POLICY_PROMPT,
+  StepSequenceLearningPipeline
+} from "./service/evolution/step-sequence-learning.js";
+export type {
+  StepSequenceLearningDeps,
+  StepSequenceLearningResult
+} from "./service/evolution/step-sequence-learning.js";
+export {
   EPISODE_PROCEDURAL_PATH_SCHEMA_VERSION,
   EXECUTION_STEP_SCHEMA_VERSION,
   PROCEDURAL_SPAN_SCHEMA_VERSION,
@@ -259,6 +299,7 @@ export {
   buildEpisodeSpanCreditRun
 } from "./service/evolution/span-credit-model.js";
 export {
+  SPAN_CREDIT_MAX_INPUT_CHARS,
   SPAN_CREDIT_SCORING_OPERATION,
   SPAN_CREDIT_SCORING_PROMPT,
   SpanCreditPipeline,
@@ -288,10 +329,11 @@ export type {
   RefreshProceduralPolicyEvidenceResult
 } from "./service/evolution/procedural-policy-evidence.js";
 export type {
-  EpisodeSpanCreditRunV1,
+  EpisodeSpanCreditRunV2,
+  SpanCreditAttributionType,
   SpanCreditEvidenceRole,
-  SpanCreditV1,
-  SpanStatePotentialV1
+  SpanCreditInputCompactionV1,
+  SpanCreditV2
 } from "./service/evolution/span-credit-model.js";
 export {
   PROCEDURAL_POLICY_INDUCTION_OPERATION,

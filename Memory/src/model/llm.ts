@@ -172,7 +172,10 @@ class HttpLlmClient implements LlmClient {
   ): Promise<T> {
     let lastError: unknown;
     let malformedRetriesRemaining = Math.max(0, this.config.malformedRetries);
-    let lengthRetryUsed = false;
+    let lengthRetriesRemaining = Math.max(
+      0,
+      Math.floor(options.maxLengthRetries ?? 1)
+    );
     let previousWasTruncated = false;
     let maxTokens = options.maxTokens ?? this.config.maxTokens;
     let jsonAttempt = 0;
@@ -188,7 +191,7 @@ class HttpLlmClient implements LlmClient {
           jsonMode: true
         });
       } catch (error) {
-        if (!(error instanceof CompletionOutputBudgetExhaustedError) || lengthRetryUsed) {
+        if (!(error instanceof CompletionOutputBudgetExhaustedError) || lengthRetriesRemaining === 0) {
           throw error;
         }
         const expandedMaxTokens = doubleMaxTokens(maxTokens);
@@ -206,7 +209,7 @@ class HttpLlmClient implements LlmClient {
           reasoningContentPresent: error.reasoningContentPresent,
           ...memoryErrorFields(error)
         });
-        lengthRetryUsed = true;
+        lengthRetriesRemaining -= 1;
         previousWasTruncated = true;
         maxTokens = expandedMaxTokens;
         lastError = error;
@@ -223,7 +226,7 @@ class HttpLlmClient implements LlmClient {
       const truncated = result.finishReason === "length" || (
         parseError !== undefined && looksLikeTruncatedJson(result.text, parseError)
       );
-      const expandedMaxTokens = truncated && !lengthRetryUsed
+      const expandedMaxTokens = truncated && lengthRetriesRemaining > 0
         ? doubleMaxTokens(maxTokens)
         : undefined;
       if (expandedMaxTokens !== undefined) {
@@ -239,7 +242,7 @@ class HttpLlmClient implements LlmClient {
           nextMaxTokens: expandedMaxTokens,
           ...(parseError ? memoryErrorFields(parseError) : {})
         });
-        lengthRetryUsed = true;
+        lengthRetriesRemaining -= 1;
         previousWasTruncated = true;
         maxTokens = expandedMaxTokens;
         lastError = parseError ?? new Error("LLM output reached the max token limit");

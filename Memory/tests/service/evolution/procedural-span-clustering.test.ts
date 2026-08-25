@@ -51,7 +51,8 @@ describe("automatic procedural Span semantic clustering", () => {
     const supportA = persistProceduralPolicyEvidence(repos, "auto-support-a");
     const supportB = persistProceduralPolicyEvidence(repos, "auto-support-b");
     const counterexample = persistProceduralPolicyEvidence(repos, "auto-counterexample", {
-      terminationStatus: "blocked"
+      terminationStatus: "blocked",
+      rTask: -1
     });
     [supportA, supportB, counterexample].forEach((evidence, index) => {
       const episode = repos.runtime.getEpisode(evidence.episodeId)!;
@@ -119,12 +120,12 @@ describe("automatic procedural Span semantic clustering", () => {
       clusterBasis: {
         discoveredAutomatically: true,
         assignmentMode: "incremental-cluster-center",
-        membershipSimilarityBasis: "current-cluster-center-goal-procedure",
+        membershipSimilarityBasis: "current-cluster-center-capability-goal-normalized-procedure",
         similarityThreshold: 0.9,
-        views: ["goal_core", "state_contract", "procedure_semantic"],
-        matchingViews: ["goal_core", "procedure_semantic"],
+        views: ["capability_goal", "state_contract", "procedure_semantic"],
+        matchingViews: ["capability_goal", "procedure_semantic"],
         centerEmbedding: {
-          version: "procedural-span-cluster-center.v1",
+          version: "procedural-span-cluster-center.v2",
           supportMemberCount: 2
         }
       }
@@ -146,11 +147,14 @@ describe("automatic procedural Span semantic clustering", () => {
       status: "succeeded"
     }));
     const policy = repos.proceduralPolicies.getActiveForCluster(clusters[0]!.id);
-    expect(policy?.policy.evidence).toMatchObject({
-      supportOccurrenceIds: [supportA.occurrence.id, supportB.occurrence.id],
-      counterexampleOccurrenceIds: [counterexample.occurrence.id]
-    });
-    expect(operations.filter((operation) => operation === "span_credit.score.v1"))
+    expect(policy?.policy.evidence.supportOccurrenceIds).toEqual(expect.arrayContaining([
+      supportA.occurrence.id,
+      supportB.occurrence.id
+    ]));
+    expect(policy?.policy.evidence.supportOccurrenceIds).toHaveLength(2);
+    expect(policy?.policy.evidence.counterexampleOccurrenceIds)
+      .toEqual([counterexample.occurrence.id]);
+    expect(operations.filter((operation) => operation === "span_credit.score.v2"))
       .toHaveLength(3);
     expect(operations).toContain("procedural_policy.induction.v1");
 
@@ -160,28 +164,15 @@ describe("automatic procedural Span semantic clustering", () => {
       pathHash: supportA.path.pathHash,
       namespaceId: PROCEDURAL_POLICY_TEST_NAMESPACE,
       rewardHash: "reward:auto-support-a:revised",
-      goalAchievement: 0,
-      statePotentials: [{
-        boundaryIndex: 0,
-        stateId: supportA.occurrence.preStateId,
-        progress: 0,
-        evidenceRefs: [supportA.occurrence.preStateId],
-        reason: "Episode start anchor"
-      }, {
-        boundaryIndex: 1,
-        stateId: supportA.occurrence.postStateId,
-        progress: 0,
-        evidenceRefs: [supportA.occurrence.postStateId],
-        reason: "Revised terminal anchor"
-      }],
+      episodeReward: -1,
       credits: [{
         occurrenceId: supportA.occurrence.id,
         spanId: supportA.occurrence.spanId,
         spanIndex: supportA.occurrence.spanIndex,
         preStateId: supportA.occurrence.preStateId,
         postStateId: supportA.occurrence.postStateId,
-        goalCredit: 0,
-        processQuality: -0.8,
+        rewardCredit: -1,
+        attributionType: "harmful",
         confidence: 0.98,
         evidenceRole: "counterexample",
         evidenceRefs: [supportA.occurrence.id],
@@ -280,9 +271,9 @@ describe("automatic procedural Span semantic clustering", () => {
       memberCount: 2,
       distinctSupportEpisodeCount: 2,
       clusterBasis: {
-        membershipSimilarityBasis: "current-cluster-center-goal-procedure",
-        views: ["goal_core", "state_contract", "procedure_semantic"],
-        matchingViews: ["goal_core", "procedure_semantic"]
+        membershipSimilarityBasis: "current-cluster-center-capability-goal-normalized-procedure",
+        views: ["capability_goal", "state_contract", "procedure_semantic"],
+        matchingViews: ["capability_goal", "procedure_semantic"]
       }
     });
     expect(repos.proceduralSpanClusters.listMembers(sharedCluster.id))
@@ -290,7 +281,7 @@ describe("automatic procedural Span semantic clustering", () => {
         expect.objectContaining({ similarity: 1 }),
         expect.objectContaining({ similarity: 1 })
       ]));
-    expect(embeddedTexts.filter((text) => text.startsWith("Goal core:"))).toHaveLength(4);
+    expect(embeddedTexts.filter((text) => text.startsWith("Capability goal:"))).toHaveLength(4);
     expect(embeddedTexts.filter((text) => text.startsWith("State contract:"))).toHaveLength(4);
     expect(embeddedTexts.filter((text) => text.startsWith("Procedure semantics:"))).toHaveLength(4);
     db.close();
@@ -357,9 +348,9 @@ describe("automatic procedural Span semantic clustering", () => {
       distinctSupportEpisodeCount: 3,
       clusterBasis: {
         assignmentMode: "incremental-cluster-center",
-        membershipSimilarityBasis: "current-cluster-center-goal-procedure",
+        membershipSimilarityBasis: "current-cluster-center-capability-goal-normalized-procedure",
         centerEmbedding: {
-          version: "procedural-span-cluster-center.v1",
+          version: "procedural-span-cluster-center.v2",
           supportMemberCount: 3
         }
       }
@@ -442,28 +433,15 @@ describe("automatic procedural Span semantic clustering", () => {
       pathHash: replacement.record.pathHash,
       namespaceId: PROCEDURAL_POLICY_TEST_NAMESPACE,
       rewardHash: "reward:user-scope-replay-a",
-      goalAchievement: 1,
-      statePotentials: [{
-        boundaryIndex: 0,
-        stateId: occurrence.preStateId,
-        progress: 0,
-        evidenceRefs: [occurrence.preStateId],
-        reason: "Replay start"
-      }, {
-        boundaryIndex: 1,
-        stateId: occurrence.postStateId,
-        progress: 1,
-        evidenceRefs: [occurrence.postStateId],
-        reason: "Replay completed"
-      }],
+      episodeReward: 1,
       credits: [{
         occurrenceId: occurrence.id,
         spanId: occurrence.spanId,
         spanIndex: occurrence.spanIndex,
         preStateId: occurrence.preStateId,
         postStateId: occurrence.postStateId,
-        goalCredit: 1,
-        processQuality: 0.8,
+        rewardCredit: 1,
+        attributionType: "helpful",
         confidence: 0.95,
         evidenceRole: "support",
         evidenceRefs: [occurrence.id],
@@ -532,7 +510,7 @@ function enqueue(repos: Repositories, input: EnqueueJobInput, index: number): vo
 
 function semanticTestEmbedder(seen: string[]): Embedder {
   const embed = (text: string): number[] => {
-    if (text.startsWith("Goal core:")) return [1, 0, 0];
+    if (text.startsWith("Capability goal:")) return [1, 0, 0];
     if (text.startsWith("Procedure semantics:")) return [0, 1, 0];
     return [0, 0, 1];
   };
@@ -616,7 +594,7 @@ function stateContractMismatchTestEmbedder(seen: string[]): Embedder {
         if (text.startsWith("State contract:")) {
           return itemIndex === 0 ? [0, 0, 1] : [0, 0, -1];
         }
-        if (text.startsWith("Goal core:")) {
+        if (text.startsWith("Capability goal:")) {
           return itemIndex === 3 ? [-1, 0, 0] : [1, 0, 0];
         }
         return itemIndex === 2 ? [0, -1, 0] : [0, 1, 0];
@@ -654,21 +632,22 @@ function automaticPipelineLlm(operations: string[]): LlmClient {
       options: { operation: string }
     ): Promise<T> {
       operations.push(options.operation);
-      if (options.operation.startsWith("span_credit.score.v1")) {
+      if (options.operation.startsWith("span_credit.score.v2")) {
         const payload = JSON.parse(messages.find((message) =>
-          message.role === "user" && message.content.includes("terminal_goal_achievement")
+          message.role === "user" && message.content.includes("episode_reward")
         )?.content ?? "{}") as {
-          terminal_goal_achievement: number;
+          episode_reward: number;
           spans: Array<{ occurrence_id: string }>;
         };
         const occurrenceId = payload.spans[0]!.occurrence_id;
         return {
-          state_progress: [],
-          span_process_quality: [{
+          span_credits: [{
             occurrence_id: occurrenceId,
-            quality: payload.terminal_goal_achievement > 0 ? 0.7 : -0.8,
+            reward_credit: payload.episode_reward,
+            attribution_type: payload.episode_reward > 0 ? "helpful" : "harmful",
+            confidence: 0.9,
             evidence_refs: [occurrenceId],
-            reason: payload.terminal_goal_achievement > 0
+            reason: payload.episode_reward > 0
               ? "The repair completed with focused verification."
               : "The repair remained blocked after focused verification."
           }]

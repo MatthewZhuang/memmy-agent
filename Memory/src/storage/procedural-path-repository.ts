@@ -13,10 +13,12 @@ import {
 } from "../service/evolution/procedural-path-model.js";
 
 export const PROCEDURAL_SPAN_OCCURRENCE_SCHEMA_VERSION = "procedural-span-occurrence.v1" as const;
-export const PROCEDURAL_SPAN_CLUSTER_PROJECTION_VERSION = "procedural-span-cluster-projection.v3" as const;
+export const PROCEDURAL_SPAN_CLUSTER_PROJECTION_VERSION = "procedural-span-cluster-projection.v5" as const;
 const LEGACY_PROCEDURAL_SPAN_CLUSTER_PROJECTION_VERSIONS = [
   "procedural-span-cluster-projection.v1",
-  "procedural-span-cluster-projection.v2"
+  "procedural-span-cluster-projection.v2",
+  "procedural-span-cluster-projection.v3",
+  "procedural-span-cluster-projection.v4"
 ] as const;
 type ProceduralSpanClusterProjectionVersion =
   | typeof PROCEDURAL_SPAN_CLUSTER_PROJECTION_VERSION
@@ -62,6 +64,7 @@ export interface ProceduralSpanOccurrenceRecord {
   schemaVersion: typeof PROCEDURAL_SPAN_OCCURRENCE_SCHEMA_VERSION;
   spanIndex: number;
   localGoal: string;
+  capabilityGoal: string;
   entryCondition: string;
   exitCondition: string;
   terminationStatus: ProceduralSpanTermination;
@@ -488,6 +491,7 @@ function buildOccurrenceInput(input: {
     schemaVersion: PROCEDURAL_SPAN_OCCURRENCE_SCHEMA_VERSION,
     spanIndex: input.span.spanIndex,
     localGoal: input.span.localGoal,
+    capabilityGoal: input.span.capabilityGoal ?? input.span.localGoal,
     entryCondition: input.span.entryCondition,
     exitCondition: input.span.termination.exitCondition,
     terminationStatus: input.span.termination.status,
@@ -513,7 +517,7 @@ function buildClusterProjection(
   const steps = spanSteps(path, span);
   return {
     version: PROCEDURAL_SPAN_CLUSTER_PROJECTION_VERSION,
-    goalText: clip(span.localGoal, 4_000),
+    goalText: clip(span.capabilityGoal ?? span.localGoal, 4_000),
     conditionText: clip([
       `Entry: ${span.entryCondition}`,
       `Exit: ${span.termination.exitCondition}`
@@ -535,6 +539,8 @@ export function proceduralSpanProcedureText(
   path: EpisodeProceduralPathV2,
   span: ProceduralSpanV1
 ): string {
+  const normalized = span.procedureSemantic?.trim();
+  if (normalized) return clip(normalized, 24_000);
   const steps = spanSteps(path, span);
   const toolSteps = steps.filter((step) => step.action.kind === "tool_action");
   const semanticSteps = toolSteps.length > 0 ? toolSteps : steps;
@@ -629,6 +635,7 @@ function occurrenceFromSql(row: ProceduralSpanOccurrenceSqlRow): ProceduralSpanO
     schemaVersion: PROCEDURAL_SPAN_OCCURRENCE_SCHEMA_VERSION,
     spanIndex: row.span_index,
     localGoal: row.local_goal,
+    capabilityGoal: row.goal_text,
     entryCondition: row.entry_condition,
     exitCondition: row.exit_condition,
     terminationStatus: row.termination_status,

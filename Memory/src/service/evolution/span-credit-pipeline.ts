@@ -21,58 +21,60 @@ import {
 } from "./procedural-span-clustering.js";
 import {
   SPAN_CREDIT_ALGORITHM_VERSION,
-  SPAN_CREDIT_PROMPT_VERSION,
   buildEpisodeSpanCreditRun,
+  type SpanCreditAttributionType,
   type SpanCreditEvidenceRole,
-  type SpanStatePotentialV1
+  type SpanCreditInputCompactionV1
 } from "./span-credit-model.js";
 import type { EpisodeProceduralPathV2, ExecutionStepV1 } from "./procedural-path-model.js";
 
-export const SPAN_CREDIT_SCORING_OPERATION = "span_credit.score.v1" as const;
+export const SPAN_CREDIT_SCORING_OPERATION = "span_credit.score.v2" as const;
 const MAX_REPAIR_ATTEMPTS = 2;
 const POSITIVE_CREDIT_THRESHOLD = 0.1;
 const NEGATIVE_CREDIT_THRESHOLD = -0.1;
 const MIN_ROLE_CONFIDENCE = 0.6;
-const COUNTEREXAMPLE_PROCESS_THRESHOLD = -0.6;
-const MIN_SUPPORT_PROCESS_QUALITY = -0.5;
 const MAX_STEPS_PER_SPAN = 10;
+export const SPAN_CREDIT_MAX_INPUT_CHARS = 48_000;
 const SPAN_CREDIT_MIN_CONTENT_TOKENS = 1_400;
-const SPAN_CREDIT_CONTENT_TOKENS_PER_SPAN = 260;
+const SPAN_CREDIT_CONTENT_TOKENS_PER_SPAN = 220;
 const SPAN_CREDIT_REASONING_RESERVE_TOKENS = 3_000;
 
-export const SPAN_CREDIT_SCORING_PROMPT = `You score one complete AI-agent EpisodeExecutionPath for procedural credit assignment.
+export const SPAN_CREDIT_SCORING_PROMPT = `Assign one Episode's final reward jointly across all ordered procedural Span occurrences.
 
-The input contains an episode goal, an authoritative terminal goal-achievement anchor, ordered boundary states, and ordered procedural Span occurrences. A Span is a complete local subproblem lifecycle; internal failed attempts that recover before the Span exits remain part of that one Span.
+The input contains the Episode goal, the authoritative episode_reward, ordered boundary states, and every Final Span. A Span is a complete local subproblem lifecycle; recovered failed attempts remain inside that Span. Evaluate the whole path in one global comparison. Do not score Spans independently.
 
-Return two judgments only:
-1. state_progress: the relative goal progress at every INTERNAL boundary. Do not score boundary 0 or the terminal boundary; the backend anchors them to 0 and terminal_goal_achievement.
-2. span_process_quality: execution quality for every Span occurrence.
+For every Span, estimate its signed causal contribution by asking: if this Span's decision and resulting state transition were removed or replaced by a competent alternative, would the final Episode outcome become worse, better, or materially unchanged?
 
-State progress rules:
-- progress is in [-1, 1], relative to boundary 0.
-- Positive means evidence-grounded progress toward the active Episode goal.
-- Negative means the state is worse than at Episode start.
-- Keep every adjacent boundary progress change within [-1, 1], because each Span credit uses that difference directly.
-- Root-cause evidence, resolved uncertainty, committed constraints, produced artifacts, and verification can be progress when they enable later execution.
-- A plan or claim without observable support is not completed progress.
-- Judge the ordered path jointly. Progress may decrease and later recover.
+Reward budget rules:
+- reward_credit is in [-1, 1]. Positive helped the final outcome; negative harmed it; near zero was incidental.
+- The sum of reward_credit across all returned Spans MUST equal episode_reward exactly (within 0.00001).
+- Positive and negative credits may coexist even when episode_reward is zero or negative.
+- Do not multiply reward_credit by confidence. confidence reports attribution certainty only.
+- Root-cause evidence, resolved uncertainty, produced artifacts, and verification may receive positive credit when they causally enabled the result.
+- Avoidable detours, incorrect modifications, unsupported claims, and regressions may receive negative credit even if the Episode later recovered.
 
-Process quality rules:
-- quality is in [-1, 1]. Judge effectiveness, avoidable repetition, recovery, verification, and cost together.
-- Do not mark an otherwise successful Span as harmful merely because it contains a failed attempt; reflect recoverable inefficiency in quality.
-- A failed/blocked Span may still contain useful evidence, but its process quality must reflect that its local exit condition was not achieved.
+attribution_type rules:
+- helpful: the agent-controlled Span made a positive causal contribution.
+- harmful: an agent-controlled choice made the final result worse.
+- externally_blocked: progress was limited by an external dependency or permission, not a reusable agent failure.
+- neutral: removing the Span would not materially change the result.
+- uncertain: the supplied evidence cannot support a stable attribution.
 
 Grounding rules:
-- Copy boundary_index and occurrence_id exactly.
+- Return every supplied occurrence_id exactly once and preserve their order.
 - evidence_refs may contain only IDs or evidence references supplied in the input.
 - Do not invent actions, outcomes, feedback, or causal claims.
-- Return JSON only with exactly these top-level keys:
+- Return JSON only with exactly this shape:
 {
-  "state_progress": [
-    {"boundary_index": 1, "progress": 0.25, "evidence_refs": ["..."], "reason": "..."}
-  ],
-  "span_process_quality": [
-    {"occurrence_id": "...", "quality": 0.5, "evidence_refs": ["..."], "reason": "..."}
+  "span_credits": [
+    {
+      "occurrence_id": "...",
+      "reward_credit": 0.25,
+      "attribution_type": "helpful",
+      "confidence": 0.8,
+      "evidence_refs": ["..."],
+      "reason": "..."
+    }
   ]
 }`;
 
@@ -80,31 +82,25 @@ export interface SpanCreditPipelineDeps {
   repos: Repositories;
   skillLlm: LlmClient;
   enableThinking?: boolean;
+  maxInputChars?: number;
   enqueueJob?(input: EnqueueJobInput): EvolutionJobRecord;
 }
 
-interface StateProgressResult {
-  boundaryIndex: number;
-  progress: number;
-  evidenceRefs: string[];
-  reason: string;
-}
-
-interface ProcessQualityResult {
+interface ParsedSpanCreditResult {
   occurrenceId: string;
-  quality: number;
+  rewardCredit: number;
+  attributionType: SpanCreditAttributionType;
+  confidence: number;
   evidenceRefs: string[];
   reason: string;
 }
 
 interface ParsedScoringResult {
-  stateProgress: StateProgressResult[];
-  processQuality: ProcessQualityResult[];
+  credits: ParsedSpanCreditResult[];
 }
 
 interface SpanCreditLlmResult extends Record<string, unknown> {
-  state_progress?: unknown;
-  span_process_quality?: unknown;
+  span_credits?: unknown;
 }
 
 interface BoundaryState {
@@ -120,10 +116,11 @@ interface ScoringContext {
   namespaceId: string;
   occurrences: ProceduralSpanOccurrenceRecord[];
   boundaries: BoundaryState[];
-  goalAchievement: number;
+  episodeReward: number;
   rewardHash: string;
   validEvidenceRefs: Set<string>;
   payload: Record<string, unknown>;
+  inputCompaction: SpanCreditInputCompactionV1;
 }
 
 export class SpanCreditPipeline {
@@ -183,6 +180,7 @@ export class SpanCreditPipeline {
         context.occurrences.length,
         this.deps.enableThinking === true
       ),
+      maxLengthRetries: this.deps.enableThinking ? 2 : 1,
       jsonMode: true
     };
     let raw = await this.deps.skillLlm.completeJson<SpanCreditLlmResult>(messages, options);
@@ -207,21 +205,14 @@ export class SpanCreditPipeline {
         });
       }
     }
-    const statePotentials = materializeStatePotentials(context, parsed.stateProgress);
-    const potentialByBoundary = new Map(statePotentials.map((item) => [item.boundaryIndex, item]));
-    const processByOccurrence = new Map(parsed.processQuality.map((item) => [item.occurrenceId, item]));
-    const credits = context.occurrences.map((occurrence, index) => {
-      const pre = potentialByBoundary.get(index)!;
-      const post = potentialByBoundary.get(index + 1)!;
-      const process = processByOccurrence.get(occurrence.id)!;
-      const goalCredit = roundScore(post.progress - pre.progress);
-      const confidence = creditConfidence(occurrence, pre, post, process);
-      const creditScore = roundScore(goalCredit * confidence);
+    const parsedByOccurrence = new Map(parsed.credits.map((item) => [item.occurrenceId, item]));
+    const credits = context.occurrences.map((occurrence) => {
+      const scored = parsedByOccurrence.get(occurrence.id)!;
       const evidenceRole = evidenceRoleFor({
         occurrence,
-        creditScore,
-        processQuality: process.quality,
-        confidence
+        rewardCredit: scored.rewardCredit,
+        attributionType: scored.attributionType,
+        confidence: scored.confidence
       });
       return {
         occurrenceId: occurrence.id,
@@ -229,17 +220,15 @@ export class SpanCreditPipeline {
         spanIndex: occurrence.spanIndex,
         preStateId: occurrence.preStateId,
         postStateId: occurrence.postStateId,
-        goalCredit,
-        processQuality: process.quality,
-        confidence,
+        rewardCredit: scored.rewardCredit,
+        attributionType: scored.attributionType,
+        confidence: scored.confidence,
         evidenceRole,
         evidenceRefs: unique([
-          ...pre.evidenceRefs,
-          ...post.evidenceRefs,
-          ...process.evidenceRefs,
+          ...scored.evidenceRefs,
           ...occurrence.span.termination.evidenceRefs
         ]),
-        reason: clip(`goal: ${goalCredit}; process: ${process.reason}`, 800)
+        reason: clip(scored.reason, 800)
       };
     });
     const run = buildEpisodeSpanCreditRun({
@@ -248,8 +237,8 @@ export class SpanCreditPipeline {
       pathHash: context.pathHash,
       namespaceId: context.namespaceId,
       rewardHash: context.rewardHash,
-      goalAchievement: context.goalAchievement,
-      statePotentials,
+      episodeReward: context.episodeReward,
+      inputCompaction: context.inputCompaction,
       credits,
       scorerModel: this.deps.skillLlm.config.model
     });
@@ -296,9 +285,16 @@ export class SpanCreditPipeline {
     }
     const stateById = new Map(pathRecord.path.states.map((state) => [state.id, state]));
     const boundaries = occurrenceBoundaries(occurrences, stateById);
-    const goalAchievement = goalAchievementForEpisode(episode);
+    const episodeReward = episodeRewardForCredit(episode);
     const rewardHash = spanCreditRewardHash(episode);
     const validEvidenceRefs = collectValidEvidenceRefs(pathRecord.path, occurrences, boundaries);
+    const scoringInput = buildScoringPayload({
+      episode,
+      path: pathRecord.path,
+      occurrences,
+      boundaries,
+      episodeReward
+    }, this.deps.maxInputChars ?? SPAN_CREDIT_MAX_INPUT_CHARS);
     return {
       episode,
       path: pathRecord.path,
@@ -307,16 +303,11 @@ export class SpanCreditPipeline {
       namespaceId: pathRecord.namespaceId,
       occurrences,
       boundaries,
-      goalAchievement,
+      episodeReward,
       rewardHash,
       validEvidenceRefs,
-      payload: buildScoringPayload({
-        episode,
-        path: pathRecord.path,
-        occurrences,
-        boundaries,
-        goalAchievement
-      })
+      payload: scoringInput.payload,
+      inputCompaction: scoringInput.compaction
     };
   }
 }
@@ -338,28 +329,49 @@ function buildScoringPayload(input: {
   path: EpisodeProceduralPathV2;
   occurrences: ProceduralSpanOccurrenceRecord[];
   boundaries: BoundaryState[];
-  goalAchievement: number;
-}): Record<string, unknown> {
+  episodeReward: number;
+}, maxInputChars: number): {
+  payload: Record<string, unknown>;
+  compaction: SpanCreditInputCompactionV1;
+} {
   const stepById = new Map(input.path.steps.map((step) => [step.id, step]));
-  return {
+  const selectedSteps = new Map(input.occurrences.map((occurrence) => [
+    occurrence.id,
+    selectSteps(occurrence.stepIds.map((id) => stepById.get(id)!))
+  ]));
+  const omittedBySelection = input.path.steps.length - [...selectedSteps.values()]
+    .reduce((sum, steps) => sum + steps.length, 0);
+  const payloadFor = (
+    mode: SpanCreditInputCompactionV1["mode"],
+    textLimit: number
+  ): Record<string, unknown> => ({
     episode_id: input.episode.id,
-    episode_goal: episodeGoal(input.episode, input.boundaries[0]!.state),
-    terminal_goal_achievement: input.goalAchievement,
-    reward_reason: text(input.episode.rewardDetail.reason),
+    episode_goal: clip(
+      episodeGoal(input.episode, input.boundaries[0]!.state),
+      mode === "full" ? 1_200 : mode === "compact" ? 600 : Math.max(textLimit, 100)
+    ),
+    episode_reward: input.episodeReward,
+    reward_reason: clip(
+      text(input.episode.rewardDetail.reason) ?? "",
+      mode === "minimal" ? Math.max(textLimit, 100) : Math.max(textLimit, 400)
+    ),
+    input_compaction_mode: mode,
     boundary_states: input.boundaries.map(({ boundaryIndex, state }) => ({
       boundary_index: boundaryIndex,
       state_id: state.id,
-      anchored_progress: boundaryIndex === 0
-        ? 0
-        : boundaryIndex === input.occurrences.length
-          ? input.goalAchievement
-          : undefined,
-      summary: clip(state.summary, 1_200),
+      summary: clip(state.summary, textLimit),
       task_status: state.taskStatus,
-      goal: state.goal,
-      issues: state.issues.slice(0, 12),
-      verification: state.verification.slice(0, 12),
-      artifacts: state.artifacts.slice(0, 12)
+      ...(mode === "minimal" ? {} : {
+        goal: state.goal ? compactStateEntry(state.goal, textLimit) : undefined,
+        facts: state.facts.slice(0, mode === "full" ? 10 : 4)
+          .map((entry) => compactStateEntry(entry, textLimit)),
+        issues: state.issues.slice(0, mode === "full" ? 10 : 4)
+          .map((entry) => compactStateEntry(entry, textLimit)),
+        verification: state.verification.slice(0, mode === "full" ? 10 : 4)
+          .map((entry) => compactStateEntry(entry, textLimit)),
+        artifacts: state.artifacts.slice(0, mode === "full" ? 10 : 4)
+          .map((entry) => compactStateEntry(entry, textLimit))
+      })
     })),
     spans: input.occurrences.map((occurrence) => ({
       occurrence_id: occurrence.id,
@@ -367,130 +379,115 @@ function buildScoringPayload(input: {
       span_index: occurrence.spanIndex,
       pre_boundary_index: occurrence.spanIndex,
       post_boundary_index: occurrence.spanIndex + 1,
-      local_goal: clip(occurrence.localGoal, 600),
-      entry_condition: clip(occurrence.entryCondition, 800),
-      exit_condition: clip(occurrence.exitCondition, 800),
+      local_goal: clip(occurrence.localGoal, textLimit),
+      capability_goal: clip(occurrence.capabilityGoal, textLimit),
+      entry_condition: clip(occurrence.entryCondition, textLimit),
+      exit_condition: clip(occurrence.exitCondition, textLimit),
       termination_status: occurrence.terminationStatus,
       cost: occurrence.span.cost,
-      procedure_summary: clip(occurrence.projection.procedureText, 2_000),
-      evidence_refs: occurrence.span.termination.evidenceRefs,
-      steps: selectSteps(occurrence.stepIds.map((id) => stepById.get(id)!)).map(compactStep)
+      procedure_summary: clip(occurrence.projection.procedureText, textLimit),
+      evidence_refs: mode === "minimal"
+        ? [occurrence.id]
+        : unique([occurrence.id, ...occurrence.span.termination.evidenceRefs]).slice(0, 8),
+      ...(mode === "full" ? {
+        steps: selectedSteps.get(occurrence.id)!.map(compactStep)
+      } : {})
     }))
-  };
+  });
+  const full = payloadFor("full", 1_200);
+  const originalChars = stableStringify(full).length;
+  if (originalChars <= maxInputChars) {
+    return {
+      payload: full,
+      compaction: {
+        mode: "full",
+        originalChars,
+        finalChars: originalChars,
+        omittedStepCount: omittedBySelection
+      }
+    };
+  }
+  const compact = payloadFor("compact", 500);
+  const compactChars = stableStringify(compact).length;
+  if (compactChars <= maxInputChars) {
+    return {
+      payload: compact,
+      compaction: {
+        mode: "compact",
+        originalChars,
+        finalChars: compactChars,
+        omittedStepCount: input.path.steps.length
+      }
+    };
+  }
+  for (const textLimit of [240, 160, 96, 48, 24]) {
+    const minimal = payloadFor("minimal", textLimit);
+    const minimalChars = stableStringify(minimal).length;
+    if (minimalChars <= maxInputChars) {
+      return {
+        payload: minimal,
+        compaction: {
+          mode: "minimal",
+          originalChars,
+          finalChars: minimalChars,
+          omittedStepCount: input.path.steps.length
+        }
+      };
+    }
+  }
+  throw new Error(
+    `SpanCredit irreducible payload exceeds ${maxInputChars} characters; ` +
+    `all ${input.occurrences.length} Final Spans were preserved and no multi-call fallback is allowed`
+  );
 }
 
 function parseScoringResult(raw: SpanCreditLlmResult, context: ScoringContext): ParsedScoringResult {
-  assertExactKeys(raw, ["state_progress", "span_process_quality"], "SpanCredit response");
-  const internalBoundaries = context.boundaries.slice(1, -1).map((item) => item.boundaryIndex);
-  const stateProgress = parseStateProgress(raw.state_progress, internalBoundaries, context.validEvidenceRefs);
-  const anchoredProgress = [
-    0,
-    ...stateProgress.map((item) => item.progress),
-    context.goalAchievement
-  ];
-  for (let index = 1; index < anchoredProgress.length; index += 1) {
-    const delta = anchoredProgress[index]! - anchoredProgress[index - 1]!;
-    if (delta < -1 || delta > 1) {
-      throw new Error(`adjacent boundary progress change at Span ${index - 1} must be in [-1, 1]`);
+  assertExactKeys(raw, ["span_credits"], "SpanCredit response");
+  const expectedOccurrenceIds = context.occurrences.map((occurrence) => occurrence.id);
+  if (!Array.isArray(raw.span_credits) || raw.span_credits.length !== expectedOccurrenceIds.length) {
+    throw new Error(`span_credits must contain ${expectedOccurrenceIds.length} entries`);
+  }
+  const credits = raw.span_credits.map((value) => {
+    if (!isRecord(value)) throw new Error("span_credits entries must be objects");
+    assertExactKeys(
+      value,
+      ["occurrence_id", "reward_credit", "attribution_type", "confidence", "evidence_refs", "reason"],
+      "span_credits entry"
+    );
+    const occurrenceId = requiredText(value.occurrence_id, "span_credits.occurrence_id");
+    const rewardCredit = score(value.reward_credit, "span_credits.reward_credit");
+    const attributionType = attributionTypeValue(value.attribution_type);
+    if (attributionType === "helpful" && rewardCredit <= 0) {
+      throw new Error(`helpful Span ${occurrenceId} must have positive reward_credit`);
     }
-  }
-  const processQuality = parseProcessQuality(
-    raw.span_process_quality,
-    context.occurrences.map((occurrence) => occurrence.id),
-    context.validEvidenceRefs
-  );
-  return { stateProgress, processQuality };
-}
-
-function parseStateProgress(
-  raw: unknown,
-  expectedBoundaryIndices: number[],
-  validRefs: Set<string>
-): StateProgressResult[] {
-  if (!Array.isArray(raw) || raw.length !== expectedBoundaryIndices.length) {
-    throw new Error(`state_progress must contain ${expectedBoundaryIndices.length} entries`);
-  }
-  const parsed = raw.map((value) => {
-    if (!isRecord(value)) throw new Error("state_progress entries must be objects");
-    assertExactKeys(
-      value,
-      ["boundary_index", "progress", "evidence_refs", "reason"],
-      "state_progress entry"
-    );
-    const boundaryIndex = integer(value.boundary_index, "state_progress.boundary_index");
-    const progress = score(value.progress, "state_progress.progress");
-    return {
-      boundaryIndex,
-      progress,
-      evidenceRefs: evidenceRefs(value.evidence_refs, validRefs, "state_progress.evidence_refs"),
-      reason: requiredText(value.reason, "state_progress.reason")
-    };
-  });
-  assertExactIds(parsed.map((item) => item.boundaryIndex), expectedBoundaryIndices, "state_progress boundary indices");
-  return parsed.sort((left, right) => left.boundaryIndex - right.boundaryIndex);
-}
-
-function parseProcessQuality(
-  raw: unknown,
-  expectedOccurrenceIds: string[],
-  validRefs: Set<string>
-): ProcessQualityResult[] {
-  if (!Array.isArray(raw) || raw.length !== expectedOccurrenceIds.length) {
-    throw new Error(`span_process_quality must contain ${expectedOccurrenceIds.length} entries`);
-  }
-  const parsed = raw.map((value) => {
-    if (!isRecord(value)) throw new Error("span_process_quality entries must be objects");
-    assertExactKeys(
-      value,
-      ["occurrence_id", "quality", "evidence_refs", "reason"],
-      "span_process_quality entry"
-    );
-    const occurrenceId = requiredText(value.occurrence_id, "span_process_quality.occurrence_id");
+    if (attributionType === "harmful" && rewardCredit >= 0) {
+      throw new Error(`harmful Span ${occurrenceId} must have negative reward_credit`);
+    }
+    if (attributionType === "neutral" && Math.abs(rewardCredit) > 0.05) {
+      throw new Error(`neutral Span ${occurrenceId} must have near-zero reward_credit`);
+    }
     return {
       occurrenceId,
-      quality: score(value.quality, "span_process_quality.quality"),
-      evidenceRefs: evidenceRefs(value.evidence_refs, validRefs, "span_process_quality.evidence_refs"),
-      reason: requiredText(value.reason, "span_process_quality.reason")
+      rewardCredit,
+      attributionType,
+      confidence: unitScore(value.confidence, "span_credits.confidence"),
+      evidenceRefs: evidenceRefs(value.evidence_refs, context.validEvidenceRefs, "span_credits.evidence_refs"),
+      reason: requiredText(value.reason, "span_credits.reason")
     };
   });
-  assertExactIds(parsed.map((item) => item.occurrenceId), expectedOccurrenceIds, "span_process_quality occurrence ids");
-  return parsed.sort((left, right) =>
-    expectedOccurrenceIds.indexOf(left.occurrenceId) - expectedOccurrenceIds.indexOf(right.occurrenceId));
-}
-
-function materializeStatePotentials(
-  context: ScoringContext,
-  internal: StateProgressResult[]
-): SpanStatePotentialV1[] {
-  const internalByBoundary = new Map(internal.map((item) => [item.boundaryIndex, item]));
-  return context.boundaries.map(({ boundaryIndex, state }) => {
-    if (boundaryIndex === 0) {
-      return {
-        boundaryIndex,
-        stateId: state.id,
-        progress: 0,
-        evidenceRefs: [state.id],
-        reason: "Episode start anchor"
-      };
-    }
-    if (boundaryIndex === context.boundaries.length - 1) {
-      return {
-        boundaryIndex,
-        stateId: state.id,
-        progress: context.goalAchievement,
-        evidenceRefs: unique([state.id, ...state.verification.flatMap((item) => item.sourceRefs)]),
-        reason: "Episode goal-achievement anchor"
-      };
-    }
-    const scored = internalByBoundary.get(boundaryIndex)!;
-    return {
-      boundaryIndex,
-      stateId: state.id,
-      progress: scored.progress,
-      evidenceRefs: scored.evidenceRefs,
-      reason: scored.reason
-    };
-  });
+  assertExactIds(credits.map((item) => item.occurrenceId), expectedOccurrenceIds, "span_credits occurrence ids");
+  if (credits.some((item, index) => item.occurrenceId !== expectedOccurrenceIds[index])) {
+    throw new Error("span_credits must preserve the requested occurrence order");
+  }
+  const allocatedReward = roundUnbounded(
+    credits.reduce((sum, credit) => sum + credit.rewardCredit, 0)
+  );
+  if (Math.abs(allocatedReward - context.episodeReward) > 1e-5) {
+    throw new Error(
+      `span_credits must conserve episode_reward: credits=${allocatedReward}, episode_reward=${context.episodeReward}`
+    );
+  }
+  return { credits };
 }
 
 function occurrenceBoundaries(
@@ -546,55 +543,32 @@ function collectValidEvidenceRefs(
   return refs;
 }
 
-function creditConfidence(
-  occurrence: ProceduralSpanOccurrenceRecord,
-  pre: SpanStatePotentialV1,
-  post: SpanStatePotentialV1,
-  process: ProcessQualityResult
-): number {
-  const evidenceCoverage = (
-    (pre.evidenceRefs.length > 0 ? 1 : 0.5) +
-    (post.evidenceRefs.length > 0 ? 1 : 0.5) +
-    (process.evidenceRefs.length > 0 ? 1 : 0.5)
-  ) / 3;
-  return roundUnit(Math.min(occurrence.span.segmentation.confidence, evidenceCoverage));
-}
-
 function evidenceRoleFor(input: {
   occurrence: ProceduralSpanOccurrenceRecord;
-  creditScore: number;
-  processQuality: number;
+  rewardCredit: number;
+  attributionType: SpanCreditAttributionType;
   confidence: number;
 }): SpanCreditEvidenceRole {
-  if (input.confidence < MIN_ROLE_CONFIDENCE) return "uncertain";
+  if (input.confidence < MIN_ROLE_CONFIDENCE || input.attributionType === "uncertain") {
+    return "uncertain";
+  }
   if (
-    input.creditScore <= NEGATIVE_CREDIT_THRESHOLD ||
-    input.processQuality <= COUNTEREXAMPLE_PROCESS_THRESHOLD ||
-    input.occurrence.terminationStatus === "failure" ||
-    input.occurrence.terminationStatus === "blocked" ||
-    input.occurrence.terminationStatus === "abandoned"
+    input.attributionType === "harmful" &&
+    input.rewardCredit <= NEGATIVE_CREDIT_THRESHOLD
   ) return "counterexample";
   if (
-    input.creditScore >= POSITIVE_CREDIT_THRESHOLD &&
-    input.processQuality >= MIN_SUPPORT_PROCESS_QUALITY &&
+    input.attributionType === "helpful" &&
+    input.rewardCredit >= POSITIVE_CREDIT_THRESHOLD &&
     input.occurrence.terminationStatus === "success"
   ) return "support";
   return "neutral";
 }
 
-function goalAchievementForEpisode(episode: EpisodeRecord): number {
-  const axes = isRecord(episode.rewardDetail.axes) ? episode.rewardDetail.axes : undefined;
-  const candidates = [
-    axes?.goalAchievement,
-    axes?.goal_achievement,
-    episode.rewardDetail.goalAchievement,
-    episode.rewardDetail.goal_achievement,
-    episode.rTask
-  ];
-  const value = candidates.find((candidate): candidate is number =>
-    typeof candidate === "number" && Number.isFinite(candidate));
-  if (value === undefined) throw new Error(`SpanCredit reward lacks goal achievement: ${episode.id}`);
-  return roundScore(value);
+function episodeRewardForCredit(episode: EpisodeRecord): number {
+  if (typeof episode.rTask !== "number" || !Number.isFinite(episode.rTask)) {
+    throw new Error(`SpanCredit Episode lacks a finite rTask reward: ${episode.id}`);
+  }
+  return roundScore(episode.rTask);
 }
 
 function episodeGoal(episode: EpisodeRecord, initialState: ObservedStateV1): string {
@@ -615,6 +589,20 @@ function compactStep(step: ExecutionStepV1): Record<string, unknown> {
     retry_of_step_id: step.retryOfStepId,
     recovery_from_step_id: step.recoveryFromStepId,
     cost: step.cost
+  };
+}
+
+function compactStateEntry(
+  entry: ObservedStateV1["facts"][number],
+  textLimit: number
+): Record<string, unknown> {
+  return {
+    subject: clip(entry.subject, textLimit),
+    ...(entry.status ? { status: clip(entry.status, Math.min(textLimit, 160)) } : {}),
+    ...(entry.value === undefined ? {} : {
+      value: clip(typeof entry.value === "string" ? entry.value : stableStringify(entry.value), textLimit)
+    }),
+    source_refs: entry.sourceRefs.slice(0, 4)
   };
 }
 
@@ -671,11 +659,6 @@ function text(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-function integer(value: unknown, field: string): number {
-  if (typeof value !== "number" || !Number.isInteger(value)) throw new Error(`${field} must be an integer`);
-  return value;
-}
-
 function score(value: unknown, field: string): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < -1 || value > 1) {
     throw new Error(`${field} must be a number in [-1, 1]`);
@@ -683,12 +666,29 @@ function score(value: unknown, field: string): number {
   return roundScore(value);
 }
 
+function unitScore(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`${field} must be a number in [0, 1]`);
+  }
+  return Math.round(value * 1_000_000) / 1_000_000;
+}
+
+function attributionTypeValue(value: unknown): SpanCreditAttributionType {
+  if (
+    value === "helpful" || value === "harmful" || value === "externally_blocked" ||
+    value === "neutral" || value === "uncertain"
+  ) return value;
+  throw new Error(
+    "span_credits.attribution_type must be helpful, harmful, externally_blocked, neutral, or uncertain"
+  );
+}
+
 function roundScore(value: number): number {
   return Math.round(Math.max(-1, Math.min(1, value)) * 1_000_000) / 1_000_000;
 }
 
-function roundUnit(value: number): number {
-  return Math.round(Math.max(0, Math.min(1, value)) * 1_000_000) / 1_000_000;
+function roundUnbounded(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000;
 }
 
 function unique(values: readonly string[]): string[] {

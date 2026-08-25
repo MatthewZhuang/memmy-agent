@@ -1,20 +1,26 @@
 import { stableHash } from "../../utils/id.js";
 
-export const SPAN_CREDIT_SCHEMA_VERSION = "span-credit.v1" as const;
-export const SPAN_CREDIT_ALGORITHM_VERSION = "span-credit-potential-difference.v1" as const;
-export const SPAN_CREDIT_PROMPT_VERSION = "span-credit-prompt.v1" as const;
+export const SPAN_CREDIT_SCHEMA_VERSION = "span-credit.v2" as const;
+export const SPAN_CREDIT_ALGORITHM_VERSION = "span-credit-global-reward-budget.v2" as const;
+export const SPAN_CREDIT_PROMPT_VERSION = "span-credit-global-reward-budget-prompt.v2" as const;
+
+export type SpanCreditAttributionType =
+  | "helpful"
+  | "harmful"
+  | "externally_blocked"
+  | "neutral"
+  | "uncertain";
 
 export type SpanCreditEvidenceRole = "support" | "counterexample" | "neutral" | "uncertain";
 
-export interface SpanStatePotentialV1 {
-  boundaryIndex: number;
-  stateId: string;
-  progress: number;
-  evidenceRefs: string[];
-  reason: string;
+export interface SpanCreditInputCompactionV1 {
+  mode: "full" | "compact" | "minimal";
+  originalChars: number;
+  finalChars: number;
+  omittedStepCount: number;
 }
 
-export interface SpanCreditV1 {
+export interface SpanCreditV2 {
   id: string;
   schemaVersion: typeof SPAN_CREDIT_SCHEMA_VERSION;
   occurrenceId: string;
@@ -22,16 +28,15 @@ export interface SpanCreditV1 {
   spanIndex: number;
   preStateId: string;
   postStateId: string;
-  goalCredit: number;
-  processQuality: number;
+  rewardCredit: number;
+  attributionType: SpanCreditAttributionType;
   confidence: number;
-  creditScore: number;
   evidenceRole: SpanCreditEvidenceRole;
   evidenceRefs: string[];
   reason: string;
 }
 
-export interface EpisodeSpanCreditRunV1 {
+export interface EpisodeSpanCreditRunV2 {
   id: string;
   schemaVersion: typeof SPAN_CREDIT_SCHEMA_VERSION;
   algorithmVersion: typeof SPAN_CREDIT_ALGORITHM_VERSION;
@@ -41,9 +46,9 @@ export interface EpisodeSpanCreditRunV1 {
   pathHash: string;
   namespaceId: string;
   rewardHash: string;
-  goalAchievement: number;
-  statePotentials: SpanStatePotentialV1[];
-  credits: SpanCreditV1[];
+  episodeReward: number;
+  inputCompaction: SpanCreditInputCompactionV1;
+  credits: SpanCreditV2[];
   scorerModel?: string;
   contentHash: string;
 }
@@ -54,53 +59,51 @@ export function buildEpisodeSpanCreditRun(input: {
   pathHash: string;
   namespaceId: string;
   rewardHash: string;
-  goalAchievement: number;
-  statePotentials: SpanStatePotentialV1[];
-  credits: Array<Omit<SpanCreditV1, "id" | "schemaVersion" | "creditScore">>;
+  episodeReward: number;
+  inputCompaction?: SpanCreditInputCompactionV1;
+  credits: Array<Omit<SpanCreditV2, "id" | "schemaVersion">>;
   scorerModel?: string;
-}): EpisodeSpanCreditRunV1 {
-  const goalAchievement = roundScore(input.goalAchievement);
-  const statePotentials = input.statePotentials.map((potential) => ({
-    ...potential,
-    progress: roundScore(potential.progress),
-    evidenceRefs: uniqueSorted(potential.evidenceRefs)
-  }));
+}): EpisodeSpanCreditRunV2 {
+  const episodeReward = roundScore(input.episodeReward);
   const credits = input.credits.map((credit) => {
-    const goalCredit = roundScore(credit.goalCredit);
-    const processQuality = roundScore(credit.processQuality);
+    const rewardCredit = roundScore(credit.rewardCredit);
     const confidence = roundUnit(credit.confidence);
-    const creditScore = roundScore(goalCredit * confidence);
+    const evidenceRefs = uniqueSorted(credit.evidenceRefs);
     const basis = {
       schemaVersion: SPAN_CREDIT_SCHEMA_VERSION,
       episodeId: input.episodeId,
       pathHash: input.pathHash,
       rewardHash: input.rewardHash,
       occurrenceId: credit.occurrenceId,
-      goalCredit,
-      processQuality,
+      rewardCredit,
+      attributionType: credit.attributionType,
       confidence,
       evidenceRole: credit.evidenceRole,
-      evidenceRefs: uniqueSorted(credit.evidenceRefs),
+      evidenceRefs,
       reason: credit.reason
     };
     return {
       ...credit,
       id: `span_credit_${stableHash(basis).slice(0, 24)}`,
       schemaVersion: SPAN_CREDIT_SCHEMA_VERSION,
-      goalCredit,
-      processQuality,
+      rewardCredit,
       confidence,
-      creditScore,
-      evidenceRefs: basis.evidenceRefs
+      evidenceRefs
     };
   });
-  assertCreditPathShape(statePotentials, credits, goalAchievement);
-  const creditedGoal = roundScore(credits.reduce((sum, credit) => sum + credit.goalCredit, 0));
-  if (Math.abs(creditedGoal - goalAchievement) > 1e-5) {
+  assertCreditPathShape(credits);
+  const creditedReward = roundedSum(credits.map((credit) => credit.rewardCredit));
+  if (Math.abs(creditedReward - episodeReward) > 1e-5) {
     throw new Error(
-      `SpanCredit goal conservation failed: credits=${creditedGoal}, goalAchievement=${goalAchievement}`
+      `SpanCredit reward conservation failed: credits=${creditedReward}, episodeReward=${episodeReward}`
     );
   }
+  const inputCompaction = input.inputCompaction ?? {
+    mode: "full",
+    originalChars: 0,
+    finalChars: 0,
+    omittedStepCount: 0
+  };
   const content = {
     schemaVersion: SPAN_CREDIT_SCHEMA_VERSION,
     algorithmVersion: SPAN_CREDIT_ALGORITHM_VERSION,
@@ -110,8 +113,8 @@ export function buildEpisodeSpanCreditRun(input: {
     pathHash: input.pathHash,
     namespaceId: input.namespaceId,
     rewardHash: input.rewardHash,
-    goalAchievement,
-    statePotentials,
+    episodeReward,
+    inputCompaction,
     credits,
     ...(input.scorerModel ? { scorerModel: input.scorerModel } : {})
   };
@@ -135,42 +138,24 @@ function roundUnit(value: number): number {
   return Math.round(value * 1_000_000) / 1_000_000;
 }
 
+function roundedSum(values: readonly number[]): number {
+  return Math.round(values.reduce((sum, value) => sum + value, 0) * 1_000_000) / 1_000_000;
+}
+
 function uniqueSorted(values: readonly string[]): string[] {
   return [...new Set(values.filter(Boolean))].sort((left, right) => left.localeCompare(right));
 }
 
-function assertCreditPathShape(
-  statePotentials: SpanStatePotentialV1[],
-  credits: SpanCreditV1[],
-  goalAchievement: number
-): void {
-  if (credits.length === 0 || statePotentials.length !== credits.length + 1) {
-    throw new Error("SpanCredit run must contain one more boundary state than Span credits");
-  }
-  if (Math.abs(statePotentials[0]!.progress) > 1e-6) {
-    throw new Error("SpanCredit boundary 0 must be anchored to progress 0");
-  }
-  if (Math.abs(statePotentials.at(-1)!.progress - goalAchievement) > 1e-6) {
-    throw new Error("SpanCredit terminal boundary must equal goalAchievement");
-  }
-  for (const [index, potential] of statePotentials.entries()) {
-    if (potential.boundaryIndex !== index) {
-      throw new Error(`SpanCredit boundary index mismatch at ${index}`);
-    }
-  }
+function assertCreditPathShape(credits: SpanCreditV2[]): void {
+  if (credits.length === 0) throw new Error("SpanCredit run must contain at least one Span credit");
+  const occurrenceIds = new Set<string>();
   for (const [index, credit] of credits.entries()) {
-    const pre = statePotentials[index]!;
-    const post = statePotentials[index + 1]!;
-    if (
-      credit.spanIndex !== index ||
-      credit.preStateId !== pre.stateId ||
-      credit.postStateId !== post.stateId
-    ) {
-      throw new Error(`SpanCredit state transition mismatch at Span ${index}`);
+    if (credit.spanIndex !== index) {
+      throw new Error(`SpanCredit index mismatch at Span ${index}`);
     }
-    const expectedCredit = Math.round((post.progress - pre.progress) * 1_000_000) / 1_000_000;
-    if (Math.abs(expectedCredit - credit.goalCredit) > 1e-6) {
-      throw new Error(`SpanCredit potential difference mismatch at Span ${index}`);
+    if (occurrenceIds.has(credit.occurrenceId)) {
+      throw new Error(`SpanCredit occurrence is duplicated: ${credit.occurrenceId}`);
     }
+    occurrenceIds.add(credit.occurrenceId);
   }
 }

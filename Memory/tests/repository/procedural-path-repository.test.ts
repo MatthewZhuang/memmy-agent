@@ -67,14 +67,16 @@ describe("repository procedural path persistence", () => {
         stepIds: path.spans[0]!.stepIds,
         preStateId: path.spans[0]!.preStateId,
         postStateId: path.spans[0]!.postStateId,
+        localGoal: "Resolve a dependency failure",
+        capabilityGoal: "Diagnose, repair, and verify a dependency constraint failure",
         projection: {
           version: PROCEDURAL_SPAN_CLUSTER_PROJECTION_VERSION,
-          goalText: "Resolve a dependency failure",
+          goalText: "Diagnose, repair, and verify a dependency constraint failure",
           structureSignature: expect.stringMatching(/^[a-f0-9]{64}$/)
         }
       });
       expect(first.occurrences[0]!.projection.procedureText)
-        .toContain("Correct the dependency constraint and rerun tests");
+        .toBe("inspect failure evidence -> repair the constraint -> run focused verification");
       expect(first.occurrences[0]!.projection.procedureText).not.toContain("tool=");
       expect(first.occurrences[0]!.projection.procedureText).not.toContain("recovery_from=");
       expect(first.occurrences[0]!.projection.conditionText).toBe(
@@ -458,6 +460,8 @@ function proceduralPath(
     spanIndex: 0,
     stepIds: steps.map((step) => step.id),
     localGoal: "Resolve a dependency failure",
+    capabilityGoal: "Diagnose, repair, and verify a dependency constraint failure",
+    procedureSemantic: "inspect failure evidence -> repair the constraint -> run focused verification",
     entryCondition: "Tests fail because dependency constraints conflict",
     exitCondition: "The corrected dependency passes the test suite",
     terminationStatus: "success",
@@ -471,6 +475,8 @@ function proceduralPath(
     episodeId,
     spanIndex: 0,
     localGoal: decision.localGoal,
+    capabilityGoal: decision.capabilityGoal,
+    procedureSemantic: decision.procedureSemantic,
     entryCondition: decision.entryCondition,
     stepIds: [...decision.stepIds],
     rawTurnIds: ["turn-a"],
