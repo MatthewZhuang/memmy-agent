@@ -221,29 +221,18 @@ describe("repository procedural path persistence", () => {
       });
       expect(repos.proceduralPaths.listActiveOccurrencesForNamespace(SESSION_NAMESPACE_ID))
         .toHaveLength(1);
-      expect(queued).toHaveLength(2);
+      expect(queued).toHaveLength(1);
       expect(queued).toEqual(expect.arrayContaining([
         expect.objectContaining({
-          jobType: "span_credit",
+          jobType: "step_sequence_learning",
           userId: "user-a",
           sessionId: "session-a",
           episodeId: "episode-a",
           payload: {
             pathId: path.id,
             pathHash: path.pathHash,
-            rewardHash: expect.stringMatching(/^[a-f0-9]{64}$/)
-          }
-        }),
-        expect.objectContaining({
-          jobType: "episode_policy_projection",
-          userId: "user-a",
-          sessionId: "session-a",
-          episodeId: "episode-a",
-          payload: expect.objectContaining({
-            pathId: path.id,
-            pathHash: path.pathHash,
             trigger: "procedural_path_activated"
-          })
+          }
         })
       ]));
       db.close();

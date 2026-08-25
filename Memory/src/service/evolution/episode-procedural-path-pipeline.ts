@@ -3,10 +3,8 @@ import type { SaveEpisodeProceduralPathResult } from "../../storage/procedural-p
 import { nowIso } from "../../utils/time.js";
 import { proceduralLearningScopeIdForSession } from "../namespace/namespace-scope.js";
 import { EPISODE_PROCEDURAL_RECONSTRUCTION_VERSION } from "./episode-procedural-reconstructor.js";
-import type { EpisodeProceduralPathV2 } from "./procedural-path-model.js";
-import { spanCreditRewardHash } from "./span-credit-pipeline.js";
+import { episodeRewardHash, type EpisodeProceduralPathV2 } from "./procedural-path-model.js";
 import type { EnqueueJobInput } from "../worker/job-handlers.js";
-import { enqueueEpisodePolicyProjection } from "./episode-policy-projection.js";
 
 export interface EpisodeProceduralPathReconstructor {
   reconstruct(input: {
@@ -20,7 +18,6 @@ export interface EpisodeProceduralPathPersistencePipelineDeps {
   repos: Repositories;
   reconstructor: EpisodeProceduralPathReconstructor;
   enqueueJob?(input: EnqueueJobInput): EvolutionJobRecord;
-  learningMode?: "span" | "step_sequence";
 }
 
 export class EpisodeProceduralPathPersistencePipeline {
@@ -33,7 +30,7 @@ export class EpisodeProceduralPathPersistencePipeline {
     const queuedRewardHash = typeof job.payload.rewardHash === "string"
       ? job.payload.rewardHash
       : undefined;
-    if (queuedRewardHash && queuedRewardHash !== spanCreditRewardHash(episode)) return undefined;
+    if (queuedRewardHash && queuedRewardHash !== episodeRewardHash(episode)) return undefined;
     const activePath = this.deps.repos.proceduralPaths.getActiveForEpisode(episode.id);
     if (
       activePath &&
@@ -91,47 +88,12 @@ export class EpisodeProceduralPathPersistencePipeline {
     return saved;
   }
 
-  private enqueueSpanCredit(
-    episode: NonNullable<ReturnType<Repositories["runtime"]["getEpisode"]>>,
-    path: SaveEpisodeProceduralPathResult["record"],
-    createdAt: string
-  ): void {
-    if (episode.rTask === undefined || !this.deps.enqueueJob) return;
-    const occurrences = this.deps.repos.proceduralPaths.listOccurrencesForPath(path.id);
-    if (occurrences.length === 0) return;
-    this.deps.enqueueJob({
-      jobType: "span_credit",
-      userId: episode.userId,
-      sessionId: episode.sessionId,
-      episodeId: episode.id,
-      payload: {
-        pathId: path.id,
-        pathHash: path.pathHash,
-        rewardHash: spanCreditRewardHash(episode)
-      },
-      createdAt
-    });
-  }
-
-  private enqueueProjection(episodeId: string, at: string, trigger: string): void {
-    if (!this.deps.enqueueJob) return;
-    enqueueEpisodePolicyProjection({
-      repos: this.deps.repos,
-      enqueueJob: this.deps.enqueueJob
-    }, { episodeId, at, trigger });
-  }
-
   private enqueueLearning(
     episode: NonNullable<ReturnType<Repositories["runtime"]["getEpisode"]>>,
     path: SaveEpisodeProceduralPathResult["record"],
     at: string,
     trigger: string
   ): void {
-    if (this.deps.learningMode !== "step_sequence") {
-      this.enqueueSpanCredit(episode, path, at);
-      this.enqueueProjection(episode.id, at, trigger);
-      return;
-    }
     if (!this.deps.enqueueJob || path.path.steps.length === 0) return;
     this.deps.enqueueJob({
       jobType: "step_sequence_learning",

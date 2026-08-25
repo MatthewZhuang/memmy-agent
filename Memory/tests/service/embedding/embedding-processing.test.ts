@@ -14,7 +14,6 @@ import {
   embeddingTextForMemory,
   embeddingRetrySourceText,
   spanEmbeddingText,
-  spanHasBothEmbeddings,
   updateMemoryVectorField
 } from "../../../src/service/embedding/embedding-pipeline.js";
 import { attachMemoryVector } from "../../../src/storage/memory-vector-state.js";
@@ -119,32 +118,7 @@ describe("MemoryService / embedding / processing", () => {
     db.close();
   });
 
-  it("requires both Span embedding vectors before clustering", () => {
-    const onlyGoal = attachMemoryVector(spanMemory(), {
-      vectorField: "vec_goal",
-      vector: [1, 0, 0],
-      embeddingModel: "test",
-      embeddingProvider: "test"
-    });
-    expect(spanHasBothEmbeddings(spanMemory())).toBe(false);
-    expect(spanHasBothEmbeddings(onlyGoal)).toBe(false);
-
-    const both = attachMemoryVector(attachMemoryVector(spanMemory(), {
-      vectorField: "vec_goal",
-      vector: [1, 0, 0],
-      embeddingModel: "test",
-      embeddingProvider: "test"
-    }), {
-      vectorField: "vec_policy",
-      vector: [0, 1, 0],
-      embeddingModel: "test",
-      embeddingProvider: "test"
-    });
-
-    expect(spanHasBothEmbeddings(both)).toBe(true);
-  });
-
-  it("queues Span clustering after an embedding retry completes both Span vectors", async () => {
+  it("does not queue retired Span clustering after both legacy Span vectors complete", async () => {
     const { db, service } = createTestService();
     const repos = new Repositories(db.db);
     const span = attachMemoryVector(spanMemory(), {
@@ -170,13 +144,8 @@ describe("MemoryService / embedding / processing", () => {
       succeeded: 1,
       failed: 0
     });
-    expect(repos.runtime.listJobs(undefined, 10).filter((job) => job.jobType === "span_cluster").map((job) => job.payload))
-      .toEqual([
-        expect.objectContaining({
-          reason: "span.embeddings.ready",
-          scopeId: "span-embedding-user:unknown:default"
-        })
-      ]);
+    expect(repos.runtime.listJobs(undefined, 10).filter((job) => job.jobType === "span_cluster"))
+      .toEqual([]);
     db.close();
   });
 

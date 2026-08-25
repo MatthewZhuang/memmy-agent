@@ -19,6 +19,7 @@ import type { MemoryRow } from "../../types.js";
 import { stableHash, stableStringify } from "../../utils/id.js";
 import { isRecord } from "../../utils/json.js";
 import { clip } from "../../utils/text.js";
+import { skillBetaPosterior, skillSuccessRate } from "../read-model/skill.js";
 import {
   EPISODE_STEP_POLICY_PROJECTION_ALGORITHM_VERSION,
   STEP_CLUSTER_SIMILARITY_THRESHOLD,
@@ -432,6 +433,17 @@ export class StepSequenceLearningPipeline {
     const firstOccurrence = selected[0]!;
     const firstStep = this.deps.repos.stepSequenceLearning
       .getStep(firstOccurrence.stepOccurrenceIds[0]!)!;
+    const sourceTraceIds = this.traceMemoryIdsForStepOccurrences(
+      selected.flatMap((occurrence) => occurrence.stepOccurrenceIds)
+    );
+    const signature = stepSequencePolicySignature(current.sequenceHash);
+    const trigger = policy.triggerConditions.join("\n");
+    const procedure = policy.procedureSteps.map((step) => step.instruction).join("\n");
+    const verification = policy.verificationSteps.map((step) =>
+      `${step.check}: ${step.successSignal}`).join("\n");
+    const boundary = policy.doNotApplyWhen.join("\n");
+    const expectedOutcome = policy.verificationSteps.map((step) => step.successSignal).join("\n");
+    const support = policy.supportEpisodeIds.length;
     const memory = this.deps.buildMemory({
       userId: firstStep.userId,
       layer: "L2",
@@ -442,10 +454,16 @@ export class StepSequenceLearningPipeline {
       value: renderPolicy(policy),
       tags: ["policy", "procedural", "step-sequence", "v2", "shadow"],
       info: {
+        signature,
         title: policy.title,
-        support: policy.supportEpisodeIds.length,
+        support,
+        gain: 0,
+        raw_gain: 0,
         policy_confidence: policy.confidence,
+        freshness_class: "stable",
+        last_verified_at: at,
         status: "candidate",
+        source_memory_ids: sourceTraceIds,
         step_sequence_policy_version_id: policy.id,
         source_pattern_id: current.id,
         source_episode_ids: policy.supportEpisodeIds
@@ -453,6 +471,24 @@ export class StepSequenceLearningPipeline {
       internal: {
         source: "worker.step_sequence_policy_induction.v1",
         plugin_algorithm: STEP_SEQUENCE_POLICY_INDUCTION_VERSION,
+        source_memory_ids: sourceTraceIds,
+        source_l1_memory_ids: sourceTraceIds,
+        title: policy.title,
+        trigger,
+        procedure,
+        verification,
+        boundary,
+        expected_outcome: expectedOutcome,
+        exclusions: policy.doNotApplyWhen,
+        support,
+        gain: 0,
+        raw_gain: 0,
+        policy_confidence: policy.confidence,
+        freshness_class: "stable",
+        last_verified_at: at,
+        status: "candidate",
+        source_episode_ids: policy.supportEpisodeIds,
+        source_trace_ids: sourceTraceIds,
         step_sequence_policy: {
           policy_version_id: policy.id,
           pattern_id: current.id,
@@ -462,23 +498,34 @@ export class StepSequenceLearningPipeline {
           evidence_hash: policy.provenance.evidenceHash
         },
         policy: {
+          title: policy.title,
           goal_pattern: policy.goalPattern,
-          trigger: policy.triggerConditions.join("\n"),
-          procedure: policy.procedureSteps.map((step) => step.instruction).join("\n"),
-          verification: policy.verificationSteps.map((step) =>
-            `${step.check}: ${step.successSignal}`).join("\n"),
-          boundary: policy.doNotApplyWhen.join("\n"),
-          support: policy.supportEpisodeIds.length,
+          trigger,
+          procedure,
+          verification,
+          boundary,
+          expected_outcome: expectedOutcome,
+          exclusions: policy.doNotApplyWhen,
+          support,
           gain: 0,
           raw_gain: 0,
           policy_confidence: policy.confidence,
+          freshness_class: "stable",
+          last_verified_at: at,
           status: "candidate",
           experience_type: "success_pattern",
           evidence_polarity: "positive",
           skill_eligible: false,
+          signature,
           induction_version: STEP_SEQUENCE_POLICY_INDUCTION_VERSION,
           source_episode_ids: policy.supportEpisodeIds,
-          source_occurrence_ids: policy.evidenceOccurrenceIds
+          source_trace_ids: sourceTraceIds,
+          source_occurrence_ids: policy.evidenceOccurrenceIds,
+          decision_guidance: {
+            preference: [],
+            anti_pattern: []
+          },
+          vec: null
         }
       },
       createdAt: at
@@ -494,6 +541,16 @@ export class StepSequenceLearningPipeline {
       });
       for (const episodeId of policy.supportEpisodeIds) {
         this.deps.repos.runtime.appendEpisodeDerivedMemory(episodeId, "L2", savedMemory.id, at);
+      }
+      for (const traceId of sourceTraceIds) {
+        this.deps.repos.runtime.insertTracePolicyLink({
+          userId: firstStep.userId,
+          l1MemoryId: traceId,
+          l2MemoryId: savedMemory.id,
+          relation: "supports",
+          strength: policy.confidence,
+          createdAt: at
+        });
       }
     });
     this.scheduleEmbedding(savedMemory!, firstStep.sessionId, firstStep.episodeId, at);
@@ -756,6 +813,21 @@ export class StepSequenceLearningPipeline {
       const policy = this.deps.repos.stepSequenceLearning.getPolicy(id);
       return policy?.l2MemoryId ? [policy.l2MemoryId] : [];
     });
+    const sourceStepOccurrenceIds = unique(occurrences.flatMap((occurrence) =>
+      occurrence.stepOccurrenceIds));
+    const evidenceAnchorIds = this.traceMemoryIdsForStepOccurrences(sourceStepOccurrenceIds);
+    const support = current.selectedEpisodeCount;
+    const successRate = skillSuccessRate(0, 0);
+    const betaPosterior = skillBetaPosterior(0, 0);
+    const procedureJson = canonicalStepPolicySkillProcedure({
+      draft,
+      support,
+      successRate,
+      betaPosterior,
+      patternId: current.id,
+      evidenceOccurrenceIds: draft.evidenceOccurrenceIds,
+      sourcePolicyIds: policyMemories
+    });
     const skillKey = `skill:step-policy-sequence:${current.sequenceHash}`;
     const value = renderSkill(draft);
     const memory = this.deps.buildMemory({
@@ -772,7 +844,7 @@ export class StepSequenceLearningPipeline {
         title: draft.displayTitle,
         eta: draft.confidence,
         status: "candidate",
-        support: current.selectedEpisodeCount,
+        support,
         source_memory_ids: policyMemories,
         source_pattern_id: current.id,
         source_episode_ids: unique(occurrences.map((occurrence) => occurrence.episodeId))
@@ -783,24 +855,14 @@ export class StepSequenceLearningPipeline {
         source_memory_ids: policyMemories,
         source_policy_ids: policyMemories,
         source_step_sequence_policy_version_ids: policyVersions,
-        source_step_occurrence_ids: unique(occurrences.flatMap((occurrence) =>
-          occurrence.stepOccurrenceIds)),
+        source_step_occurrence_ids: sourceStepOccurrenceIds,
+        source_step_policy_skill_occurrence_ids: draft.evidenceOccurrenceIds,
         source_path_ids: unique(occurrences.map((occurrence) => occurrence.pathId)),
         source_episode_ids: unique(occurrences.map((occurrence) => occurrence.episodeId)),
+        evidence_anchor_ids: evidenceAnchorIds,
         name: draft.name,
         invocation_guide: value,
-        procedure_json: {
-          schema_version: "step-policy-sequence-skill.v1",
-          name: draft.name,
-          display_title: draft.displayTitle,
-          trigger_context: draft.triggerContext,
-          summary: draft.summary,
-          steps: draft.steps,
-          verification: draft.verification,
-          do_not_use_when: draft.doNotUseWhen,
-          tools: draft.tools,
-          evidence_occurrence_ids: draft.evidenceOccurrenceIds
-        },
+        procedure_json: procedureJson,
         step_policy_sequence_skill: {
           compiler_version: STEP_POLICY_SKILL_COMPILER_VERSION,
           pattern_id: current.id,
@@ -813,21 +875,17 @@ export class StepSequenceLearningPipeline {
           name: draft.name,
           eta: draft.confidence,
           status: "candidate",
-          support: current.selectedEpisodeCount,
+          support,
           gain: 0,
           source_policy_ids: policyMemories,
           source_world_model_ids: [],
-          evidence_anchor_ids: draft.evidenceOccurrenceIds,
+          evidence_anchor_ids: evidenceAnchorIds,
           invocation_guide: value,
-          procedure_json: {
-            schema_version: "step-policy-sequence-skill.v1",
-            steps: draft.steps,
-            verification: draft.verification
-          },
+          procedure_json: procedureJson,
           trials_attempted: 0,
           trials_passed: 0,
-          success_rate: 0,
-          beta_posterior: { alpha: 1, beta: 1 },
+          success_rate: successRate,
+          beta_posterior: betaPosterior,
           vec: null
         }
       },
@@ -954,6 +1012,92 @@ export class StepSequenceLearningPipeline {
       createdAt: at
     });
   }
+
+  private traceMemoryIdsForStepOccurrences(stepOccurrenceIds: readonly string[]): string[] {
+    const rawTurnIdsByEpisode = new Map<string, Set<string>>();
+    for (const occurrenceId of stepOccurrenceIds) {
+      const occurrence = this.deps.repos.stepSequenceLearning.getStep(occurrenceId);
+      if (!occurrence) continue;
+      const rawTurnIds = rawTurnIdsByEpisode.get(occurrence.episodeId) ?? new Set<string>();
+      rawTurnIds.add(occurrence.rawTurnId);
+      rawTurnIdsByEpisode.set(occurrence.episodeId, rawTurnIds);
+    }
+    const traceIds: string[] = [];
+    for (const [episodeId, rawTurnIds] of rawTurnIdsByEpisode) {
+      const episode = this.deps.repos.runtime.getEpisode(episodeId);
+      if (!episode) continue;
+      for (const memory of this.deps.repos.memories.getMany(episode.l1MemoryIds)) {
+        if (memory.memoryLayer !== "L1") continue;
+        const rawTurnId = rawTurnIdFromMemory(memory);
+        if (rawTurnId && rawTurnIds.has(rawTurnId)) traceIds.push(memory.id);
+      }
+    }
+    return unique(traceIds);
+  }
+}
+
+function stepSequencePolicySignature(sequenceHash: string): string {
+  return `step_sequence|${sequenceHash.slice(0, 24)}|_|_`;
+}
+
+function canonicalStepPolicySkillProcedure(input: {
+  draft: StepPolicySequenceSkillDraftV1;
+  support: number;
+  successRate: number;
+  betaPosterior: ReturnType<typeof skillBetaPosterior>;
+  patternId: string;
+  evidenceOccurrenceIds: readonly string[];
+  sourcePolicyIds: readonly string[];
+}): Record<string, unknown> {
+  return {
+    retrievalBlurb: input.draft.retrievalBlurb,
+    triggerContext: input.draft.triggerContext,
+    displayTitle: input.draft.displayTitle,
+    summary: input.draft.summary,
+    parameters: [],
+    preconditions: [],
+    steps: input.draft.steps.map((step) => ({
+      title: step.title,
+      body: step.body,
+      evidenceRefs: step.evidenceRefs,
+      supportingPolicyIds: [...input.sourcePolicyIds]
+    })),
+    examples: [],
+    verification: input.draft.verification.map((item) => ({
+      check: item.check,
+      successSignal: item.successSignal,
+      evidenceRefs: item.evidenceRefs
+    })),
+    doNotUseWhen: [...input.draft.doNotUseWhen],
+    decisionGuidance: {
+      preference: [],
+      antiPattern: []
+    },
+    reliability: {
+      supportCount: input.support,
+      successRate: input.successRate,
+      betaPosterior: input.betaPosterior
+    },
+    tools: [...input.draft.tools],
+    tags: [...input.draft.tags],
+    grounding: {
+      patternId: input.patternId,
+      evidenceOccurrenceIds: [...input.evidenceOccurrenceIds],
+      sourcePolicyMemoryIds: [...input.sourcePolicyIds]
+    }
+  };
+}
+
+function rawTurnIdFromMemory(memory: MemoryRow): string | undefined {
+  const internal = memory.properties.internal_info;
+  const sourceRawTurnId = internal.source_raw_turn_id;
+  if (typeof sourceRawTurnId === "string" && sourceRawTurnId) return sourceRawTurnId;
+  const rawTurnId = internal.raw_turn_id;
+  if (typeof rawTurnId === "string" && rawTurnId) return rawTurnId;
+  const trace = internal.trace;
+  return isRecord(trace) && typeof trace.raw_turn_id === "string" && trace.raw_turn_id
+    ? trace.raw_turn_id
+    : undefined;
 }
 
 function parsePolicyDraft(

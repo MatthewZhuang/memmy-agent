@@ -8,6 +8,10 @@ export const EXECUTION_STEP_SCHEMA_VERSION = "execution-step.v1" as const;
 export const PROCEDURAL_SPAN_SCHEMA_VERSION = "procedural-span.v1" as const;
 export const EPISODE_PROCEDURAL_PATH_SCHEMA_VERSION = "episode-execution-path.v2" as const;
 
+export function episodeRewardHash(input: { rTask?: number; rewardDetail: unknown }): string {
+  return stableHash({ rTask: input.rTask, rewardDetail: input.rewardDetail });
+}
+
 export type ExecutionStepKind = "tool_action" | "response_generation";
 export type ExecutionStepOutcome = "success" | "failure" | "partial" | "unknown";
 export type ProceduralSpanTermination = "success" | "failure" | "blocked" | "abandoned";

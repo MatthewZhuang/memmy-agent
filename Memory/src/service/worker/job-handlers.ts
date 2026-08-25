@@ -65,12 +65,6 @@ export interface WorkerJobProcessors {
     splitBigTurn(job: EvolutionJobRecord): MaybePromise<void>;
     reconstructProceduralPath(job: EvolutionJobRecord): MaybePromise<void>;
     learnStepSequences(job: EvolutionJobRecord): MaybePromise<void>;
-    scoreSpanCredit(job: EvolutionJobRecord): MaybePromise<void>;
-    clusterProceduralSpans(job: EvolutionJobRecord): MaybePromise<void>;
-    projectEpisodePolicies(job: EvolutionJobRecord): MaybePromise<void>;
-    minePolicySequences(job: EvolutionJobRecord): MaybePromise<void>;
-    clusterSpans(job: EvolutionJobRecord): MaybePromise<void>;
-    auditSpanCluster(job: EvolutionJobRecord): MaybePromise<void>;
   };
   feedback: {
     applyReward(job: EvolutionJobRecord): MaybePromise<void>;
@@ -254,22 +248,14 @@ export async function processJob(
       await deps.processors.evolution.learnStepSequences(job);
       return;
     case "span_credit":
-      await deps.processors.evolution.scoreSpanCredit(job);
-      return;
     case "procedural_span_cluster":
-      await deps.processors.evolution.clusterProceduralSpans(job);
-      return;
     case "episode_policy_projection":
-      await deps.processors.evolution.projectEpisodePolicies(job);
-      return;
     case "policy_sequence_mining":
-      await deps.processors.evolution.minePolicySequences(job);
-      return;
     case "span_cluster":
-      await deps.processors.evolution.clusterSpans(job);
-      return;
     case "span_cluster_audit":
-      await deps.processors.evolution.auditSpanCluster(job);
+      // Legacy Trace2Skill jobs may remain in upgraded SQLite databases. They
+      // are intentionally drained as successful no-ops after Step Sequence
+      // became the sole procedural learner.
       return;
     case "embedding":
       await deps.processors.embedding.embedMemory(job);

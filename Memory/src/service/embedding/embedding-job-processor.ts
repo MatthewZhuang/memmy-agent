@@ -41,7 +41,6 @@ import {
   embeddingTextForMemory,
   spanEmbeddingSourceHash,
   spanEmbeddingText,
-  spanHasBothEmbeddings,
   type SpanEmbeddingVectorField,
   traceSummaryEmbeddingText,
   updateMemoryVectorField
@@ -247,9 +246,8 @@ export class EmbeddingJobProcessor {
       source: "worker.embedding",
       sourceHash: item.sourceHash,
       allowedProcessingStates: ["embedding_pending", "embedding"],
-      finalize: (saved, hadProcessing, at) => {
+      finalize: (_saved, hadProcessing, at) => {
         if (hadProcessing) this.deps.repos.runtime.completeJob(item.job.id, at);
-        this.enqueueSpanClusterIfReady(saved, item.job, at);
       }
     });
   }
@@ -470,24 +468,6 @@ export class EmbeddingJobProcessor {
       targetMemoryId: memory.id,
       payload: { reason, sourceJobId: source.id, contentHash: memory.contentHash },
       maxAttempts: 6, createdAt: at
-    });
-  }
-
-  private enqueueSpanClusterIfReady(memory: MemoryRow, sourceJob: EvolutionJobRecord, at: string): void {
-    if (!spanHasBothEmbeddings(memory)) return;
-    const scopeId = namespaceIdFromMemory(memory);
-    this.deps.enqueueJob({
-      jobType: "span_cluster",
-      userId: memory.userId,
-      sessionId: memory.sessionId,
-      episodeId: sourceJob.episodeId,
-      payload: {
-        reason: "span.embeddings.ready",
-        sourceJobId: sourceJob.id,
-        scopeId,
-        algorithmVersion: "span-cluster.v1"
-      },
-      createdAt: at
     });
   }
 

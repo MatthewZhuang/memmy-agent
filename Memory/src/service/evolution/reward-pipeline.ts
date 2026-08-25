@@ -29,7 +29,7 @@ import {
   SPAN_BIG_TURN_ENABLED,
   SPAN_BIG_TURN_MIN_TOOL_CALLS
 } from "./big-turn-span-pipeline.js";
-import { spanCreditRewardHash } from "./span-credit-pipeline.js";
+import { episodeRewardHash } from "./procedural-path-model.js";
 
 type TraceMeta = NonNullable<ReturnType<typeof traceMetaFromMemory>>;
 type HumanScoreResult = ReturnType<typeof heuristicHumanScore>;
@@ -340,7 +340,7 @@ export class RewardPipeline {
   }
 
   private enqueueProceduralState(episode: EpisodeRecord): void {
-    const rewardHash = spanCreditRewardHash(episode);
+    const rewardHash = episodeRewardHash(episode);
     const activePath = this.deps.repos.proceduralPaths.getActiveForEpisode(episode.id);
     if (!activePath) {
       this.deps.enqueueJob({
@@ -354,14 +354,15 @@ export class RewardPipeline {
       return;
     }
     this.deps.enqueueJob({
-      jobType: "span_credit",
+      jobType: "step_sequence_learning",
       userId: episode.userId,
       sessionId: episode.sessionId,
       episodeId: episode.id,
       payload: {
         pathId: activePath.id,
         pathHash: activePath.pathHash,
-        rewardHash
+        rewardHash,
+        trigger: "reward_updated"
       },
       createdAt: episode.updatedAt
     });

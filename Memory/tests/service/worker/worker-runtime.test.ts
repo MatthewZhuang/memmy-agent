@@ -12,6 +12,41 @@ afterEach(() => {
 });
 
 describe("MemoryService / worker / runtime", () => {
+  it("drains persisted jobs from retired Span learners as successful no-ops", async () => {
+    const { db, service } = createTestService();
+    const repos = new Repositories(db.db);
+    const createdAt = new Date(Date.now() - 60_000).toISOString();
+    const legacyJobTypes = [
+      "span_credit",
+      "procedural_span_cluster",
+      "episode_policy_projection",
+      "policy_sequence_mining",
+      "span_cluster",
+      "span_cluster_audit"
+    ] as const;
+    for (const [index, jobType] of legacyJobTypes.entries()) {
+      repos.runtime.enqueueJob({
+        id: `job-retired-span-${index}`,
+        jobType,
+        status: "queued",
+        userId: "retired-span-user",
+        payload: { legacy: true },
+        attempts: 0,
+        maxAttempts: 3,
+        createdAt,
+        updatedAt: createdAt
+      });
+    }
+
+    const run = await service.runWorkerOnce(legacyJobTypes.length);
+
+    expect(run.failed).toBe(0);
+    expect(run.jobs).toHaveLength(legacyJobTypes.length);
+    expect(run.jobs.every((job) => job.status === "succeeded")).toBe(true);
+    expect(repos.runtime.listJobs("dead_letter", 20)).toEqual([]);
+    db.close();
+  });
+
   it("selects the earliest worker wake across evolution and embedding queues", () => {
     const { db, service } = createTestService();
     const repos = new Repositories(db.db);

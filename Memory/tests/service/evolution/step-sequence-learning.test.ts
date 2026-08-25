@@ -14,6 +14,10 @@ import {
   type ProceduralSpanV1,
   type SpanSegmentationDecisionV1
 } from "../../../src/index.js";
+import {
+  policyMetaFromMemory,
+  skillMetaFromMemory
+} from "../../../src/algorithm/plugin-algorithms.js";
 import { Repositories } from "../../../src/storage/repositories.js";
 import type { MemoryRow } from "../../../src/types.js";
 import { createMemoryServiceFixture } from "../../fixtures/memory-service-fixture.js";
@@ -125,6 +129,50 @@ describe("StepCluster sequence learning", () => {
         }
       }
     });
+    const policyMemories = secondResult.inducedPolicyIds.map((id) =>
+      repos.stepSequenceLearning.getPolicy(id)?.l2MemoryId)
+      .filter((id): id is string => Boolean(id))
+      .map((id) => repos.memories.get(id)!);
+    expect(policyMemories).toHaveLength(2);
+    for (const policyMemory of policyMemories) {
+      const policy = policyMetaFromMemory(policyMemory)!;
+      expect(policy.title).not.toContain("policy:step-sequence:");
+      expect(policy.signature).toMatch(/^step_sequence\|[a-f0-9]{24}\|_\|_$/);
+      expect(policy.sourceTraceIds).toHaveLength(2);
+      expect(policy.sourceTraceIds.every((id) => repos.memories.get(id)?.memoryLayer === "L1"))
+        .toBe(true);
+      expect(repos.runtime.listTracePolicyLinks({ l2MemoryId: policy.id }))
+        .toHaveLength(2);
+    }
+    const skillMeta = skillMetaFromMemory(skill!)!;
+    expect(skillMeta.retrievalBlurb)
+      .toBe("Execute two reusable local procedures with evidence-based verification.");
+    expect(skillMeta.triggerContext)
+      .toBe("Use when the two-stage workflow must be completed end to end.");
+    expect(skillMeta.evidenceAnchorIds).toHaveLength(2);
+    expect(skillMeta.evidenceAnchorIds.every((id) => repos.memories.get(id)?.memoryLayer === "L1"))
+      .toBe(true);
+    const internal = skill!.properties.internal_info;
+    const nestedSkill = internal.skill as Record<string, unknown>;
+    expect(internal.procedure_json).toEqual(nestedSkill.procedure_json);
+    expect(internal.source_step_policy_skill_occurrence_ids)
+      .toEqual(expect.arrayContaining([
+        expect.stringMatching(/^step_policy_skill_occurrence_/),
+        expect.stringMatching(/^step_policy_skill_occurrence_/)
+      ]));
+    const skillDetail = service.getSkill(skill!.id);
+    expect(skillDetail).toMatchObject({
+      name: "run_two_stage_workflow",
+      evidenceAnchorIds: skillMeta.evidenceAnchorIds,
+      reliability: {
+        supportCount: 2,
+        trialsAttempted: 0,
+        trialsPassed: 0
+      }
+    });
+    expect(skillDetail.sourcePolicyIds)
+      .toEqual(expect.arrayContaining(policyMemories.map((memory) => memory.id)));
+    expect(skillDetail.invocationGuide).toContain("Run and verify the two-stage workflow");
     expect(embeddedTexts).toHaveLength(14);
   });
 
@@ -379,10 +427,19 @@ function persistStepSequenceEpisode(
     status: "succeeded",
     createdAt: at
   });
+  const traceId = `trace-step-sequence-${suffix}`;
+  repos.memories.insert(traceFixtureMemory({
+    id: traceId,
+    episodeId,
+    sessionId,
+    rawTurnId,
+    at
+  }));
+  repos.runtime.appendEpisodeTurn(episodeId, rawTurnId, traceId, at);
   const state = emptyObservedState();
   const sourceSnapshotHash = `step-sequence-snapshot-${suffix}`;
   const provenance = {
-    algorithmVersion: "episode-procedural-reconstruction.v6",
+    algorithmVersion: "episode-procedural-reconstruction.v7",
     model: "fixture-model",
     sourceSnapshotHash
   };
@@ -466,6 +523,50 @@ function persistStepSequenceEpisode(
     createdAt: at
   });
   return { episodeId, pathId: saved.record.id };
+}
+
+function traceFixtureMemory(input: {
+  id: string;
+  episodeId: string;
+  sessionId: string;
+  rawTurnId: string;
+  at: string;
+}): MemoryRow {
+  return {
+    id: input.id,
+    timeline: input.at,
+    userId: "user-step-sequence",
+    sessionId: input.sessionId,
+    memoryType: "LongTermMemory",
+    status: "activated",
+    visibility: "private",
+    memoryKey: `trace:${input.rawTurnId}`,
+    memoryValue: `Trace for ${input.rawTurnId}`,
+    tags: ["trace", "fixture"],
+    info: {
+      episode_id: input.episodeId,
+      raw_turn_id: input.rawTurnId
+    },
+    properties: {
+      status: "activated",
+      internal_info: {
+        memory_layer: "L1",
+        memory_kind: "trace",
+        source_raw_turn_id: input.rawTurnId,
+        raw_turn_id: input.rawTurnId,
+        trace: {
+          raw_turn_id: input.rawTurnId,
+          episode_id: input.episodeId
+        }
+      }
+    },
+    memoryLayer: "L1",
+    contentHash: `${input.id}-hash`,
+    version: 1,
+    createdAt: input.at,
+    updatedAt: input.at,
+    deletedAt: null
+  };
 }
 
 function stepSequenceEmbedder(seen: string[]): Embedder {

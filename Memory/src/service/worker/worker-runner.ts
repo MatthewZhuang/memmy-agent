@@ -28,7 +28,6 @@ import {
   embeddingRetrySourceText,
   embeddingRetryBackoffMs,
   embeddingRetryToRunItem,
-  spanHasBothEmbeddings,
   spanEmbeddingSourceHash
 } from "../embedding/embedding-pipeline.js";
 import { spanPayload } from "../evolution/span-model.js";
@@ -115,7 +114,6 @@ export interface WorkerRunnerDeps {
   nowIso: () => string;
   nowMs?: () => number;
   encodeChangeCursor: (changeSeq: number) => string;
-  namespaceIdFromMemory: (memory: MemoryRow) => string;
   runWorkerNoWrite: (request: RequestEnvelope) => Promise<WorkerRunSummary>;
   restartFailedProcessing: (at: string, limit: number) => number;
   previewPolicyEvidenceReconciliation: (limit: number) => PolicyEvidencePreflightReport;
@@ -647,12 +645,11 @@ export class WorkerRunner {
           ? retrievalDocumentSourceHash(memory)
           : undefined,
       allowedProcessingStates: ["embedding_pending", "embedding"],
-      finalize: (saved, _hadProcessing, at) => {
+      finalize: (_saved, _hadProcessing, _at) => {
         completed = this.deps.repos.runtime.markEmbeddingRetrySucceededClaimed(retry.id, {
           ...claim,
           now: this.nowMs()
         });
-        this.enqueueSpanClusterIfReadyAfterRetry(saved, retry, at);
       }
     });
     if (completed) {
@@ -706,25 +703,6 @@ export class WorkerRunner {
     return this.deps.nowMs?.() ?? Date.now();
   }
 
-  private enqueueSpanClusterIfReadyAfterRetry(
-    memory: MemoryRow,
-    retry: EmbeddingRetryRecord,
-    at: string
-  ): void {
-    if (!spanHasBothEmbeddings(memory)) return;
-    this.deps.enqueueJob({
-      jobType: "span_cluster",
-      userId: memory.userId,
-      sessionId: memory.sessionId,
-      payload: {
-        reason: "span.embeddings.ready",
-        sourceRetryId: retry.id,
-        scopeId: this.deps.namespaceIdFromMemory(memory),
-        algorithmVersion: "span-cluster.v1"
-      },
-      createdAt: at
-    });
-  }
 }
 
 function emptyPolicyEvidencePreflight(): PolicyEvidencePreflightReport {

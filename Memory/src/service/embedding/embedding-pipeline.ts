@@ -134,10 +134,6 @@ export function embeddingRetrySourceText(
     : undefined;
 }
 
-export function spanHasBothEmbeddings(memory: MemoryRow): boolean {
-  return Boolean(spanPayload(memory) && memoryVector(memory, "vec_goal") && memoryVector(memory, "vec_policy"));
-}
-
 export function embeddingRetryTargetKindForMemory(memory: MemoryRow): EmbeddingRetryTargetKind {
   if (spanPayload(memory)) return "span";
   if (memory.memoryLayer === "L1") return "trace";

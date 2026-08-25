@@ -80,11 +80,6 @@ import {
   EmbeddingJobProcessor
 } from "./embedding/embedding-job-processor.js";
 import { EvolutionJobProcessor } from "./evolution/evolution-job-processor.js";
-import {
-  inspectTrace2SkillEpisode,
-  type Trace2SkillDiagnosticReportV1,
-  type Trace2SkillReplayResultV1
-} from "./evolution/trace2skill-replay.js";
 import { traceReflectionWasScored,traceSortKey } from "./evolution/span-pipeline.js";
 import {
   FeedbackExperienceService,
@@ -289,13 +284,7 @@ export class MemoryService {
           associateL2: (job) => this.evolutionJobs.associateL2(job),
           splitBigTurn: (job) => this.evolutionJobs.splitBigTurn(job),
           reconstructProceduralPath: (job) => this.evolutionJobs.reconstructProceduralPath(job),
-          learnStepSequences: (job) => this.evolutionJobs.learnStepSequences(job),
-          scoreSpanCredit: (job) => this.evolutionJobs.scoreSpanCredit(job),
-          clusterProceduralSpans: (job) => this.evolutionJobs.clusterProceduralSpans(job),
-          projectEpisodePolicies: (job) => this.evolutionJobs.projectEpisodePolicies(job),
-          minePolicySequences: (job) => this.evolutionJobs.minePolicySequences(job),
-          clusterSpans: (job) => this.evolutionJobs.clusterSpans(job),
-          auditSpanCluster: (job) => this.evolutionJobs.auditSpanCluster(job)
+          learnStepSequences: (job) => this.evolutionJobs.learnStepSequences(job)
         },
         feedback: {
           applyReward: (job) => this.evolutionJobs.applyReward(job),
@@ -419,7 +408,6 @@ export class MemoryService {
       memoryAddEnabled: this.memoryAddEnabled.bind(this),
       nowIso,
       encodeChangeCursor: this.encodeChangeCursor.bind(this),
-      namespaceIdFromMemory,
       runWorkerNoWrite: this.runWorkerNoWrite.bind(this),
       restartFailedProcessing: this.restartFailedProcessing.bind(this),
       previewPolicyEvidenceReconciliation: this.evolutionJobs.previewPolicyEvidenceReconciliation.bind(this.evolutionJobs),
@@ -1835,19 +1823,6 @@ export class MemoryService {
     } = {}
   ): ReturnType<WorkerRunner["runWorkerOnce"]> {
     return this.workerRunner.runWorkerOnce(limit, request);
-  }
-
-  inspectTrace2SkillEpisode(episodeId: string): Trace2SkillDiagnosticReportV1 {
-    return inspectTrace2SkillEpisode(this.repos, episodeId);
-  }
-
-  replayTrace2SkillEpisode(input: {
-    episodeId: string;
-    at?: string;
-  }): Promise<Trace2SkillReplayResultV1> {
-    return this.withModelTaskContext(() =>
-      this.evolutionJobs.replayTrace2SkillEpisode(input)
-    );
   }
 
   reconstructProceduralPathForReplay(input: {

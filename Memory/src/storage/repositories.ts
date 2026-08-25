@@ -36,15 +36,7 @@ import {
   VECTOR_SEARCH_WINDOW,
   type VectorSearchCandidate
 } from "./sqlite-vec-store.js";
-import { SpanClusterRepository } from "./span-cluster-repository.js";
 import { EpisodeProceduralPathRepository } from "./procedural-path-repository.js";
-import { ProceduralSpanClusterRepository } from "./procedural-span-cluster-repository.js";
-import { ProceduralPolicyRepository } from "./procedural-policy-repository.js";
-import { ProceduralSpanCreditRepository } from "./procedural-span-credit-repository.js";
-import { ProceduralSpanEmbeddingRepository } from "./procedural-span-embedding-repository.js";
-import { EpisodePolicyProjectionRepository } from "./episode-policy-projection-repository.js";
-import { EpisodeCapabilityRepository } from "./episode-capability-repository.js";
-import { PolicySequencePatternRepository } from "./policy-sequence-pattern-repository.js";
 import { StepSequenceLearningRepository } from "./step-sequence-learning-repository.js";
 
 type SqlValue = string | number | Buffer | null;
@@ -3917,15 +3909,7 @@ export class Repositories {
   readonly processing: MemoryProcessingRepository;
   readonly runtime: RuntimeRepository;
   readonly vectors: SqliteVecStore;
-  readonly spanClusters: SpanClusterRepository;
   readonly proceduralPaths: EpisodeProceduralPathRepository;
-  readonly proceduralSpanClusters: ProceduralSpanClusterRepository;
-  readonly proceduralPolicies: ProceduralPolicyRepository;
-  readonly proceduralSpanCredits: ProceduralSpanCreditRepository;
-  readonly proceduralSpanEmbeddings: ProceduralSpanEmbeddingRepository;
-  readonly episodePolicyProjections: EpisodePolicyProjectionRepository;
-  readonly episodeCapabilities: EpisodeCapabilityRepository;
-  readonly policySequencePatterns: PolicySequencePatternRepository;
   readonly stepSequenceLearning: StepSequenceLearningRepository;
 
   constructor(readonly db: Database.Database) {
@@ -3934,15 +3918,7 @@ export class Repositories {
     this.userMemories = new UserMemoryRepository(db);
     this.processing = new MemoryProcessingRepository(db);
     this.runtime = new RuntimeRepository(db);
-    this.spanClusters = new SpanClusterRepository(db);
     this.proceduralPaths = new EpisodeProceduralPathRepository(db);
-    this.proceduralSpanClusters = new ProceduralSpanClusterRepository(db);
-    this.proceduralPolicies = new ProceduralPolicyRepository(db);
-    this.proceduralSpanCredits = new ProceduralSpanCreditRepository(db);
-    this.proceduralSpanEmbeddings = new ProceduralSpanEmbeddingRepository(db);
-    this.episodePolicyProjections = new EpisodePolicyProjectionRepository(db);
-    this.episodeCapabilities = new EpisodeCapabilityRepository(db);
-    this.policySequencePatterns = new PolicySequencePatternRepository(db);
     this.stepSequenceLearning = new StepSequenceLearningRepository(db);
   }
 
