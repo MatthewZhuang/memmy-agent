@@ -5,7 +5,7 @@ import {
   worldModelMetaFromMemory
 } from "../../algorithm/plugin-algorithms.js";
 import type { MemmyConfig } from "../../config/index.js";
-import type { LlmClient } from "../../model/types.js";
+import type { Embedder, LlmClient } from "../../model/types.js";
 import type {
   EpisodeRecord,
   EvolutionJobRecord,
@@ -28,6 +28,7 @@ import { L3WorldModelTraceFieldPipeline } from "./l3-world-model-pipeline.js";
 import { NegativeExperiencePipeline } from "./negative-experience-pipeline.js";
 import { BigTurnSpanPipeline } from "./big-turn-span-pipeline.js";
 import { PolicyInductionEngine } from "./policy-induction.js";
+import { ProceduralTrajectoryPipeline } from "./procedural-trajectory-pipeline.js";
 import {
   RewardPipeline,
   type DecisionRepairSummary
@@ -51,6 +52,7 @@ export interface EvolutionJobProcessorDeps {
   config: MemmyConfig;
   llm: LlmClient;
   skillLlm: LlmClient;
+  embedder: Embedder;
   traceMeta(memory: MemoryRow | undefined | null): TraceMeta | null;
   namespaceIdFromMemory(memory: MemoryRow): string;
   buildMemory(input: Record<string, unknown>): MemoryRow;
@@ -85,6 +87,7 @@ export class EvolutionJobProcessor {
   private readonly skill: SkillPipeline;
   private readonly span: SpanPipeline;
   private readonly bigTurnSpan: BigTurnSpanPipeline;
+  private readonly proceduralTrajectory: ProceduralTrajectoryPipeline;
   private readonly l3WorldModel: L3WorldModelTraceFieldPipeline;
 
   constructor(private readonly deps: EvolutionJobProcessorDeps) {
@@ -137,6 +140,18 @@ export class EvolutionJobProcessor {
       enqueueJob: deps.enqueueJob,
       namespaceIdFromMemory: deps.namespaceIdFromMemory,
       embedAfterCapture: () => owner.deps.config.algorithm.capture.embedAfterCapture
+    });
+    this.proceduralTrajectory = new ProceduralTrajectoryPipeline({
+      repos: deps.repos,
+      get config() { return owner.deps.config; },
+      get llm() { return owner.deps.llm; },
+      get skillLlm() { return owner.deps.skillLlm; },
+      get embedder() { return owner.deps.embedder; },
+      traceMeta: deps.traceMeta,
+      buildMemory: deps.buildMemory,
+      upsertEvolutionMemory: this.upsertEvolutionMemory.bind(this),
+      enqueueJob: deps.enqueueJob,
+      namespaceIdFromMemory: deps.namespaceIdFromMemory
     });
     this.reward = new RewardPipeline({
       get config() { return owner.deps.config; },
@@ -196,6 +211,39 @@ export class EvolutionJobProcessor {
 
   splitBigTurn(job: EvolutionJobRecord): Promise<void> {
     return this.bigTurnSpan.splitAndStore(job);
+  }
+
+  compileEpisodePath(job: EvolutionJobRecord): Promise<void> {
+    return this.proceduralTrajectory.compileEpisodePath(job);
+  }
+
+  ingestTrajectoryWindows(job: EvolutionJobRecord): Promise<void> {
+    return this.proceduralTrajectory.ingestTrajectoryWindows(job);
+  }
+
+  induceProceduralSkill(job: EvolutionJobRecord): Promise<void> {
+    return this.proceduralTrajectory.induceProceduralSkill(job);
+  }
+
+  invalidateProceduralEpisodeSources(input: {
+    episodeId: string;
+    reason: string;
+    at: string;
+    recompile?: boolean;
+  }): void {
+    this.proceduralTrajectory.invalidateEpisodeSources(input);
+  }
+
+  markProceduralSkillGovernanceDisabled(
+    memory: MemoryRow,
+    action: "archive" | "delete",
+    at: string
+  ): MemoryRow {
+    return this.proceduralTrajectory.markProceduralSkillGovernanceDisabled(
+      memory,
+      action,
+      at
+    );
   }
 
   materializeNegativeExperience(job: EvolutionJobRecord): void {
@@ -330,8 +378,21 @@ export class EvolutionJobProcessor {
       });
   }
 
-  invalidateMemoryDependencies(memory: MemoryRow, at: string): void {
+  invalidateMemoryDependencies(
+    memory: MemoryRow,
+    at: string,
+    reason = "memory-governance"
+  ): void {
     if (memory.memoryLayer === "L1") {
+      const trace = this.deps.traceMeta(memory);
+      if (trace?.episodeId) {
+        this.proceduralTrajectory.invalidateEpisodeSources({
+          episodeId: trace.episodeId,
+          reason,
+          at,
+          recompile: true
+        });
+      }
       const policyIds = Array.from(new Set(
         this.deps.repos.runtime
           .listTracePolicyLinks({ l1MemoryId: memory.id, limit: 1000 })

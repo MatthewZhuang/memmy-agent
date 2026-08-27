@@ -1,0 +1,899 @@
+{
+  "schemaVersion": "v15-kw-evidence-clusters-golden.v1",
+  "source": {
+    "artifact": "20260826-kw-multi-medoid-span5-076-span10-070-policy-v15.json",
+    "episodeCount": 18,
+    "stepCount": 318,
+    "windowCount": 185,
+    "representation": {
+      "coarse": "window-intent-sequence-embedding.v1",
+      "fine": "step-intent-banded-monotonic.v1"
+    }
+  },
+  "config": {
+    "windowSpecs": [
+      {
+        "length": 5,
+        "stride": 2
+      },
+      {
+        "length": 10,
+        "stride": 5
+      }
+    ],
+    "coarseSimilarityThresholdByScale": {
+      "5": 0.76,
+      "10": 0.7
+    },
+    "fineMatchConfigs": [
+      {
+        "scale": 5,
+        "bandWidth": 1,
+        "minStepSimilarity": 0.7,
+        "minMatchedSteps": 4,
+        "minCoverage": 0.8,
+        "minAverageMatchSimilarity": 0.78,
+        "maxInternalGap": 1,
+        "gapPenalty": 0.1,
+        "minAlignmentScore": 0.62
+      },
+      {
+        "scale": 10,
+        "bandWidth": 2,
+        "minStepSimilarity": 0.68,
+        "minMatchedSteps": 7,
+        "minCoverage": 0.7,
+        "minAverageMatchSimilarity": 0.76,
+        "maxInternalGap": 2,
+        "gapPenalty": 0.1,
+        "minAlignmentScore": 0.52
+      }
+    ],
+    "minSupportEpisodes": 2
+  },
+  "clusters": [
+    {
+      "name": "span10-document-generation-recovery",
+      "scale": 10,
+      "stableSignature": "episode_6e709b0946b4902a1a47|s10|5-14|raw_5f3e709e75641c0d2fef#5,raw_5f3e709e75641c0d2fef#6,raw_5f3e709e75641c0d2fef#7,raw_5f3e709e75641c0d2fef#8,raw_5f3e709e75641c0d2fef#9,raw_5f3e709e75641c0d2fef#10,raw_5f3e709e75641c0d2fef#11,raw_5f3e709e75641c0d2fef#12,raw_5f3e709e75641c0d2fef#13,raw_5f3e709e75641c0d2fef#14||episode_b1deef67447d5edf1f19|s10|10-19|raw_663021460edbaf97796c#10,raw_663021460edbaf97796c#11,raw_663021460edbaf97796c#12,raw_663021460edbaf97796c#13,raw_663021460edbaf97796c#14,raw_663021460edbaf97796c#15,raw_663021460edbaf97796c#16,raw_663021460edbaf97796c#17,raw_663021460edbaf97796c#18,raw_663021460edbaf97796c#19",
+      "expectedCoreAnchorOffsets": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "members": [
+        {
+          "stableKey": "episode_6e709b0946b4902a1a47|s10|5-14|raw_5f3e709e75641c0d2fef#5,raw_5f3e709e75641c0d2fef#6,raw_5f3e709e75641c0d2fef#7,raw_5f3e709e75641c0d2fef#8,raw_5f3e709e75641c0d2fef#9,raw_5f3e709e75641c0d2fef#10,raw_5f3e709e75641c0d2fef#11,raw_5f3e709e75641c0d2fef#12,raw_5f3e709e75641c0d2fef#13,raw_5f3e709e75641c0d2fef#14",
+          "episodeId": "episode_6e709b0946b4902a1a47",
+          "terminalReward": 0.75,
+          "startStepIndex": 5,
+          "endStepIndex": 14,
+          "isMedoid": true,
+          "steps": [
+            {
+              "rawTurnId": "raw_5f3e709e75641c0d2fef",
+              "toolCallIndex": 5,
+              "toolName": "web_search",
+              "intent": "search for sales operation process document structure and CRM best practices",
+              "summary": "Retrieved search results with CRM pipeline management best practices.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_5f3e709e75641c0d2fef",
+              "toolCallIndex": 6,
+              "toolName": "web_search",
+              "intent": "search for private debt fund issuance and issuer onboarding workflow",
+              "summary": "Retrieved search results with institutional guides on tokenizing private credit.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_5f3e709e75641c0d2fef",
+              "toolCallIndex": 7,
+              "toolName": "exec",
+              "intent": "install python-docx package",
+              "summary": "Package installation failed due to externally managed environment restriction.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_5f3e709e75641c0d2fef",
+              "toolCallIndex": 8,
+              "toolName": "exec",
+              "intent": "install python-docx package with override",
+              "summary": "Package installation succeeded with system package override.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_5f3e709e75641c0d2fef",
+              "toolCallIndex": 9,
+              "toolName": "write_file",
+              "intent": "create a script to generate the sales operation process document",
+              "summary": "The generation script was written to the workspace.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_5f3e709e75641c0d2fef",
+              "toolCallIndex": 10,
+              "toolName": "exec",
+              "intent": "execute the document generation script",
+              "summary": "Script execution failed due to a typo in the alignment constant.",
+              "outcome": "failure"
+            },
+            {
+              "rawTurnId": "raw_5f3e709e75641c0d2fef",
+              "toolCallIndex": 11,
+              "toolName": "edit_file",
+              "intent": "fix the alignment constant typo in the generation script",
+              "summary": "Edited the script to correct the misspelled alignment constant.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_5f3e709e75641c0d2fef",
+              "toolCallIndex": 12,
+              "toolName": "exec",
+              "intent": "execute the document generation script",
+              "summary": "Script executed successfully and the document was saved.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_5f3e709e75641c0d2fef",
+              "toolCallIndex": 13,
+              "toolName": "exec",
+              "intent": "verify the generated document file exists",
+              "summary": "Confirmed the document file exists with a size of 55K.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_5f3e709e75641c0d2fef",
+              "toolCallIndex": 14,
+              "toolName": "exec",
+              "intent": "verify the document content and flow charts",
+              "summary": "Inspected the document and confirmed all sections and flow charts are present.",
+              "outcome": "success"
+            }
+          ],
+          "alignmentToMedoid": {
+            "admitted": true,
+            "score": 1,
+            "averageMatchSimilarity": 1,
+            "coverage": 1,
+            "matchedSteps": 10,
+            "internalGapSteps": 0,
+            "maxInternalGap": 0,
+            "pairs": [
+              {
+                "leftIndex": 0,
+                "rightIndex": 0,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 1,
+                "rightIndex": 1,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 2,
+                "rightIndex": 2,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 3,
+                "rightIndex": 3,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 4,
+                "rightIndex": 4,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 5,
+                "rightIndex": 5,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 6,
+                "rightIndex": 6,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 7,
+                "rightIndex": 7,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 8,
+                "rightIndex": 8,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 9,
+                "rightIndex": 9,
+                "similarity": 1
+              }
+            ]
+          }
+        },
+        {
+          "stableKey": "episode_b1deef67447d5edf1f19|s10|10-19|raw_663021460edbaf97796c#10,raw_663021460edbaf97796c#11,raw_663021460edbaf97796c#12,raw_663021460edbaf97796c#13,raw_663021460edbaf97796c#14,raw_663021460edbaf97796c#15,raw_663021460edbaf97796c#16,raw_663021460edbaf97796c#17,raw_663021460edbaf97796c#18,raw_663021460edbaf97796c#19",
+          "episodeId": "episode_b1deef67447d5edf1f19",
+          "terminalReward": 0.75,
+          "startStepIndex": 10,
+          "endStepIndex": 19,
+          "isMedoid": false,
+          "steps": [
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 10,
+              "toolName": "exec",
+              "intent": "install reportlab library",
+              "summary": "Installation failed because the environment is externally managed and requires an override flag.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 11,
+              "toolName": "exec",
+              "intent": "install reportlab library with system package override",
+              "summary": "Installation succeeded; reportlab was already present in the environment.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 12,
+              "toolName": "write_file",
+              "intent": "create a script to generate accessibility training PDFs",
+              "summary": "The generation script source file was created successfully.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 13,
+              "toolName": "exec",
+              "intent": "execute the PDF generation script",
+              "summary": "Script execution failed with a traceback error.",
+              "outcome": "failure"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 14,
+              "toolName": "edit_file",
+              "intent": "edit the PDF generation script to fix errors",
+              "summary": "The script file was edited successfully with lint checks passing.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 15,
+              "toolName": "exec",
+              "intent": "execute the PDF generation script",
+              "summary": "Script execution succeeded and produced the accessibility framework guide PDF.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 16,
+              "toolName": "exec",
+              "intent": "verify the generated PDF file exists and check its size",
+              "summary": "The generated PDF file exists with a size of 23 KB.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 17,
+              "toolName": "exec",
+              "intent": "extract text from the generated PDF to verify content",
+              "summary": "Text extraction succeeded and confirmed the guide content includes accessibility standards and best practices.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 18,
+              "toolName": "exec",
+              "intent": "extract text from the generated PDF to verify content",
+              "summary": "Text extraction succeeded and confirmed the guide includes escalation steps for staff.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 19,
+              "toolName": "exec",
+              "intent": "extract text from the generated PDF to verify content",
+              "summary": "Text extraction succeeded and confirmed the quick checklist content is present.",
+              "outcome": "success"
+            }
+          ],
+          "alignmentToMedoid": {
+            "admitted": true,
+            "score": 0.5451595425363727,
+            "averageMatchSimilarity": 0.7787993464805324,
+            "coverage": 0.7,
+            "matchedSteps": 7,
+            "internalGapSteps": 0,
+            "maxInternalGap": 0,
+            "pairs": [
+              {
+                "leftIndex": 1,
+                "rightIndex": 3,
+                "similarity": 0.6881098776543365
+              },
+              {
+                "leftIndex": 2,
+                "rightIndex": 4,
+                "similarity": 0.6956059537020506
+              },
+              {
+                "leftIndex": 3,
+                "rightIndex": 5,
+                "similarity": 0.8910220765818693
+              },
+              {
+                "leftIndex": 4,
+                "rightIndex": 6,
+                "similarity": 0.7162394943591497
+              },
+              {
+                "leftIndex": 5,
+                "rightIndex": 7,
+                "similarity": 0.8910220765818693
+              },
+              {
+                "leftIndex": 6,
+                "rightIndex": 8,
+                "similarity": 0.849821002086356
+              },
+              {
+                "leftIndex": 7,
+                "rightIndex": 9,
+                "similarity": 0.7197749443980948
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "span5-pdf-generate-validate",
+      "scale": 5,
+      "stableSignature": "episode_76609ece7406d386ba81|s5|18-22|raw_fd1c25bda9158930d067#18,raw_fd1c25bda9158930d067#19,raw_fd1c25bda9158930d067#20,raw_fd1c25bda9158930d067#21,raw_fd1c25bda9158930d067#22||episode_b1deef67447d5edf1f19|s5|14-18|raw_663021460edbaf97796c#14,raw_663021460edbaf97796c#15,raw_663021460edbaf97796c#16,raw_663021460edbaf97796c#17,raw_663021460edbaf97796c#18",
+      "expectedCoreAnchorOffsets": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "members": [
+        {
+          "stableKey": "episode_76609ece7406d386ba81|s5|18-22|raw_fd1c25bda9158930d067#18,raw_fd1c25bda9158930d067#19,raw_fd1c25bda9158930d067#20,raw_fd1c25bda9158930d067#21,raw_fd1c25bda9158930d067#22",
+          "episodeId": "episode_76609ece7406d386ba81",
+          "terminalReward": 1,
+          "startStepIndex": 18,
+          "endStepIndex": 22,
+          "isMedoid": true,
+          "steps": [
+            {
+              "rawTurnId": "raw_fd1c25bda9158930d067",
+              "toolCallIndex": 18,
+              "toolName": "edit_file",
+              "intent": "edit the script to add dashed line drawing logic",
+              "summary": "Added dashed line drawing logic for reroute paths in the script.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_fd1c25bda9158930d067",
+              "toolCallIndex": 19,
+              "toolName": "exec",
+              "intent": "execute the process map generation script",
+              "summary": "Script executed successfully and generated the PDF.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_fd1c25bda9158930d067",
+              "toolCallIndex": 20,
+              "toolName": "exec",
+              "intent": "verify the generated PDF file exists",
+              "summary": "Checked the PDF file with ls; file exists with size 6.9K.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_fd1c25bda9158930d067",
+              "toolCallIndex": 21,
+              "toolName": "exec",
+              "intent": "verify PDF content by reading text",
+              "summary": "Attempted to read PDF text with pypdf; failed due to missing module.",
+              "outcome": "failure"
+            },
+            {
+              "rawTurnId": "raw_fd1c25bda9158930d067",
+              "toolCallIndex": 22,
+              "toolName": "exec",
+              "intent": "verify PDF content by reading text",
+              "summary": "Read PDF text successfully; found expected title, subtitle, swimlanes, and process steps.",
+              "outcome": "success"
+            }
+          ],
+          "alignmentToMedoid": {
+            "admitted": true,
+            "score": 1,
+            "averageMatchSimilarity": 1,
+            "coverage": 1,
+            "matchedSteps": 5,
+            "internalGapSteps": 0,
+            "maxInternalGap": 0,
+            "pairs": [
+              {
+                "leftIndex": 0,
+                "rightIndex": 0,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 1,
+                "rightIndex": 1,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 2,
+                "rightIndex": 2,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 3,
+                "rightIndex": 3,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 4,
+                "rightIndex": 4,
+                "similarity": 1
+              }
+            ]
+          }
+        },
+        {
+          "stableKey": "episode_b1deef67447d5edf1f19|s5|14-18|raw_663021460edbaf97796c#14,raw_663021460edbaf97796c#15,raw_663021460edbaf97796c#16,raw_663021460edbaf97796c#17,raw_663021460edbaf97796c#18",
+          "episodeId": "episode_b1deef67447d5edf1f19",
+          "terminalReward": 0.75,
+          "startStepIndex": 14,
+          "endStepIndex": 18,
+          "isMedoid": false,
+          "steps": [
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 14,
+              "toolName": "edit_file",
+              "intent": "edit the PDF generation script to fix errors",
+              "summary": "The script file was edited successfully with lint checks passing.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 15,
+              "toolName": "exec",
+              "intent": "execute the PDF generation script",
+              "summary": "Script execution succeeded and produced the accessibility framework guide PDF.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 16,
+              "toolName": "exec",
+              "intent": "verify the generated PDF file exists and check its size",
+              "summary": "The generated PDF file exists with a size of 23 KB.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 17,
+              "toolName": "exec",
+              "intent": "extract text from the generated PDF to verify content",
+              "summary": "Text extraction succeeded and confirmed the guide content includes accessibility standards and best practices.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 18,
+              "toolName": "exec",
+              "intent": "extract text from the generated PDF to verify content",
+              "summary": "Text extraction succeeded and confirmed the guide includes escalation steps for staff.",
+              "outcome": "success"
+            }
+          ],
+          "alignmentToMedoid": {
+            "admitted": true,
+            "score": 0.6691557533310478,
+            "averageMatchSimilarity": 0.8364446916638097,
+            "coverage": 0.8,
+            "matchedSteps": 4,
+            "internalGapSteps": 0,
+            "maxInternalGap": 0,
+            "pairs": [
+              {
+                "leftIndex": 1,
+                "rightIndex": 1,
+                "similarity": 0.745768349092299
+              },
+              {
+                "leftIndex": 2,
+                "rightIndex": 2,
+                "similarity": 0.9157445815202062
+              },
+              {
+                "leftIndex": 3,
+                "rightIndex": 3,
+                "similarity": 0.8421329180213666
+              },
+              {
+                "leftIndex": 4,
+                "rightIndex": 4,
+                "similarity": 0.8421329180213666
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "span5-pdf-debug-retry",
+      "scale": 5,
+      "stableSignature": "episode_76609ece7406d386ba81|s5|4-8|raw_fd1c25bda9158930d067#4,raw_fd1c25bda9158930d067#5,raw_fd1c25bda9158930d067#6,raw_fd1c25bda9158930d067#7,raw_fd1c25bda9158930d067#8||episode_b1deef67447d5edf1f19|s5|12-16|raw_663021460edbaf97796c#12,raw_663021460edbaf97796c#13,raw_663021460edbaf97796c#14,raw_663021460edbaf97796c#15,raw_663021460edbaf97796c#16",
+      "expectedCoreAnchorOffsets": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "members": [
+        {
+          "stableKey": "episode_76609ece7406d386ba81|s5|4-8|raw_fd1c25bda9158930d067#4,raw_fd1c25bda9158930d067#5,raw_fd1c25bda9158930d067#6,raw_fd1c25bda9158930d067#7,raw_fd1c25bda9158930d067#8",
+          "episodeId": "episode_76609ece7406d386ba81",
+          "terminalReward": 1,
+          "startStepIndex": 4,
+          "endStepIndex": 8,
+          "isMedoid": false,
+          "steps": [
+            {
+              "rawTurnId": "raw_fd1c25bda9158930d067",
+              "toolCallIndex": 4,
+              "toolName": "edit_file",
+              "intent": "edit the script to fix color imports",
+              "summary": "Edited the script to use a different set of color imports.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_fd1c25bda9158930d067",
+              "toolCallIndex": 5,
+              "toolName": "exec",
+              "intent": "execute the process map generation script",
+              "summary": "Script execution failed again with a traceback.",
+              "outcome": "failure"
+            },
+            {
+              "rawTurnId": "raw_fd1c25bda9158930d067",
+              "toolCallIndex": 6,
+              "toolName": "edit_file",
+              "intent": "edit the script to fix the build call",
+              "summary": "Edited the script to pass an empty flowables list to the build method.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_fd1c25bda9158930d067",
+              "toolCallIndex": 7,
+              "toolName": "exec",
+              "intent": "execute the process map generation script",
+              "summary": "Script executed successfully and generated the PDF.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_fd1c25bda9158930d067",
+              "toolCallIndex": 8,
+              "toolName": "exec",
+              "intent": "verify the generated PDF file exists",
+              "summary": "Checked the PDF file with ls; command exited with error, indicating the file may not be present.",
+              "outcome": "failure"
+            }
+          ],
+          "alignmentToMedoid": {
+            "admitted": true,
+            "score": 0.634407124952643,
+            "averageMatchSimilarity": 0.7930089061908037,
+            "coverage": 0.8,
+            "matchedSteps": 4,
+            "internalGapSteps": 0,
+            "maxInternalGap": 0,
+            "pairs": [
+              {
+                "leftIndex": 1,
+                "rightIndex": 1,
+                "similarity": 0.745768349092299
+              },
+              {
+                "leftIndex": 2,
+                "rightIndex": 2,
+                "similarity": 0.7647543450584103
+              },
+              {
+                "leftIndex": 3,
+                "rightIndex": 3,
+                "similarity": 0.745768349092299
+              },
+              {
+                "leftIndex": 4,
+                "rightIndex": 4,
+                "similarity": 0.9157445815202062
+              }
+            ]
+          }
+        },
+        {
+          "stableKey": "episode_b1deef67447d5edf1f19|s5|12-16|raw_663021460edbaf97796c#12,raw_663021460edbaf97796c#13,raw_663021460edbaf97796c#14,raw_663021460edbaf97796c#15,raw_663021460edbaf97796c#16",
+          "episodeId": "episode_b1deef67447d5edf1f19",
+          "terminalReward": 0.75,
+          "startStepIndex": 12,
+          "endStepIndex": 16,
+          "isMedoid": true,
+          "steps": [
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 12,
+              "toolName": "write_file",
+              "intent": "create a script to generate accessibility training PDFs",
+              "summary": "The generation script source file was created successfully.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 13,
+              "toolName": "exec",
+              "intent": "execute the PDF generation script",
+              "summary": "Script execution failed with a traceback error.",
+              "outcome": "failure"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 14,
+              "toolName": "edit_file",
+              "intent": "edit the PDF generation script to fix errors",
+              "summary": "The script file was edited successfully with lint checks passing.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 15,
+              "toolName": "exec",
+              "intent": "execute the PDF generation script",
+              "summary": "Script execution succeeded and produced the accessibility framework guide PDF.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_663021460edbaf97796c",
+              "toolCallIndex": 16,
+              "toolName": "exec",
+              "intent": "verify the generated PDF file exists and check its size",
+              "summary": "The generated PDF file exists with a size of 23 KB.",
+              "outcome": "success"
+            }
+          ],
+          "alignmentToMedoid": {
+            "admitted": true,
+            "score": 1,
+            "averageMatchSimilarity": 1,
+            "coverage": 1,
+            "matchedSteps": 5,
+            "internalGapSteps": 0,
+            "maxInternalGap": 0,
+            "pairs": [
+              {
+                "leftIndex": 0,
+                "rightIndex": 0,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 1,
+                "rightIndex": 1,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 2,
+                "rightIndex": 2,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 3,
+                "rightIndex": 3,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 4,
+                "rightIndex": 4,
+                "similarity": 1
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "span5-generic-debug-retry",
+      "scale": 5,
+      "stableSignature": "episode_3bce333543ac1d3d344b|s5|8-12|raw_f3de4536eaa558774795#8,raw_f3de4536eaa558774795#9,raw_f3de4536eaa558774795#10,raw_f3de4536eaa558774795#11,raw_f3de4536eaa558774795#12||episode_6e709b0946b4902a1a47|s5|10-14|raw_5f3e709e75641c0d2fef#10,raw_5f3e709e75641c0d2fef#11,raw_5f3e709e75641c0d2fef#12,raw_5f3e709e75641c0d2fef#13,raw_5f3e709e75641c0d2fef#14",
+      "expectedCoreAnchorOffsets": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "members": [
+        {
+          "stableKey": "episode_3bce333543ac1d3d344b|s5|8-12|raw_f3de4536eaa558774795#8,raw_f3de4536eaa558774795#9,raw_f3de4536eaa558774795#10,raw_f3de4536eaa558774795#11,raw_f3de4536eaa558774795#12",
+          "episodeId": "episode_3bce333543ac1d3d344b",
+          "terminalReward": 0.75,
+          "startStepIndex": 8,
+          "endStepIndex": 12,
+          "isMedoid": true,
+          "steps": [
+            {
+              "rawTurnId": "raw_f3de4536eaa558774795",
+              "toolCallIndex": 8,
+              "toolName": "write_file",
+              "intent": "create a chart generation script",
+              "summary": "The chart generation script was created.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_f3de4536eaa558774795",
+              "toolCallIndex": 9,
+              "toolName": "exec",
+              "intent": "execute the chart generation script",
+              "summary": "Script execution failed due to a runtime error.",
+              "outcome": "failure"
+            },
+            {
+              "rawTurnId": "raw_f3de4536eaa558774795",
+              "toolCallIndex": 10,
+              "toolName": "edit_file",
+              "intent": "edit the chart generation script to fix data values",
+              "summary": "The script was edited to replace missing data with a proxy value.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_f3de4536eaa558774795",
+              "toolCallIndex": 11,
+              "toolName": "exec",
+              "intent": "execute the chart generation script",
+              "summary": "Script executed successfully and the chart was saved.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_f3de4536eaa558774795",
+              "toolCallIndex": 12,
+              "toolName": "exec",
+              "intent": "verify the chart file exists",
+              "summary": "The chart file was confirmed to exist.",
+              "outcome": "success"
+            }
+          ],
+          "alignmentToMedoid": {
+            "admitted": true,
+            "score": 1,
+            "averageMatchSimilarity": 1,
+            "coverage": 1,
+            "matchedSteps": 5,
+            "internalGapSteps": 0,
+            "maxInternalGap": 0,
+            "pairs": [
+              {
+                "leftIndex": 0,
+                "rightIndex": 0,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 1,
+                "rightIndex": 1,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 2,
+                "rightIndex": 2,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 3,
+                "rightIndex": 3,
+                "similarity": 1
+              },
+              {
+                "leftIndex": 4,
+                "rightIndex": 4,
+                "similarity": 1
+              }
+            ]
+          }
+        },
+        {
+          "stableKey": "episode_6e709b0946b4902a1a47|s5|10-14|raw_5f3e709e75641c0d2fef#10,raw_5f3e709e75641c0d2fef#11,raw_5f3e709e75641c0d2fef#12,raw_5f3e709e75641c0d2fef#13,raw_5f3e709e75641c0d2fef#14",
+          "episodeId": "episode_6e709b0946b4902a1a47",
+          "terminalReward": 0.75,
+          "startStepIndex": 10,
+          "endStepIndex": 14,
+          "isMedoid": false,
+          "steps": [
+            {
+              "rawTurnId": "raw_5f3e709e75641c0d2fef",
+              "toolCallIndex": 10,
+              "toolName": "exec",
+              "intent": "execute the document generation script",
+              "summary": "Script execution failed due to a typo in the alignment constant.",
+              "outcome": "failure"
+            },
+            {
+              "rawTurnId": "raw_5f3e709e75641c0d2fef",
+              "toolCallIndex": 11,
+              "toolName": "edit_file",
+              "intent": "fix the alignment constant typo in the generation script",
+              "summary": "Edited the script to correct the misspelled alignment constant.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_5f3e709e75641c0d2fef",
+              "toolCallIndex": 12,
+              "toolName": "exec",
+              "intent": "execute the document generation script",
+              "summary": "Script executed successfully and the document was saved.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_5f3e709e75641c0d2fef",
+              "toolCallIndex": 13,
+              "toolName": "exec",
+              "intent": "verify the generated document file exists",
+              "summary": "Confirmed the document file exists with a size of 55K.",
+              "outcome": "success"
+            },
+            {
+              "rawTurnId": "raw_5f3e709e75641c0d2fef",
+              "toolCallIndex": 14,
+              "toolName": "exec",
+              "intent": "verify the document content and flow charts",
+              "summary": "Inspected the document and confirmed all sections and flow charts are present.",
+              "outcome": "success"
+            }
+          ],
+          "alignmentToMedoid": {
+            "admitted": true,
+            "score": 0.6272037191898067,
+            "averageMatchSimilarity": 0.7840046489872583,
+            "coverage": 0.8,
+            "matchedSteps": 4,
+            "internalGapSteps": 0,
+            "maxInternalGap": 0,
+            "pairs": [
+              {
+                "leftIndex": 0,
+                "rightIndex": 1,
+                "similarity": 0.8166063774531368
+              },
+              {
+                "leftIndex": 1,
+                "rightIndex": 2,
+                "similarity": 0.7181097206529455
+              },
+              {
+                "leftIndex": 2,
+                "rightIndex": 3,
+                "similarity": 0.8166063774531368
+              },
+              {
+                "leftIndex": 3,
+                "rightIndex": 4,
+                "similarity": 0.7846961203898138
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

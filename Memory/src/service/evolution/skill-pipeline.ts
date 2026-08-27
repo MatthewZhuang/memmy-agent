@@ -70,6 +70,7 @@ export class SkillPipeline {
         skill: NonNullable<ReturnType<typeof skillMetaFromMemory>>;
       } => Boolean(
         item.skill?.sourcePolicyIds.includes(policyId) &&
+        !isProceduralPatternSkillMemory(item.memory) &&
         !isReadOnlySkillMemory(item.memory)
       ));
 
@@ -471,6 +472,7 @@ export class SkillPipeline {
         skill &&
         skill.memory.userId === policy.memory.userId &&
         skill.status !== "archived" &&
+        !isProceduralPatternSkillMemory(skill.memory) &&
         !isReadOnlySkillMemory(skill.memory)
       ));
   }
@@ -713,6 +715,7 @@ private capSkillEvidenceTrace(trace: TraceMeta): TraceMeta {
       .map(skillMetaFromMemory)
       .filter((skill): skill is NonNullable<ReturnType<typeof skillMetaFromMemory>> =>
         Boolean(skill &&
+          !isProceduralPatternSkillMemory(skill.memory) &&
           skill.sourcePolicyIds.includes(policy.id))
       );
     for (const skill of skills) {
@@ -1337,6 +1340,10 @@ function isReadOnlySkillMemory(memory: MemoryRow): boolean {
   return internal.read_only === true || internal.generated_by_memory_base !== true;
 }
 
+function isProceduralPatternSkillMemory(memory: MemoryRow): boolean {
+  return memory.properties.internal_info.plugin_algorithm === "procedural.pattern.skill.v1";
+}
+
 function compareSkillMergeTargets(
   left: NonNullable<ReturnType<typeof skillMetaFromMemory>>,
   right: NonNullable<ReturnType<typeof skillMetaFromMemory>>
@@ -1463,7 +1470,7 @@ function skillCrystallizerInvalidReason(result: unknown): string | null {
   return null;
 }
 
-function detectSkillModelRefusal(value: unknown): boolean {
+export function detectSkillModelRefusal(value: unknown): boolean {
   for (const text of collectSkillStrings(value)) {
     if (detectSkillModelRefusalText(text)) return true;
   }
@@ -1506,7 +1513,7 @@ function coerceSkillSteps(value: unknown): Array<{ title: string; body: string }
     .filter((item): item is { title: string; body: string } => Boolean(item));
 }
 
-function coerceSkillParameters(value: unknown): Array<Record<string, unknown>> {
+export function coerceSkillParameters(value: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) return [];
   return value
     .map((item) => {
@@ -1531,7 +1538,7 @@ function coerceSkillParameters(value: unknown): Array<Record<string, unknown>> {
     .filter((item): item is Record<string, unknown> => Boolean(item));
 }
 
-function coerceSkillExamples(value: unknown): Array<{ input: string; expected: string }> {
+export function coerceSkillExamples(value: unknown): Array<{ input: string; expected: string }> {
   if (!Array.isArray(value)) return [];
   return value
     .map((item) => {
@@ -1572,13 +1579,13 @@ function skillMarkdownArray(value: unknown): string[] {
   return value.map((item) => skillMarkdown(item)).filter(Boolean);
 }
 
-function skillText(value: unknown): string {
+export function skillText(value: unknown): string {
   return stripDangerousMarkdownLinks(stripUnsafeHtml(skillRawString(value)))
     .replace(SKILL_CONTROL_RE, "")
     .trim();
 }
 
-function skillMarkdown(value: unknown): string {
+export function skillMarkdown(value: unknown): string {
   return stripDangerousMarkdownLinks(stripDangerousHtmlBlocks(skillRawString(value)))
     .replace(SKILL_CONTROL_RE, "")
     .trim();
@@ -1621,7 +1628,7 @@ function isSafeLinkTarget(raw: string): boolean {
   }
 }
 
-function coerceSkillName(value: unknown, fallback: string): string {
+export function coerceSkillName(value: unknown, fallback: string): string {
   const raw = skillRawString(value).trim() || fallback;
   const normalized = raw
     .toLowerCase()

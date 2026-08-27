@@ -50,6 +50,7 @@ import {
   VECTOR_SEARCH_WINDOW,
   type VectorSearchCandidate
 } from "./sqlite-vec-store.js";
+import { ProceduralTrajectoryRepository } from "./procedural-trajectory-repository.js";
 
 type SqlValue = string | number | Buffer | null;
 const BUNDLE_TABLES = [
@@ -60,6 +61,18 @@ const BUNDLE_TABLES = [
   "l3_world_model_session_cursors",
   "episodes",
   "raw_turns",
+  "episode_execution_paths",
+  "procedural_step_embeddings",
+  "trajectory_window_occurrences",
+  "trajectory_window_families",
+  "trajectory_window_family_revisions",
+  "trajectory_window_family_members",
+  "trajectory_window_clusters",
+  "trajectory_window_cluster_versions",
+  "trajectory_window_cluster_members",
+  "trajectory_window_cluster_canonical_keys",
+  "trajectory_window_family_cluster_links",
+  "trajectory_skill_versions",
   "l3_world_model_input_traces",
   "feedback",
   "l3_world_model_evidence_batches",
@@ -5001,6 +5014,7 @@ export class Repositories {
   readonly userMemories: UserMemoryRepository;
   readonly processing: MemoryProcessingRepository;
   readonly runtime: RuntimeRepository;
+  readonly proceduralTrajectory: ProceduralTrajectoryRepository;
   readonly l3WorldModels: L3WorldModelRepository;
   readonly projectEnvironments: ProjectEnvironmentRepository;
   readonly vectors: SqliteVecStore;
@@ -5011,6 +5025,7 @@ export class Repositories {
     this.userMemories = new UserMemoryRepository(db);
     this.processing = new MemoryProcessingRepository(db);
     this.runtime = new RuntimeRepository(db);
+    this.proceduralTrajectory = new ProceduralTrajectoryRepository(db);
     this.l3WorldModels = new L3WorldModelRepository(db, this.memories);
     this.projectEnvironments = new ProjectEnvironmentRepository(db, this.l3WorldModels, this.runtime);
   }
@@ -6726,6 +6741,46 @@ function nestedString(record: Record<string, unknown>, ...path: string[]): strin
 }
 
 function redactBundleRow(table: BundleTableName, row: Record<string, unknown>): Record<string, unknown> {
+  if (table === "episode_execution_paths") {
+    const payload = parseJson<Record<string, unknown>>(
+      typeof row.payload_json === "string" ? row.payload_json : "{}",
+      {}
+    );
+    const steps = Array.isArray(payload.steps)
+      ? payload.steps.map((step) => isRecordLike(step)
+        ? {
+            ...step,
+            intent: "[REDACTED]",
+            summary: "[REDACTED]"
+          }
+        : step)
+      : [];
+    const turnTransitions = Array.isArray(payload.turnTransitions)
+      ? payload.turnTransitions.map((transition) => isRecordLike(transition)
+        ? {
+            ...transition,
+            ...(Object.prototype.hasOwnProperty.call(transition, "userObservation")
+              ? { userObservation: "[REDACTED]" }
+              : {})
+          }
+        : transition)
+      : [];
+    return {
+      ...row,
+      payload_json: toJson({
+        ...payload,
+        steps,
+        turnTransitions
+      })
+    };
+  }
+  if (table === "trajectory_window_occurrences") {
+    return {
+      ...row,
+      semantic_text: "[REDACTED]",
+      semantic_hash: stableHash("[REDACTED]")
+    };
+  }
   if (table !== "raw_turns") {
     return row;
   }
@@ -6931,9 +6986,12 @@ function evolutionJobPrioritySql(): string {
              WHEN job_type = 'episode_idle_close' THEN 10
              WHEN job_type = 'reflection' THEN 20
              WHEN job_type = 'reward' THEN 30
+             WHEN job_type = 'episode_path_compile' THEN 34
+             WHEN job_type = 'trajectory_window_ingest' THEN 35
              WHEN job_type = 'span_big_turn' THEN 35
              WHEN job_type = 'l2_association' THEN 40
              WHEN job_type = 'l2_induction' THEN 50
+             WHEN job_type = 'procedural_skill_induction' THEN 50
              WHEN job_type = 'project_environment_profile' THEN 55
              WHEN job_type IN ('l3_abstraction', 'l3_world_model_update') THEN 60
              WHEN job_type = 'skill_crystallization' THEN 70

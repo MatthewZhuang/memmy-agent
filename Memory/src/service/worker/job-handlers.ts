@@ -67,6 +67,9 @@ export interface WorkerJobProcessors {
     crystallizeSkill(job: EvolutionJobRecord): MaybePromise<void>;
     associateL2(job: EvolutionJobRecord): MaybePromise<void>;
     splitBigTurn(job: EvolutionJobRecord): MaybePromise<void>;
+    compileEpisodePath(job: EvolutionJobRecord): MaybePromise<void>;
+    ingestTrajectoryWindows(job: EvolutionJobRecord): MaybePromise<void>;
+    induceProceduralSkill(job: EvolutionJobRecord): MaybePromise<void>;
   };
   feedback: {
     applyReward(job: EvolutionJobRecord): MaybePromise<void>;
@@ -260,6 +263,15 @@ export async function processJob(
       return;
     case "span_big_turn":
       await deps.processors.evolution.splitBigTurn(job);
+      return;
+    case "episode_path_compile":
+      await deps.processors.evolution.compileEpisodePath(job);
+      return;
+    case "trajectory_window_ingest":
+      await deps.processors.evolution.ingestTrajectoryWindows(job);
+      return;
+    case "procedural_skill_induction":
+      await deps.processors.evolution.induceProceduralSkill(job);
       return;
     case "embedding":
       await deps.processors.embedding.embedMemory(job);
@@ -489,6 +501,8 @@ export function workerJobCanRunInParallel(job: EvolutionJobRecord): boolean {
   return job.jobType === "trace_summary" ||
     job.jobType === "import_summary" ||
     job.jobType === "embedding" ||
+    job.jobType === "episode_path_compile" ||
+    job.jobType === "procedural_skill_induction" ||
     job.jobType === "l3_world_model_update" ||
     job.jobType === "project_environment_profile";
 }
@@ -551,6 +565,11 @@ export function evolutionJobDedupeKey(input: Pick<EnqueueJobInput, "jobType" | "
     const value = payload[key];
     return typeof value === "string" && value.trim() ? value.trim() : undefined;
   };
+  const payloadVersion = (key: string): string | undefined => {
+    const value = payload[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+    return typeof value === "number" && Number.isFinite(value) ? String(value) : undefined;
+  };
   const payloadStringArray = (key: string): string[] => {
     const value = payload[key];
     return Array.isArray(value)
@@ -577,6 +596,35 @@ export function evolutionJobDedupeKey(input: Pick<EnqueueJobInput, "jobType" | "
       return input.episodeId ? `reward:${input.episodeId}` : target ? `reward:${target}` : undefined;
     case "span_big_turn":
       return target ? `span_big_turn:${target}` : undefined;
+    case "episode_path_compile": {
+      const episodeId = input.episodeId ?? payloadString("episodeId");
+      if (!episodeId) return undefined;
+      const sourceSnapshotHash = payloadString("sourceSnapshotHash") ?? "current";
+      const rewardSnapshotHash = payloadString("rewardSnapshotHash") ?? "current";
+      const semanticsVersion = payloadVersion("semanticsVersion") ?? "current";
+      return `episode_path_compile:${episodeId}:${sourceSnapshotHash}:${rewardSnapshotHash}:${semanticsVersion}`;
+    }
+    case "trajectory_window_ingest": {
+      const pathId = payloadString("pathId") ?? target;
+      if (!pathId) return undefined;
+      const pathHash = payloadString("pathHash") ?? "current";
+      const rewardSnapshotHash = payloadString("rewardSnapshotHash") ?? "current";
+      const mechanicalWindowHash = payloadVersion("mechanicalWindowHash") ??
+        payloadVersion("windowConfigVersion") ?? "current";
+      const clusteringConfigHash = payloadVersion("clusteringConfigHash") ?? "current";
+      const governanceSnapshotHash = payloadString("governanceSnapshotHash") ?? "current";
+      return `trajectory_window_ingest:${pathId}:${pathHash}:${rewardSnapshotHash}:` +
+        `${mechanicalWindowHash}:${clusteringConfigHash}:${governanceSnapshotHash}`;
+    }
+    case "procedural_skill_induction": {
+      const clusterId = payloadString("clusterId") ?? target;
+      if (!clusterId) return undefined;
+      const clusterVersion = payloadString("clusterVersionId")
+        ?? payloadVersion("membershipVersion")
+        ?? "current";
+      const inductionVersion = payloadVersion("inductionVersion") ?? "current";
+      return `procedural_skill_induction:${clusterId}:${clusterVersion}:${inductionVersion}`;
+    }
     case "negative_experience": {
       const source = payloadString("source");
       const sourceEventId = payloadString("sourceEventId");

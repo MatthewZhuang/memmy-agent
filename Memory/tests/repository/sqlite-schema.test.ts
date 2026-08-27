@@ -3,8 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { MemoryDb, SCHEMA_MIGRATION_ID, SCHEMA_VERSION } from "../../src/index.js";
+import { MemoryDb } from "../../src/storage/db.js";
 import { Repositories } from "../../src/storage/repositories.js";
+import { SCHEMA_MIGRATION_ID, SCHEMA_VERSION } from "../../src/storage/schema.js";
 import type { MemoryRow } from "../../src/types.js";
 
 describe("repository sqlite schema contract", () => {
@@ -73,6 +74,18 @@ describe("repository sqlite schema contract", () => {
         "l3_world_model_session_cursors",
         "episodes",
         "raw_turns",
+        "episode_execution_paths",
+        "procedural_step_embeddings",
+        "trajectory_window_occurrences",
+        "trajectory_window_families",
+        "trajectory_window_family_revisions",
+        "trajectory_window_family_members",
+        "trajectory_window_clusters",
+        "trajectory_window_cluster_versions",
+        "trajectory_window_cluster_members",
+        "trajectory_window_cluster_canonical_keys",
+        "trajectory_window_family_cluster_links",
+        "trajectory_skill_versions",
         "l3_world_model_input_traces",
         "feedback",
         "l3_world_model_evidence_batches",
@@ -262,6 +275,118 @@ describe("repository sqlite schema contract", () => {
         "profile_scan_id"
       ]));
       db.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates schema v6 to the latest version without losing existing memories", () => {
+    const root = mkdtempSync(join(tmpdir(), "mindock-repo-v6-procedural-migration-"));
+    const dbPath = join(root, "memory.sqlite");
+    try {
+      const seeded = new MemoryDb({ path: dbPath });
+      new Repositories(seeded.db).memories.insert(schemaVectorMemory());
+      seeded.db.pragma("foreign_keys = OFF");
+      for (const table of [
+        "trajectory_window_family_cluster_links",
+        "trajectory_window_cluster_canonical_keys",
+        "trajectory_skill_versions",
+        "trajectory_window_cluster_members",
+        "trajectory_window_cluster_versions",
+        "trajectory_window_clusters",
+        "trajectory_window_family_members",
+        "trajectory_window_family_revisions",
+        "trajectory_window_families",
+        "trajectory_window_occurrences",
+        "procedural_step_embeddings",
+        "episode_execution_paths"
+      ]) {
+        seeded.db.exec(`DROP TABLE ${table}`);
+      }
+      seeded.db.prepare(`DELETE FROM schema_migrations`).run();
+      seeded.db.prepare(
+        `INSERT INTO schema_migrations (id, version, applied_at, checksum)
+         VALUES ('006_l3_world_model', 6, '2026-01-01T00:00:00.000Z', 'v6')`
+      ).run();
+      seeded.close();
+
+      const migrated = new MemoryDb({ path: dbPath });
+      expect(migrated.schemaVersion()).toMatchObject({
+        version: SCHEMA_VERSION,
+        lastMigrationId: SCHEMA_MIGRATION_ID
+      });
+      expect(new Repositories(migrated.db).memories.get("old-vector-memory")?.memoryValue)
+        .toBe("old vector memory");
+      expect(sqliteNames(migrated, "trajectory_%")).toEqual(expect.arrayContaining([
+        "trajectory_window_occurrences",
+        "trajectory_window_families",
+        "trajectory_window_family_revisions",
+        "trajectory_window_family_members",
+        "trajectory_window_clusters",
+        "trajectory_window_cluster_versions",
+        "trajectory_window_cluster_members",
+        "trajectory_window_cluster_canonical_keys",
+        "trajectory_window_family_cluster_links",
+        "trajectory_skill_versions"
+      ]));
+      migrated.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates schema v7 to v8 without losing existing trajectory clusters", () => {
+    const root = mkdtempSync(join(tmpdir(), "mindock-repo-v7-family-migration-"));
+    const dbPath = join(root, "memory.sqlite");
+    try {
+      const seeded = new MemoryDb({ path: dbPath });
+      seeded.db.prepare(
+        `INSERT INTO trajectory_window_clusters (
+          id, user_id, scale, algorithm_version, config_hash, status,
+          created_at, updated_at
+        ) VALUES (?, ?, 5, ?, ?, 'active', ?, ?)`
+      ).run(
+        "trajectory-cluster-preserved-v7",
+        "migration-user",
+        "multi-scale-window.v1",
+        "v7-config",
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:00.000Z"
+      );
+      seeded.db.pragma("foreign_keys = OFF");
+      for (const table of [
+        "trajectory_window_family_cluster_links",
+        "trajectory_window_cluster_canonical_keys",
+        "trajectory_window_family_members",
+        "trajectory_window_family_revisions",
+        "trajectory_window_families"
+      ]) {
+        seeded.db.exec(`DROP TABLE ${table}`);
+      }
+      seeded.db.prepare(`DELETE FROM schema_migrations`).run();
+      seeded.db.prepare(
+        `INSERT INTO schema_migrations (id, version, applied_at, checksum)
+         VALUES ('007_procedural_trajectory', 7, '2026-01-01T00:00:00.000Z', 'v7')`
+      ).run();
+      seeded.close();
+
+      const migrated = new MemoryDb({ path: dbPath });
+      expect(migrated.schemaVersion()).toMatchObject({
+        version: SCHEMA_VERSION,
+        lastMigrationId: SCHEMA_MIGRATION_ID
+      });
+      expect(migrated.db.prepare(
+        `SELECT id FROM trajectory_window_clusters WHERE id = ?`
+      ).get("trajectory-cluster-preserved-v7")).toEqual({
+        id: "trajectory-cluster-preserved-v7"
+      });
+      expect(sqliteNames(migrated, "trajectory_window_famil%")).toEqual(expect.arrayContaining([
+        "trajectory_window_families",
+        "trajectory_window_family_revisions",
+        "trajectory_window_family_members",
+        "trajectory_window_family_cluster_links"
+      ]));
+      migrated.close();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

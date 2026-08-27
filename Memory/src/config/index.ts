@@ -171,6 +171,28 @@ export interface AlgorithmConfig {
     maxSourceIds: number;
     implicitConfidenceCap: number;
   };
+  proceduralWindow: {
+    enabled: boolean;
+    stepSemanticBatchSize: number;
+    stepSemanticMaxChars: number;
+    maxStepsPerEpisode: number;
+    minSupportEpisodes: number;
+    maxSkillEvidenceEpisodes: number;
+    medoidSwitchMargin: number;
+    scales: Array<{
+      length: number;
+      stride: number;
+      coarseSimilarityThreshold: number;
+      bandWidth: number;
+      minStepSimilarity: number;
+      minMatchedSteps: number;
+      minCoverage: number;
+      minAverageMatchSimilarity: number;
+      maxInternalGap: number;
+      gapPenalty: number;
+      minAlignmentScore: number;
+    }>;
+  };
   l2Induction: {
     useLlm: boolean;
     minEpisodesForInduction: number;
@@ -391,6 +413,43 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
       maxPreferences: 3,
       maxSourceIds: 20,
       implicitConfidenceCap: 0.65
+    },
+    proceduralWindow: {
+      enabled: true,
+      stepSemanticBatchSize: 30,
+      stepSemanticMaxChars: 30_000,
+      maxStepsPerEpisode: 500,
+      minSupportEpisodes: 2,
+      maxSkillEvidenceEpisodes: 6,
+      medoidSwitchMargin: 0.01,
+      scales: [
+        {
+          length: 5,
+          stride: 2,
+          coarseSimilarityThreshold: 0.76,
+          bandWidth: 1,
+          minStepSimilarity: 0.70,
+          minMatchedSteps: 3,
+          minCoverage: 0.60,
+          minAverageMatchSimilarity: 0.70,
+          maxInternalGap: 1,
+          gapPenalty: 0.10,
+          minAlignmentScore: 0.34
+        },
+        {
+          length: 10,
+          stride: 5,
+          coarseSimilarityThreshold: 0.70,
+          bandWidth: 2,
+          minStepSimilarity: 0.68,
+          minMatchedSteps: 7,
+          minCoverage: 0.70,
+          minAverageMatchSimilarity: 0.70,
+          maxInternalGap: 2,
+          gapPenalty: 0.10,
+          minAlignmentScore: 0.43
+        }
+      ]
     },
     l2Induction: {
       useLlm: true,
@@ -906,6 +965,7 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
   const reward = asRecord(input.reward);
   const feedback = asRecord(input.feedback);
   const negativeExperience = asRecord(input.negativeExperience);
+  const proceduralWindow = asRecord(input.proceduralWindow);
   const l2 = asRecord(input.l2Induction);
   const l3 = asRecord(input.l3Abstraction);
   const skill = asRecord(input.skill);
@@ -1007,6 +1067,37 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
         DEFAULT_MEMMY_CONFIG.algorithm.negativeExperience.implicitConfidenceCap
       )
     },
+    proceduralWindow: {
+      enabled: booleanValue(
+        proceduralWindow.enabled,
+        DEFAULT_MEMMY_CONFIG.algorithm.proceduralWindow.enabled
+      ),
+      stepSemanticBatchSize: numberValue(
+        proceduralWindow.stepSemanticBatchSize,
+        DEFAULT_MEMMY_CONFIG.algorithm.proceduralWindow.stepSemanticBatchSize
+      ),
+      stepSemanticMaxChars: numberValue(
+        proceduralWindow.stepSemanticMaxChars,
+        DEFAULT_MEMMY_CONFIG.algorithm.proceduralWindow.stepSemanticMaxChars
+      ),
+      maxStepsPerEpisode: numberValue(
+        proceduralWindow.maxStepsPerEpisode,
+        DEFAULT_MEMMY_CONFIG.algorithm.proceduralWindow.maxStepsPerEpisode
+      ),
+      minSupportEpisodes: numberValue(
+        proceduralWindow.minSupportEpisodes,
+        DEFAULT_MEMMY_CONFIG.algorithm.proceduralWindow.minSupportEpisodes
+      ),
+      maxSkillEvidenceEpisodes: numberValue(
+        proceduralWindow.maxSkillEvidenceEpisodes,
+        DEFAULT_MEMMY_CONFIG.algorithm.proceduralWindow.maxSkillEvidenceEpisodes
+      ),
+      medoidSwitchMargin: numberValue(
+        proceduralWindow.medoidSwitchMargin,
+        DEFAULT_MEMMY_CONFIG.algorithm.proceduralWindow.medoidSwitchMargin
+      ),
+      scales: normalizeProceduralWindowScales(proceduralWindow.scales)
+    },
     l2Induction: {
       useLlm: booleanValue(l2.useLlm, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.useLlm),
       minEpisodesForInduction: numberValue(l2.minEpisodesForInduction, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.minEpisodesForInduction),
@@ -1089,6 +1180,47 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
       )
     }
   };
+}
+
+function normalizeProceduralWindowScales(
+  value: unknown
+): AlgorithmConfig["proceduralWindow"]["scales"] {
+  const defaults = DEFAULT_MEMMY_CONFIG.algorithm.proceduralWindow.scales;
+  if (!Array.isArray(value) || value.length === 0) return defaults.map((item) => ({ ...item }));
+  const normalized = value.map((item, index) => {
+    const input = asRecord(item);
+    const fallback = defaults.find((candidate) => candidate.length === Number(input.length))
+      ?? defaults[index]
+      ?? defaults[0]!;
+    return {
+      length: numberValue(input.length, fallback.length),
+      stride: numberValue(input.stride, fallback.stride),
+      coarseSimilarityThreshold: numberValue(
+        input.coarseSimilarityThreshold,
+        fallback.coarseSimilarityThreshold
+      ),
+      bandWidth: numberValue(input.bandWidth, fallback.bandWidth),
+      minStepSimilarity: numberValue(input.minStepSimilarity, fallback.minStepSimilarity),
+      minMatchedSteps: numberValue(input.minMatchedSteps, fallback.minMatchedSteps),
+      minCoverage: numberValue(input.minCoverage, fallback.minCoverage),
+      minAverageMatchSimilarity: numberValue(
+        input.minAverageMatchSimilarity,
+        fallback.minAverageMatchSimilarity
+      ),
+      maxInternalGap: numberValue(input.maxInternalGap, fallback.maxInternalGap),
+      gapPenalty: numberValue(input.gapPenalty, fallback.gapPenalty),
+      minAlignmentScore: numberValue(input.minAlignmentScore, fallback.minAlignmentScore)
+    };
+  });
+  const valid = normalized.filter((item) =>
+    Number.isInteger(item.length) && item.length >= 2 &&
+    Number.isInteger(item.stride) && item.stride >= 1 && item.stride <= item.length &&
+    item.coarseSimilarityThreshold > 0 && item.coarseSimilarityThreshold <= 1 &&
+    Number.isInteger(item.bandWidth) && item.bandWidth >= 0 && item.bandWidth < item.length &&
+    Number.isInteger(item.minMatchedSteps) && item.minMatchedSteps >= 1 &&
+    item.minMatchedSteps <= item.length
+  );
+  return valid.length > 0 ? valid : defaults.map((item) => ({ ...item }));
 }
 
 function memoryDomainName(value: unknown, fallback: MemoryDomainName): MemoryDomainName {

@@ -306,7 +306,10 @@ export class MemoryService {
           updateProjectEnvironment: (job) => this.projectEnvironment.processProfileJob(job),
           crystallizeSkill: (job) => this.evolutionJobs.crystallizeSkill(job),
           associateL2: (job) => this.evolutionJobs.associateL2(job),
-          splitBigTurn: (job) => this.evolutionJobs.splitBigTurn(job)
+          splitBigTurn: (job) => this.evolutionJobs.splitBigTurn(job),
+          compileEpisodePath: (job) => this.evolutionJobs.compileEpisodePath(job),
+          ingestTrajectoryWindows: (job) => this.evolutionJobs.ingestTrajectoryWindows(job),
+          induceProceduralSkill: (job) => this.evolutionJobs.induceProceduralSkill(job)
         },
         feedback: {
           applyReward: (job) => this.evolutionJobs.applyReward(job),
@@ -325,6 +328,7 @@ export class MemoryService {
       get config() { return evolutionOwner.config; },
       get llm() { return evolutionOwner.llm; },
       get skillLlm() { return evolutionOwner.skillLlm; },
+      get embedder() { return evolutionOwner.embedder; },
       traceMeta: this.traceMeta.bind(this),
       namespaceIdFromMemory,
       buildMemory: (input) => this.buildMemory(input as Parameters<MemoryService["buildMemory"]>[0]),
@@ -1378,7 +1382,12 @@ export class MemoryService {
     this.assertMemoryInScope(memory, request.namespace);
     const kind = kindFromMemory(memory);
     const at = nowIso();
-    const archived = this.repos.memories.archive(memory.id, at);
+    const governedMemory = this.evolutionJobs.markProceduralSkillGovernanceDisabled(
+      memory,
+      "archive",
+      at
+    );
+    const archived = this.repos.memories.archive(governedMemory.id, at);
     if (!archived) {
       throw new MemoryServiceError("not_found", `memory not found: ${id}`);
     }
@@ -1408,7 +1417,7 @@ export class MemoryService {
       meta: { reason: request.reason },
       createdAt: archived.updatedAt
     });
-    this.evolutionJobs.invalidateMemoryDependencies(memory, at);
+    this.evolutionJobs.invalidateMemoryDependencies(memory, at, "l1-archive");
     return {
       ok: true,
       id: archived.id,
@@ -1503,6 +1512,7 @@ export class MemoryService {
     }
     const kind = kindFromMemory(memory);
     const at = nowIso();
+    this.evolutionJobs.markProceduralSkillGovernanceDisabled(memory, "delete", at);
     const deleted = strictV2WorldModel
       ? this.repos.l3WorldModels.deleteScopeMemory(memory.id, at)?.deleted
       : this.repos.memories.softDelete(memory.id, at);
@@ -1535,7 +1545,7 @@ export class MemoryService {
       meta: { reason: request.reason },
       createdAt: deleted.updatedAt
     });
-    this.evolutionJobs.invalidateMemoryDependencies(memory, at);
+    this.evolutionJobs.invalidateMemoryDependencies(memory, at, "l1-delete");
     return {
       ok: true,
       id: deleted.id,
@@ -1683,6 +1693,12 @@ export class MemoryService {
       deletedAt: mode === "delete" ? at : rawTurn.deletedAt
     };
     this.repos.runtime.updateRawTurn(redacted);
+    this.evolutionJobs.invalidateProceduralEpisodeSources({
+      episodeId: rawTurn.episodeId,
+      reason: mode === "delete" ? "raw-turn-delete" : "raw-turn-redact",
+      at,
+      recompile: true
+    });
     const changeSeq = this.repos.runtime.appendChange({
       memoryId: rawTurn.id,
       namespaceId: namespaceIdFromContext(rawTurnNamespace),

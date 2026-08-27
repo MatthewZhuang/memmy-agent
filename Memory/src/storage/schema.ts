@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 6;
-export const SCHEMA_MIGRATION_ID = "006_l3_world_model";
+export const SCHEMA_VERSION = 8;
+export const SCHEMA_MIGRATION_ID = "008_procedural_coarse_families";
 const API_LOG_SOURCE_AGENT_MIGRATION_FROM_VERSION = 2;
 const PROCESSING_TAGS = new Set([
   "摘要排队中",
@@ -220,6 +220,258 @@ const statements = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_raw_turns_episode_created
     ON raw_turns (episode_id, created_at ASC)`,
+
+  `CREATE TABLE IF NOT EXISTS episode_execution_paths (
+    id TEXT PRIMARY KEY,
+    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    compilation_key TEXT NOT NULL,
+    source_snapshot_hash TEXT NOT NULL,
+    path_hash TEXT NOT NULL,
+    compiler_version TEXT NOT NULL,
+    model_signature TEXT,
+    source_raw_turn_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(source_raw_turn_ids_json)),
+    source_agent_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(source_agent_ids_json)),
+    step_count INTEGER NOT NULL DEFAULT 0 CHECK (step_count >= 0),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded')),
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    deactivated_at TEXT,
+    UNIQUE (episode_id, compilation_key),
+    UNIQUE (episode_id, path_hash)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_episode_execution_paths_active
+    ON episode_execution_paths (episode_id) WHERE status = 'active'`,
+  `CREATE INDEX IF NOT EXISTS idx_episode_execution_paths_user_status
+    ON episode_execution_paths (user_id, status, created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_episode_execution_paths_episode_created
+    ON episode_execution_paths (episode_id, created_at DESC, id DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS procedural_step_embeddings (
+    id TEXT PRIMARY KEY,
+    path_id TEXT NOT NULL REFERENCES episode_execution_paths(id) ON DELETE CASCADE,
+    step_id TEXT NOT NULL,
+    step_index INTEGER NOT NULL CHECK (step_index >= 0),
+    representation_version TEXT NOT NULL,
+    embedding_signature TEXT NOT NULL,
+    semantic_hash TEXT NOT NULL,
+    embedding_dim INTEGER NOT NULL CHECK (embedding_dim > 0),
+    vector_json TEXT NOT NULL CHECK (json_valid(vector_json)),
+    created_at TEXT NOT NULL,
+    UNIQUE (path_id, step_id, representation_version, embedding_signature)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_step_embeddings_path_index
+    ON procedural_step_embeddings (path_id, step_index ASC)`,
+  `CREATE INDEX IF NOT EXISTS idx_procedural_step_embeddings_signature
+    ON procedural_step_embeddings (embedding_signature, representation_version, path_id)`,
+
+  `CREATE TABLE IF NOT EXISTS trajectory_window_occurrences (
+    id TEXT PRIMARY KEY,
+    path_id TEXT NOT NULL REFERENCES episode_execution_paths(id) ON DELETE CASCADE,
+    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL,
+    terminal_reward REAL,
+    evidence_role TEXT NOT NULL CHECK (evidence_role IN ('support', 'counterexample', 'unknown')),
+    schema_version TEXT NOT NULL,
+    window_config_hash TEXT NOT NULL,
+    scale INTEGER NOT NULL CHECK (scale >= 2),
+    stride INTEGER NOT NULL CHECK (stride >= 1),
+    start_step_index INTEGER NOT NULL CHECK (start_step_index >= 0),
+    end_step_index INTEGER NOT NULL CHECK (end_step_index >= start_step_index),
+    step_ids_json TEXT NOT NULL CHECK (json_valid(step_ids_json)),
+    raw_turn_ids_json TEXT NOT NULL CHECK (json_valid(raw_turn_ids_json)),
+    semantic_text TEXT NOT NULL,
+    semantic_hash TEXT NOT NULL,
+    coarse_representation_version TEXT NOT NULL,
+    embedding_signature TEXT NOT NULL,
+    embedding_dim INTEGER NOT NULL CHECK (embedding_dim > 0),
+    coarse_vector_json TEXT NOT NULL CHECK (json_valid(coarse_vector_json)),
+    created_at TEXT NOT NULL,
+    UNIQUE (path_id, window_config_hash, scale, start_step_index, end_step_index)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_windows_path_scale_start
+    ON trajectory_window_occurrences (path_id, scale, start_step_index ASC)`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_windows_user_scale_signature
+    ON trajectory_window_occurrences (user_id, scale, embedding_signature, created_at ASC)`,
+
+  `CREATE TABLE IF NOT EXISTS trajectory_window_families (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    scale INTEGER NOT NULL CHECK (scale >= 2),
+    algorithm_version TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    embedding_signature TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retired')),
+    active_revision_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_window_families_scope
+    ON trajectory_window_families (
+      user_id, scale, algorithm_version, config_hash, embedding_signature,
+      status, updated_at DESC
+    )`,
+
+  `CREATE TABLE IF NOT EXISTS trajectory_window_family_revisions (
+    id TEXT PRIMARY KEY,
+    family_id TEXT NOT NULL REFERENCES trajectory_window_families(id) ON DELETE CASCADE,
+    revision_no INTEGER NOT NULL CHECK (revision_no >= 1),
+    membership_hash TEXT NOT NULL,
+    evidence_hash TEXT NOT NULL,
+    medoid_occurrence_id TEXT NOT NULL REFERENCES trajectory_window_occurrences(id) ON DELETE CASCADE,
+    metrics_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metrics_json)),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded')),
+    supersedes_revision_id TEXT,
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    deactivated_at TEXT,
+    UNIQUE (family_id, revision_no),
+    UNIQUE (family_id, membership_hash)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_trajectory_window_family_revisions_active
+    ON trajectory_window_family_revisions (family_id) WHERE status = 'active'`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_window_family_revisions_family
+    ON trajectory_window_family_revisions (family_id, created_at DESC, id DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_window_family_revisions_medoid
+    ON trajectory_window_family_revisions (medoid_occurrence_id, status)`,
+
+  `CREATE TABLE IF NOT EXISTS trajectory_window_family_members (
+    id TEXT PRIMARY KEY,
+    family_revision_id TEXT NOT NULL REFERENCES trajectory_window_family_revisions(id) ON DELETE CASCADE,
+    occurrence_id TEXT NOT NULL REFERENCES trajectory_window_occurrences(id) ON DELETE CASCADE,
+    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL,
+    coarse_similarity REAL NOT NULL CHECK (coarse_similarity >= -1 AND coarse_similarity <= 1),
+    is_medoid INTEGER NOT NULL DEFAULT 0 CHECK (is_medoid IN (0, 1)),
+    created_at TEXT NOT NULL,
+    UNIQUE (family_revision_id, occurrence_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_window_family_members_revision
+    ON trajectory_window_family_members (family_revision_id, occurrence_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_window_family_members_occurrence
+    ON trajectory_window_family_members (occurrence_id, family_revision_id)`,
+
+  `CREATE TABLE IF NOT EXISTS trajectory_window_clusters (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    scale INTEGER NOT NULL CHECK (scale >= 2),
+    algorithm_version TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retired')),
+    active_version_id TEXT,
+    active_skill_version_id TEXT,
+    active_skill_memory_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_window_clusters_scope
+    ON trajectory_window_clusters (user_id, scale, algorithm_version, config_hash, status, updated_at DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS trajectory_window_cluster_versions (
+    id TEXT PRIMARY KEY,
+    cluster_id TEXT NOT NULL REFERENCES trajectory_window_clusters(id) ON DELETE CASCADE,
+    version_no INTEGER NOT NULL CHECK (version_no >= 1),
+    membership_hash TEXT NOT NULL,
+    support_hash TEXT NOT NULL,
+    medoid_occurrence_id TEXT NOT NULL REFERENCES trajectory_window_occurrences(id) ON DELETE CASCADE,
+    support_episode_count INTEGER NOT NULL DEFAULT 0 CHECK (support_episode_count >= 0),
+    counterexample_episode_count INTEGER NOT NULL DEFAULT 0 CHECK (counterexample_episode_count >= 0),
+    unknown_episode_count INTEGER NOT NULL DEFAULT 0 CHECK (unknown_episode_count >= 0),
+    metrics_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metrics_json)),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded')),
+    supersedes_version_id TEXT,
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    deactivated_at TEXT,
+    UNIQUE (cluster_id, version_no),
+    UNIQUE (cluster_id, membership_hash)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_trajectory_window_cluster_versions_active
+    ON trajectory_window_cluster_versions (cluster_id) WHERE status = 'active'`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_window_cluster_versions_cluster
+    ON trajectory_window_cluster_versions (cluster_id, created_at DESC, id DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_window_cluster_versions_medoid
+    ON trajectory_window_cluster_versions (medoid_occurrence_id, status)`,
+
+  `CREATE TABLE IF NOT EXISTS trajectory_window_cluster_members (
+    id TEXT PRIMARY KEY,
+    cluster_version_id TEXT NOT NULL REFERENCES trajectory_window_cluster_versions(id) ON DELETE CASCADE,
+    occurrence_id TEXT NOT NULL REFERENCES trajectory_window_occurrences(id) ON DELETE CASCADE,
+    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL,
+    evidence_role TEXT NOT NULL CHECK (evidence_role IN ('support', 'counterexample', 'unknown')),
+    reward_hash TEXT NOT NULL,
+    terminal_reward REAL,
+    coarse_similarity REAL NOT NULL CHECK (coarse_similarity >= -1 AND coarse_similarity <= 1),
+    alignment_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(alignment_json)),
+    is_medoid INTEGER NOT NULL DEFAULT 0 CHECK (is_medoid IN (0, 1)),
+    created_at TEXT NOT NULL,
+    UNIQUE (cluster_version_id, occurrence_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_window_cluster_members_version_role
+    ON trajectory_window_cluster_members (cluster_version_id, evidence_role, episode_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_window_cluster_members_occurrence
+    ON trajectory_window_cluster_members (occurrence_id, cluster_version_id)`,
+
+  `CREATE TABLE IF NOT EXISTS trajectory_window_cluster_canonical_keys (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    scale INTEGER NOT NULL CHECK (scale >= 2),
+    algorithm_version TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    embedding_signature TEXT NOT NULL,
+    evidence_signature TEXT NOT NULL,
+    cluster_id TEXT NOT NULL REFERENCES trajectory_window_clusters(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (
+      user_id, scale, algorithm_version, config_hash, embedding_signature,
+      evidence_signature
+    )
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_window_cluster_canonical_cluster
+    ON trajectory_window_cluster_canonical_keys (cluster_id, updated_at DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS trajectory_window_family_cluster_links (
+    id TEXT PRIMARY KEY,
+    family_revision_id TEXT NOT NULL REFERENCES trajectory_window_family_revisions(id) ON DELETE CASCADE,
+    canonical_key_id TEXT NOT NULL REFERENCES trajectory_window_cluster_canonical_keys(id) ON DELETE CASCADE,
+    cluster_version_id TEXT NOT NULL REFERENCES trajectory_window_cluster_versions(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    UNIQUE (family_revision_id, canonical_key_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_window_family_cluster_links_family
+    ON trajectory_window_family_cluster_links (family_revision_id, cluster_version_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_window_family_cluster_links_cluster
+    ON trajectory_window_family_cluster_links (cluster_version_id, family_revision_id)`,
+
+  `CREATE TABLE IF NOT EXISTS trajectory_skill_versions (
+    id TEXT PRIMARY KEY,
+    cluster_id TEXT NOT NULL REFERENCES trajectory_window_clusters(id) ON DELETE CASCADE,
+    cluster_version_id TEXT NOT NULL REFERENCES trajectory_window_cluster_versions(id) ON DELETE CASCADE,
+    version_no INTEGER NOT NULL CHECK (version_no >= 1),
+    skill_key TEXT NOT NULL,
+    membership_hash TEXT NOT NULL,
+    support_hash TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    skill_memory_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded')),
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    supersedes_version_id TEXT,
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    deactivated_at TEXT,
+    UNIQUE (cluster_id, version_no),
+    UNIQUE (cluster_version_id, content_hash)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_trajectory_skill_versions_active
+    ON trajectory_skill_versions (cluster_id) WHERE status = 'active'`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_skill_versions_memory
+    ON trajectory_skill_versions (skill_memory_id, status, created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_skill_versions_cluster
+    ON trajectory_skill_versions (cluster_id, created_at DESC, id DESC)`,
 
   `CREATE TABLE IF NOT EXISTS l3_world_model_input_traces (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -607,7 +859,7 @@ export function migrate(db: Database.Database): void {
   const hasMemories = tableExists(db, "memories");
   const version = currentSchemaVersion(db);
 
-  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5) {
+  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7) {
     throw new Error(
       `Unsupported memory database schema version ${version}; the database was left unchanged`
     );

@@ -90,6 +90,7 @@ import {
   sanitizeTurnStartRequest,
   turnStartContextHints
 } from "../turn/turn-normalization.js";
+import { inferToolOutcome } from "../turn/tool-outcome.js";
 
 type TraceMeta = NonNullable<ReturnType<typeof traceMetaFromMemory>>;
 interface ToolFailureRecord { toolId: string; context: string; step: number; reason: string; ts: number; rawTurnId?: string; sessionId?: string; episodeId?: string; }
@@ -126,30 +127,57 @@ interface CommittedTurnRoute extends EpisodeTurnRoute {
 export interface ToolOutcomeObservation { toolId: string; success?: boolean; reason?: string; }
 
 export function toolObservationEvent(input: ToolObserveRequest): { phase: "start" | "complete" | "error"; event: ToolCallPayload; toolCall: ToolCallPayload; toolResult?: ToolCallPayload } {
-  const error = errorMessageFromUnknown(input.error);
-  const success = input.error !== undefined ? false : input.result !== undefined ? true : undefined;
   const phase = input.error !== undefined ? "error" : input.result !== undefined ? "complete" : "start";
-  const event: ToolCallPayload = { id: input.toolCallId, name: input.toolName, input: input.args, output: input.error === undefined ? input.result : undefined, error, success };
+  const explicitError = input.error === undefined
+    ? undefined
+    : errorMessageFromUnknown(input.error) ?? "The tool observation reported an error.";
+  const baseEvent: ToolCallPayload = {
+    id: input.toolCallId,
+    name: input.toolName,
+    input: input.args,
+    output: input.error === undefined ? input.result : undefined,
+    ...(explicitError ? { error: explicitError } : {})
+  };
+  const inferred = inferToolOutcome({
+    call: baseEvent,
+    result: input.result,
+    completionObserved: phase === "complete"
+  });
+  const event: ToolCallPayload = {
+    ...baseEvent,
+    ...(inferred.status === "unknown" ? {} : { success: inferred.status === "success" }),
+    ...(!baseEvent.error && inferred.status === "failure" && inferred.reason
+      ? { error: inferred.reason }
+      : {}),
+    ...(inferred.errorCode ? { errorCode: inferred.errorCode } : {})
+  };
   return { phase, event, toolCall: { id: input.toolCallId, name: input.toolName, input: input.args }, toolResult: phase === "start" ? undefined : event };
 }
 
 export function toolOutcomeFromObservation(input: ToolObserveRequest, rawTurn: RawTurnRecord, updatedRawTurn: RawTurnRecord): ToolOutcomeObservation | undefined {
-  const event = toolObservationEvent(input).event; const eventRecord = event as unknown as Record<string, unknown>;
-  const call = matchingObservedToolCall(eventRecord, rawTurn, updatedRawTurn);
-  const resultSuccess = input.result === undefined ? undefined : successFromToolObservation(eventRecord) ?? true;
-  return { toolId: input.toolName, success: input.error !== undefined ? false : resultSuccess, reason: failureReasonFromToolObservation(event, call) };
+  const event = toolObservationEvent(input).event;
+  const eventRecord = event as unknown as Record<string, unknown>;
+  const observedCall = matchingObservedToolCall(eventRecord, rawTurn, updatedRawTurn);
+  const inferred = inferToolOutcome({
+    call: observedCall ? { ...observedCall, ...event } : event,
+    result: input.result,
+    completionObserved: input.result !== undefined && input.error === undefined
+  });
+  return {
+    toolId: input.toolName,
+    ...(inferred.status === "unknown" ? {} : { success: inferred.status === "success" }),
+    ...(inferred.status === "failure" && inferred.reason ? { reason: clip(inferred.reason, 240) } : {})
+  };
 }
 
 export function toolRepairContext(session: SessionRecord, episode: EpisodeRecord): string { return [session.userId, session.projectId ?? session.workspaceId ?? session.conversationId ?? "default", episode.id].join(":"); }
 export function toolSignalKey(toolId: string, context: string): string { return `${toolId}|${context}`; }
 export function toolRepairContextHash(toolId: string, context: string): string { return stableHash(`${toolId}\n${context}`).slice(0, 16); }
 export function repairEvidenceValueDiff(high: MemoryRow[], low: MemoryRow[]): number { if (!high.length || !low.length) return Number.POSITIVE_INFINITY; return Math.abs(meanTraceValue(high) - meanTraceValue(low)); }
-export function isRepairFailureLikeTrace(trace: NonNullable<ReturnType<typeof traceMetaFromMemory>>): boolean { const blob = `${trace.agentText}\n${trace.reflection ?? ""}`.toLowerCase(); return /(error|failed|failure|exception|traceback|timeout|retry)/.test(blob) || trace.toolCalls.some((call) => Boolean(call.error ?? errorMessageFromUnknown(call.output))); }
+export function isRepairFailureLikeTrace(trace: NonNullable<ReturnType<typeof traceMetaFromMemory>>): boolean { const blob = `${trace.agentText}\n${trace.reflection ?? ""}`.toLowerCase(); return /(error|failed|failure|exception|traceback|timeout|retry)/.test(blob) || trace.toolCalls.some((call) => inferToolOutcome({ call }).status === "failure"); }
 export function repairTraceContains(trace: NonNullable<ReturnType<typeof traceMetaFromMemory>>, needle: string): boolean { return `${trace.userText}\n${trace.agentText}\n${trace.reflection ?? ""}`.toLowerCase().includes(needle); }
 
 function matchingObservedToolCall(record: Record<string, unknown> | undefined, rawTurn: RawTurnRecord, updatedRawTurn: RawTurnRecord): ToolCallPayload | undefined { const id = stringFromMaybeRecord(record, "id") ?? stringFromMaybeRecord(record, "toolCallId"); const name = stringFromMaybeRecord(record, "name") ?? stringFromMaybeRecord(record, "toolName"); const calls = [...updatedRawTurn.toolCalls, ...rawTurn.toolCalls].filter(isToolCallPayload); return calls.find((call) => id && call.id === id) ?? calls.find((call) => name && call.name === name); }
-function successFromToolObservation(record: Record<string, unknown> | undefined): boolean | undefined { if (!record) return undefined; if (typeof record.success === "boolean") return record.success; if (typeof record.ok === "boolean") return record.ok; if (typeof record.exitCode === "number") return record.exitCode === 0; if (typeof record.status === "string") { const status = record.status.toLowerCase(); if (["succeeded","success","ok","passed"].includes(status)) return true; if (["failed","failure","error","cancelled"].includes(status)) return false; } return record.error !== undefined ? false : undefined; }
-function failureReasonFromToolObservation(event: unknown, call: ToolCallPayload | undefined): string | undefined { const reason = errorMessageFromUnknown(event) ?? (isRecord(event) ? stringFromMaybeRecord(event, "output") : undefined) ?? call?.error ?? errorMessageFromUnknown(call?.output); return reason ? clip(reason, 240) : undefined; }
 function meanTraceValue(memories: MemoryRow[]): number { const values = memories.map((memory) => traceMetaFromMemory(memory)?.value).filter((value): value is number => typeof value === "number" && Number.isFinite(value)); return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0; }
 function errorMessageFromUnknown(value: unknown): string | undefined { if (value === undefined || value === null) return undefined; if (value instanceof Error) return value.message; if (typeof value === "string") return value; if (isRecord(value)) { const message = value.error ?? value.message; if (typeof message === "string") return message; } return undefined; }
 function stringFromMaybeRecord(record: unknown, key: string): string | undefined { return isRecord(record) ? (typeof record[key] === "string" ? record[key] as string : undefined) : undefined; }

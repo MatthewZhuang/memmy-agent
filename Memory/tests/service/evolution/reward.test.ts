@@ -320,6 +320,26 @@ describe("MemoryService / evolution / reward", () => {
       targetKind: "episode"
     });
     expect(typeof rewardPayload.runAfter).toBe("string");
+    db.db.prepare(
+      `UPDATE evolution_jobs
+       SET payload_json = json_set(payload_json, '$.runAfter', ?)
+       WHERE job_type = 'reward' AND episode_id = ?`
+    ).run("2000-01-01T00:00:00.000Z", complete.episodeId);
+    await runWorkerRounds(service, 2);
+    expect(db.db.prepare(
+      `SELECT r_task FROM episodes WHERE id = ?`
+    ).get(complete.episodeId)).toEqual({ r_task: 0 });
+    const proceduralRefresh = db.db.prepare(
+      `SELECT payload_json
+       FROM evolution_jobs
+       WHERE job_type = 'episode_path_compile' AND episode_id = ?
+       ORDER BY created_at DESC
+       LIMIT 1`
+    ).get(complete.episodeId) as { payload_json: string } | undefined;
+    expect(JSON.parse(proceduralRefresh!.payload_json)).toMatchObject({
+      reason: "reward.skipped",
+      rTask: 0
+    });
     db.close();
   });
 

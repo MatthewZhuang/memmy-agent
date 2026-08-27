@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_MEMMY_CONFIG,
+  type MemoryDb,
   type LlmClient,
   type LlmCompletionOptions,
   type LlmMessage
 } from "../../../src/index.js";
+import { Repositories } from "../../../src/storage/repositories.js";
 import {
   createCapturingEmbedder,
   createMemoryServiceFixture,
@@ -198,6 +200,16 @@ describe("MemoryService / evolution / span big turn", () => {
       magnitude: 1,
       rationale: "复杂任务已经正确完成"
     });
+    await runWorkerRounds(service, 4);
+    enqueueLegacySpanBigTurn(db, {
+      userId: namespace.userId,
+      sessionId: session.sessionId,
+      episodeId: completed.episodeId,
+      l1MemoryId: completed.l1MemoryId,
+      rawTurnId: completed.rawTurnId,
+      rTask: 0.97,
+      rewardReason: "复杂开发任务已完成"
+    });
     await runWorkerRounds(service, 8);
 
     const spanCall = calls.find((call) => call.options.operation === "span.big_turn.v1");
@@ -360,6 +372,16 @@ describe("MemoryService / evolution / span big turn", () => {
       magnitude: 1,
       rationale: "迁移结果正确"
     });
+    await runWorkerRounds(service, 4);
+    enqueueLegacySpanBigTurn(db, {
+      userId: namespace.userId,
+      sessionId: session.sessionId,
+      episodeId: completed.episodeId,
+      l1MemoryId: completed.l1MemoryId,
+      rawTurnId: completed.rawTurnId,
+      rTask: 0.97,
+      rewardReason: "迁移结果正确"
+    });
     await runWorkerRounds(service, 8);
 
     expect(calls.filter((call) => call.options.operation === "span.big_turn.v1")).toHaveLength(1);
@@ -426,6 +448,16 @@ describe("MemoryService / evolution / span big turn", () => {
       magnitude: 1,
       rationale: "任务结果正确"
     });
+    await runWorkerRounds(service, 4);
+    enqueueLegacySpanBigTurn(db, {
+      userId: namespace.userId,
+      sessionId: session.sessionId,
+      episodeId: completed.episodeId,
+      l1MemoryId: completed.l1MemoryId,
+      rawTurnId: completed.rawTurnId,
+      rTask: 0.97,
+      rewardReason: "任务结果正确"
+    });
     await runWorkerRounds(service, 8);
 
     const spans = service.panelItems({ namespace, layer: "L1" }).items.filter(
@@ -442,9 +474,10 @@ describe("MemoryService / evolution / span big turn", () => {
     db.close();
   });
 
-  it("requires both a positive reward and more than ten tool calls", async () => {
+  it("does not automatically schedule the legacy big-turn job after reward", async () => {
     for (const scenario of [
       { userId: "span-big-turn-ten-tools", toolCount: 10, polarity: "positive" as const },
+      { userId: "span-big-turn-positive", toolCount: 11, polarity: "positive" as const },
       { userId: "span-big-turn-negative", toolCount: 11, polarity: "negative" as const }
     ]) {
       const calls: Array<{ messages: LlmMessage[]; options: LlmCompletionOptions }> = [];
@@ -497,6 +530,11 @@ describe("MemoryService / evolution / span big turn", () => {
       await runWorkerRounds(service, 8);
 
       expect(calls.some((call) => call.options.operation === "span.big_turn.v1")).toBe(false);
+      expect(service.panelJobs({ userId: namespace.userId }).items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ jobType: "episode_path_compile", status: "succeeded" })
+        ])
+      );
       expect(service.panelItems({ namespace, layer: "L1" }).items.some(
         (item) => item.kind === "span"
       )).toBe(false);
@@ -559,6 +597,16 @@ describe("MemoryService / evolution / span big turn", () => {
       magnitude: 1,
       rationale: "任务结果正确"
     });
+    await runWorkerRounds(service, 4);
+    enqueueLegacySpanBigTurn(db, {
+      userId: namespace.userId,
+      sessionId: session.sessionId,
+      episodeId: completed.episodeId,
+      l1MemoryId: completed.l1MemoryId,
+      rawTurnId: completed.rawTurnId,
+      rTask: 0.97,
+      rewardReason: "任务结果正确"
+    });
     await runWorkerRounds(service, 8);
 
     expect(calls.filter((call) => call.options.operation === "span.big_turn.v1")).toHaveLength(3);
@@ -577,3 +625,36 @@ describe("MemoryService / evolution / span big turn", () => {
     db.close();
   });
 });
+
+function enqueueLegacySpanBigTurn(
+  db: MemoryDb,
+  input: {
+    userId: string;
+    sessionId: string;
+    episodeId: string;
+    l1MemoryId: string;
+    rawTurnId: string;
+    rTask: number;
+    rewardReason: string;
+  }
+): void {
+  const at = new Date().toISOString();
+  new Repositories(db.db).runtime.enqueueJob({
+    id: `job_legacy_span_${input.l1MemoryId}`,
+    jobType: "span_big_turn",
+    status: "queued",
+    userId: input.userId,
+    sessionId: input.sessionId,
+    episodeId: input.episodeId,
+    targetMemoryId: input.l1MemoryId,
+    payload: {
+      rawTurnId: input.rawTurnId,
+      rTask: input.rTask,
+      rewardReason: input.rewardReason
+    },
+    attempts: 0,
+    maxAttempts: 3,
+    createdAt: at,
+    updatedAt: at
+  });
+}

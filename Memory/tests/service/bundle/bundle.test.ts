@@ -9,6 +9,97 @@ const {
 afterEach(cleanup);
 
 describe("MemoryService / bundle", () => {
+  it("redacts procedural Path and Window text when raw text export is disabled", () => {
+    const { db, service } = createTestService();
+    const namespace = {
+      source: "codex",
+      profileId: "default",
+      userId: "bundle-procedural-user"
+    };
+    const session = service.openSession({ namespace });
+    const completed = service.completeTurn("bundle-procedural-turn", {
+      sessionId: session.sessionId,
+      query: "raw user request",
+      answer: "raw assistant answer"
+    });
+    const at = new Date().toISOString();
+    const pathId = "path-bundle-redaction";
+    const stepId = "step-bundle-redaction";
+    db.db.prepare(
+      `INSERT INTO episode_execution_paths (
+         id, episode_id, user_id, schema_version, compilation_key,
+         source_snapshot_hash, path_hash, compiler_version, model_signature,
+         source_raw_turn_ids_json, source_agent_ids_json, step_count, status,
+         payload_json, created_at, activated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`
+    ).run(
+      pathId,
+      completed.episodeId,
+      namespace.userId,
+      "episode-execution-path-lite.v1",
+      "compile-bundle-redaction",
+      "source-bundle-redaction",
+      "hash-bundle-redaction",
+      "compiler-bundle-redaction",
+      "model-bundle-redaction",
+      JSON.stringify([completed.rawTurnId]),
+      JSON.stringify([namespace.source]),
+      1,
+      JSON.stringify({
+        id: pathId,
+        steps: [{
+          id: stepId,
+          intent: "DERIVED_PRIVATE_INTENT",
+          summary: "DERIVED_PRIVATE_SUMMARY"
+        }],
+        turnTransitions: [{ userObservation: "RAW_PRIVATE_OBSERVATION" }]
+      }),
+      at,
+      at
+    );
+    db.db.prepare(
+      `INSERT INTO trajectory_window_occurrences (
+         id, path_id, episode_id, user_id, terminal_reward, evidence_role,
+         schema_version, window_config_hash, scale, stride,
+         start_step_index, end_step_index, step_ids_json, raw_turn_ids_json,
+         semantic_text, semantic_hash, coarse_representation_version,
+         embedding_signature, embedding_dim, coarse_vector_json, created_at
+       ) VALUES (?, ?, ?, ?, NULL, 'unknown', ?, ?, 2, 1, 0, 1, ?, ?, ?, ?, ?, ?, 2, ?, ?)`
+    ).run(
+      "window-bundle-redaction",
+      pathId,
+      completed.episodeId,
+      namespace.userId,
+      "trajectory-window-occurrence.v1",
+      "window-config-bundle-redaction",
+      JSON.stringify([stepId, `${stepId}-2`]),
+      JSON.stringify([completed.rawTurnId]),
+      "DERIVED_PRIVATE_WINDOW_TEXT",
+      "semantic-private-hash",
+      "intent-sequence-v1",
+      "embedding-bundle-redaction",
+      JSON.stringify([1, 0]),
+      at
+    );
+
+    const full = service.exportBundle({ includeRawText: true });
+    expect(JSON.stringify(full.tables.episode_execution_paths))
+      .toContain("DERIVED_PRIVATE_INTENT");
+    expect(JSON.stringify(full.tables.trajectory_window_occurrences))
+      .toContain("DERIVED_PRIVATE_WINDOW_TEXT");
+
+    const redacted = service.exportBundle();
+    const serialized = JSON.stringify({
+      paths: redacted.tables.episode_execution_paths,
+      windows: redacted.tables.trajectory_window_occurrences
+    });
+    expect(serialized).not.toContain("DERIVED_PRIVATE_INTENT");
+    expect(serialized).not.toContain("DERIVED_PRIVATE_SUMMARY");
+    expect(serialized).not.toContain("RAW_PRIVATE_OBSERVATION");
+    expect(serialized).not.toContain("DERIVED_PRIVATE_WINDOW_TEXT");
+    expect(serialized).toContain("[REDACTED]");
+  });
+
   it("redacts in-flight L3 evidence while full bundles preserve recoverable runtime state", () => {
     const first = createTestService();
     const namespace = {

@@ -25,10 +25,7 @@ import type {
   SynthesizeDecisionRepairDraft
 } from "../feedback/feedback-experience.js";
 import type { EnqueueJobInput } from "../worker/job-handlers.js";
-import {
-  SPAN_BIG_TURN_ENABLED,
-  SPAN_BIG_TURN_MIN_TOOL_CALLS
-} from "./big-turn-span-pipeline.js";
+import { EPISODE_PATH_COMPILER_VERSION } from "./episode-path-compiler.js";
 
 type TraceMeta = NonNullable<ReturnType<typeof traceMetaFromMemory>>;
 type HumanScoreResult = ReturnType<typeof heuristicHumanScore>;
@@ -147,6 +144,14 @@ export class RewardPipeline {
           after: savedEpisode,
           source: "worker.reward.skip.v7",
           createdAt: savedEpisode.updatedAt
+        });
+        this.enqueueProceduralTrajectoryRefresh({
+          episode: savedEpisode,
+          traces: episodeTraces,
+          job,
+          reason: skipReason,
+          source: "heuristic",
+          at: savedEpisode.updatedAt
         });
       }
       return;
@@ -269,32 +274,6 @@ export class RewardPipeline {
         createdAt: at
       });
       const savedTrace = this.deps.traceMeta(saved);
-      const rawTurn = savedTrace?.rawTurnId
-        ? this.deps.repos.runtime.getRawTurn(savedTrace.rawTurnId)
-        : undefined;
-      if (
-        SPAN_BIG_TURN_ENABLED &&
-        job.payload.downstreamScheduled !== true &&
-        feedback.rHuman > 0 &&
-        savedTrace &&
-        savedTrace.alpha > 0 &&
-        rawTurn &&
-        rawTurn.toolCalls.length >= SPAN_BIG_TURN_MIN_TOOL_CALLS
-      ) {
-        this.deps.enqueueJob({
-          jobType: "span_big_turn",
-          userId: saved.userId,
-          sessionId: saved.sessionId,
-          episodeId: trace.episodeId,
-          targetMemoryId: saved.id,
-          payload: {
-            rawTurnId: rawTurn.id,
-            rTask: feedback.rHuman,
-            rewardReason: feedback.reason
-          },
-          createdAt: at
-        });
-      }
       if (job.payload.downstreamScheduled !== true && savedTrace && this.deps.isTraceEligibleForL2(savedTrace)) {
         this.deps.recordCandidatePoolTrace(savedTrace, signatureFromTrace(savedTrace), at);
         l2Eligible.push({ memory: saved, trace: savedTrace });
@@ -309,6 +288,16 @@ export class RewardPipeline {
         });
       }
       await this.maybeCreateValueDistributionRepair(saved, at);
+    }
+    if (rewardedEpisode) {
+      this.enqueueProceduralTrajectoryRefresh({
+        episode: rewardedEpisode,
+        traces: episodeTraces,
+        job,
+        reason: feedback.reason,
+        source: feedback.source,
+        at
+      });
     }
     const inductionSeed = l2Eligible[0];
     if (job.payload.downstreamScheduled !== true && inductionSeed) {
@@ -328,6 +317,68 @@ export class RewardPipeline {
       });
     }
     if (rewardedEpisode) this.deps.finalizeClosedEpisode(rewardedEpisode, at, "episode_rewarded");
+  }
+
+  private enqueueProceduralTrajectoryRefresh(input: {
+    episode: EpisodeRecord;
+    traces: TraceMeta[];
+    job: EvolutionJobRecord;
+    reason: string;
+    source: string;
+    at: string;
+  }): void {
+    if (!this.deps.config.algorithm.proceduralWindow.enabled ||
+        input.job.payload.downstreamScheduled === true) {
+      return;
+    }
+    const rawTurnSnapshots = input.episode.rawTurnIds.map((rawTurnId) => {
+      const rawTurn = this.deps.repos.runtime.getRawTurn(rawTurnId);
+      if (!rawTurn) return { id: rawTurnId, missing: true };
+      return {
+        id: rawTurn.id,
+        turnId: rawTurn.turnId,
+        createdAt: rawTurn.createdAt,
+        status: rawTurn.status,
+        redactedAt: rawTurn.redactedAt ?? null,
+        deletedAt: rawTurn.deletedAt ?? null,
+        contentHash: stableHash({
+          userText: rawTurn.userText ?? "",
+          assistantText: rawTurn.assistantText ?? "",
+          reasoningSummary: rawTurn.reasoningSummary ?? "",
+          toolCalls: rawTurn.toolCalls,
+          toolResults: rawTurn.toolResults,
+          messagePayload: rawTurn.messagePayload ?? {}
+        })
+      };
+    });
+    const sourceSnapshotHash = stableHash({
+      schema: "episode_trajectory_source.v1",
+      episodeId: input.episode.id,
+      rawTurns: rawTurnSnapshots
+    });
+    const rewardSnapshotHash = stableHash({
+      schema: "episode_reward_snapshot.v1",
+      rTask: input.episode.rTask ?? 0,
+      rewardDetail: input.episode.rewardDetail
+    });
+    this.deps.enqueueJob({
+      jobType: "episode_path_compile",
+      userId: input.episode.userId,
+      sessionId: input.episode.sessionId,
+      episodeId: input.episode.id,
+      payload: {
+        reason: input.episode.rTask === 0 ? "reward.skipped" : "reward.updated",
+        semanticsVersion: EPISODE_PATH_COMPILER_VERSION,
+        rTask: input.episode.rTask ?? 0,
+        rewardReason: input.reason,
+        rewardSource: input.source,
+        sourceSnapshotHash,
+        rewardSnapshotHash,
+        rawTurnIds: input.episode.rawTurnIds,
+        traceIds: input.traces.map((item) => item.id)
+      },
+      createdAt: input.at
+    });
   }
 
   async scoreFeedbackWithLlm(input: {
