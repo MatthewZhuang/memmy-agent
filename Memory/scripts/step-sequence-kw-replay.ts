@@ -19,6 +19,8 @@ interface Args {
   concurrency: number;
   seed: number;
   reconstructRaw: boolean;
+  rewardFilter: "all" | "positive" | "negative" | "zero" | "unknown";
+  episodeIds?: string[];
 }
 
 interface EpisodeCandidate {
@@ -27,6 +29,7 @@ interface EpisodeCandidate {
   stepCount: number;
   turnCount: number;
   toolCallCount: number;
+  terminalReward?: number;
   stratum: "short" | "medium" | "long";
 }
 
@@ -46,8 +49,10 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   mkdirSync(dirname(args.outputDbPath), { recursive: true });
   mkdirSync(dirname(args.outputReportPath), { recursive: true });
-  const candidates = listCandidates(args.dbPath, args.reconstructRaw);
-  const sampled = stratifiedSample(candidates, args.sampleSize, args.seed);
+  const candidates = listCandidates(args.dbPath, args.reconstructRaw, args.rewardFilter);
+  const sampled = args.episodeIds
+    ? selectRequestedEpisodes(candidates, args.episodeIds)
+    : stratifiedSample(candidates, args.sampleSize, args.seed);
   if (sampled.length === 0) throw new Error("No eligible closed KW Episodes were found");
   await cloneDatabase(args.dbPath, args.outputDbPath);
   const loaded = loadMemmyConfig(args.configPath);
@@ -115,6 +120,8 @@ async function main(): Promise<void> {
         available: candidates.length,
         concurrency: args.concurrency,
         reconstructRaw: args.reconstructRaw,
+        rewardFilter: args.rewardFilter,
+        fixedEpisodeOrder: Boolean(args.episodeIds),
         strata: Object.fromEntries(["short", "medium", "long"].map((stratum) => [
           stratum,
           sampled.filter((candidate) => candidate.stratum === stratum).length
@@ -167,12 +174,17 @@ async function main(): Promise<void> {
   }
 }
 
-function listCandidates(dbPath: string, reconstructRaw: boolean): EpisodeCandidate[] {
+function listCandidates(
+  dbPath: string,
+  reconstructRaw: boolean,
+  rewardFilter: Args["rewardFilter"]
+): EpisodeCandidate[] {
   const db = new Database(resolve(dbPath), { readonly: true, fileMustExist: true });
   try {
     const rows = db.prepare(
       `SELECT episodes.id AS episode_id,
               episodes.turn_count,
+              episodes.r_task,
               paths.id AS path_id,
               COALESCE(json_array_length(paths.payload_json, '$.steps'), 0) AS step_count,
               COALESCE(SUM(json_array_length(raw_turns.tool_calls_json)), 0) AS tool_call_count
@@ -188,11 +200,12 @@ function listCandidates(dbPath: string, reconstructRaw: boolean): EpisodeCandida
     ).all(reconstructRaw ? 1 : 0, reconstructRaw ? 1 : 0) as Array<{
       episode_id: string;
       turn_count: number;
+      r_task: number | null;
       path_id: string | null;
       step_count: number;
       tool_call_count: number;
     }>;
-    return rows.map((row) => {
+    return rows.filter((row) => rewardMatches(row.r_task, rewardFilter)).map((row) => {
       const size = reconstructRaw ? row.tool_call_count : row.step_count;
       return {
         episodeId: row.episode_id,
@@ -200,6 +213,7 @@ function listCandidates(dbPath: string, reconstructRaw: boolean): EpisodeCandida
         stepCount: row.step_count,
         turnCount: row.turn_count,
         toolCallCount: row.tool_call_count,
+        ...(row.r_task === null ? {} : { terminalReward: row.r_task }),
         stratum: size <= 20 ? "short" : size <= 50 ? "medium" : "long"
       };
     });
@@ -297,6 +311,7 @@ function renderMarkdown(artifact: {
       "",
       `- Stratum: ${run.candidate.stratum}`,
       `- Source Steps: ${run.candidate.stepCount}`,
+      `- Terminal Reward: ${run.candidate.terminalReward ?? "unknown"}`,
       `- Tool calls: ${run.candidate.toolCallCount}`,
       `- Elapsed: ${Math.round(run.elapsedMs / 1000)}s`,
       `- Result: ${run.error ? `failed — ${run.error.split("\n")[0]}` : "succeeded"}`,
@@ -322,6 +337,8 @@ function parseArgs(argv: readonly string[]): Args {
   let concurrency = 4;
   let seed = 20260825;
   let reconstructRaw = false;
+  let rewardFilter: Args["rewardFilter"] = "all";
+  let episodeIds: string[] | undefined;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--db") dbPath = requiredValue(argv, ++index, arg);
@@ -331,6 +348,20 @@ function parseArgs(argv: readonly string[]): Args {
     else if (arg === "--sample-size") sampleSize = positiveInt(requiredValue(argv, ++index, arg), arg);
     else if (arg === "--concurrency") concurrency = positiveInt(requiredValue(argv, ++index, arg), arg);
     else if (arg === "--seed") seed = positiveInt(requiredValue(argv, ++index, arg), arg);
+    else if (arg === "--reward") {
+      const value = requiredValue(argv, ++index, arg);
+      if (!["all", "positive", "negative", "zero", "unknown"].includes(value)) {
+        throw new Error("--reward must be all, positive, negative, zero, or unknown");
+      }
+      rewardFilter = value as Args["rewardFilter"];
+    }
+    else if (arg === "--episode-ids") {
+      episodeIds = unique(requiredValue(argv, ++index, arg)
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean));
+      if (episodeIds.length === 0) throw new Error("--episode-ids requires at least one Episode ID");
+    }
     else if (arg === "--from") {
       const value = requiredValue(argv, ++index, arg);
       if (value !== "path" && value !== "raw") throw new Error("--from must be path or raw");
@@ -351,12 +382,38 @@ function parseArgs(argv: readonly string[]): Args {
     sampleSize,
     concurrency,
     seed,
-    reconstructRaw
+    reconstructRaw,
+    rewardFilter,
+    ...(episodeIds ? { episodeIds } : {})
   };
 }
 
 function helpText(): string {
-  return `Usage:\n  npm run step-sequence:kw -- --db <kw.sqlite> [--config <config.yaml>] [--from path|raw] [--sample-size 12] [--concurrency 4] [--seed 20260825] [--output-db <copy.sqlite>] [--output <report.json>]\n\nThe command always writes to a cloned database. It samples closed Episodes by short/medium/long trajectory strata and never mutates the source KW database.\n`;
+  return `Usage:\n  npm run step-sequence:kw -- --db <kw.sqlite> [--config <config.yaml>] [--from path|raw] [--reward all|positive|negative|zero|unknown] [--episode-ids <id1,id2,...>] [--sample-size 12] [--concurrency 4] [--seed 20260825] [--output-db <copy.sqlite>] [--output <report.json>]\n\nThe command always writes to a cloned database. It samples closed Episodes by reward and short/medium/long trajectory strata, or replays an explicit Episode ID list in the supplied order, and never mutates the source KW database.\n`;
+}
+
+function selectRequestedEpisodes(
+  candidates: readonly EpisodeCandidate[],
+  episodeIds: readonly string[]
+): EpisodeCandidate[] {
+  const byId = new Map(candidates.map((candidate) => [candidate.episodeId, candidate]));
+  const missing = episodeIds.filter((episodeId) => !byId.has(episodeId));
+  if (missing.length > 0) {
+    throw new Error(`Requested Episodes are unavailable under the current filters: ${missing.join(", ")}`);
+  }
+  return episodeIds.map((episodeId) => byId.get(episodeId)!);
+}
+
+function rewardMatches(
+  terminalReward: number | null,
+  filter: Args["rewardFilter"]
+): boolean {
+  if (filter === "all") return true;
+  if (filter === "unknown") return terminalReward === null;
+  if (terminalReward === null) return false;
+  if (filter === "positive") return terminalReward > 0;
+  if (filter === "negative") return terminalReward < 0;
+  return terminalReward === 0;
 }
 
 function requiredValue(argv: readonly string[], index: number, option: string): string {

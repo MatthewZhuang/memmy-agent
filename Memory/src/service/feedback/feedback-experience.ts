@@ -80,7 +80,14 @@ export interface FeedbackResponse {
   feedbackId: string;
   recallEventId?: string;
   recallOutcome?: NonNullable<RecallEventRecord["outcome"]>;
-  repair?: { repairId?: string; contextHash?: string; skipped?: boolean; reason?: string; attachedPolicyIds?: string[] };
+  repair?: {
+    repairId?: string;
+    contextHash?: string;
+    skipped?: boolean;
+    reason?: string;
+    attachedPolicyIds?: string[];
+    repairJobId?: string;
+  };
   jobs: JobRef[];
   serverTime: string;
   duplicate?: boolean;
@@ -268,6 +275,7 @@ async feedback(request: FeedbackRequest): Promise<FeedbackResponse> {
       this.applyRecallOutcome(updatedRecallEvent, feedback, feedback.createdAt);
     }
     const jobs: EvolutionJobRecord[] = [];
+    if (repair?.repairJob) jobs.push(repair.repairJob);
     if (feedback.polarity !== "negative") {
       jobs.push(...await this.maybeCreateFeedbackExperience(attributedRequest, feedback, context));
     }
@@ -334,7 +342,14 @@ async feedback(request: FeedbackRequest): Promise<FeedbackResponse> {
       feedbackId,
       recallEventId: updatedRecallEvent?.id,
       recallOutcome: updatedRecallEvent?.outcome,
-      repair,
+      repair: repair ? {
+        repairId: repair.repairId,
+        contextHash: repair.contextHash,
+        skipped: repair.skipped,
+        reason: repair.reason,
+        attachedPolicyIds: repair.attachedPolicyIds,
+        repairJobId: repair.repairJob?.id
+      } : undefined,
       jobs: jobs.map(jobToRef),
       serverTime: nowIso()
     };
@@ -427,6 +442,7 @@ maybeCreateDecisionRepair(
     skipped?: boolean;
     reason?: string;
     attachedPolicyIds?: string[];
+    repairJob?: EvolutionJobRecord;
   } | undefined {
     const classification = classifyFeedbackText(request.rationale ?? "");
     const shouldRepair = request.polarity === "negative" ||
@@ -495,6 +511,22 @@ maybeCreateDecisionRepair(
     const actuallyAttached = attachedPolicyIds.length > 0
       ? this.attachRepairToPolicies(repair.id, attachedPolicyIds, repair.preference, repair.antiPattern, feedback.createdAt)
       : [];
+    const stepPolicyIds = actuallyAttached.filter((policyId) =>
+      Boolean(this.deps.repos.stepSequenceLearning.getPolicyByMemoryId(policyId)));
+    const repairJob = stepPolicyIds.length > 0
+      ? this.deps.enqueueJob({
+          jobType: "step_policy_repair",
+          userId: feedback.userId,
+          sessionId: feedback.sessionId,
+          episodeId: feedback.episodeId,
+          targetMemoryId: stepPolicyIds[0],
+          payload: {
+            repairId: repair.id,
+            policyMemoryIds: stepPolicyIds
+          },
+          createdAt: feedback.createdAt
+        })
+      : undefined;
     this.deps.repos.runtime.appendChange({
       memoryId: repair.id,
       namespaceId,
@@ -511,7 +543,8 @@ maybeCreateDecisionRepair(
       repairId: repair.id,
       contextHash,
       skipped: false,
-      attachedPolicyIds: actuallyAttached
+      attachedPolicyIds: actuallyAttached,
+      ...(repairJob ? { repairJob } : {})
     };
   }
 
@@ -1336,6 +1369,10 @@ attachRepairToPolicies(
     for (const policyId of policyIds) {
       const memory = this.deps.repos.memories.get(policyId);
       if (!memory || memory.memoryLayer !== "L2") continue;
+      if (this.deps.repos.stepSequenceLearning.getPolicyByMemoryId(policyId)) {
+        attached.push(policyId);
+        continue;
+      }
       const previous = memory;
       const next = updatePolicyDecisionGuidance(memory, {
         preference,

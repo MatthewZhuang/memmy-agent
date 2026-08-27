@@ -39,8 +39,28 @@ import type { TurnMemoryCaptureDecision } from "./span-pipeline.js";
 import { WorldModelPipeline } from "./world-model-pipeline.js";
 import { EpisodeProceduralReconstructor } from "./episode-procedural-reconstructor.js";
 import { EpisodeProceduralPathPersistencePipeline } from "./episode-procedural-path-pipeline.js";
+import {
+  EpisodeBoundarySegmenter,
+  type EpisodeBoundarySegmentationResultV1
+} from "./episode-boundary-segmentation.js";
+import {
+  EpisodeSubproblemContractSegmenter,
+  type SubproblemContractSegmentationResultV1
+} from "./episode-subproblem-contract-segmentation.js";
 import { StepSequenceLearningPipeline } from "./step-sequence-learning.js";
 import type { StepSequenceLearningResult } from "./step-sequence-learning.js";
+import {
+  MultiScaleWindowPolicyExperiment,
+  type MultiScaleWindowCoarseMembershipMode,
+  type MultiScaleWindowPolicyDecisionV1,
+  type MultiScaleWindowPolicyExperimentResultV1,
+  type MultiScaleWindowSkillCandidateV1,
+  type MultiScaleWindowSkillDecisionV1,
+  type MultiScaleWindowSpec,
+  type PreparedMultiScaleWindowPolicyExperimentV1,
+  type TrajectoryWindowClusterV1
+} from "./multi-scale-window-policy.js";
+import type { BandedMonotonicMatchConfig } from "./trajectory-window-alignment.js";
 
 type TraceMeta = NonNullable<ReturnType<typeof traceMetaFromMemory>>;
 type PolicyMeta = NonNullable<ReturnType<typeof policyMetaFromMemory>>;
@@ -92,7 +112,10 @@ export class EvolutionJobProcessor {
   private readonly skill: SkillPipeline;
   private readonly span: SpanPipeline;
   private readonly proceduralPath: EpisodeProceduralPathPersistencePipeline;
+  private readonly episodeBoundarySegmenter: EpisodeBoundarySegmenter;
+  private readonly episodeSubproblemContractSegmenter: EpisodeSubproblemContractSegmenter;
   private readonly stepSequenceLearning: StepSequenceLearningPipeline;
+  private readonly multiScaleWindowPolicy: MultiScaleWindowPolicyExperiment;
   private readonly bigTurnSpan: BigTurnSpanPipeline;
   private readonly worldModel: WorldModelPipeline;
 
@@ -161,6 +184,14 @@ export class EvolutionJobProcessor {
       }),
       enqueueJob: deps.enqueueJob
     });
+    this.episodeBoundarySegmenter = new EpisodeBoundarySegmenter({
+      get llm() { return owner.deps.skillLlm; },
+      get enableThinking() { return owner.deps.config.evolution.enableThinking; }
+    });
+    this.episodeSubproblemContractSegmenter = new EpisodeSubproblemContractSegmenter({
+      get llm() { return owner.deps.skillLlm; },
+      get enableThinking() { return owner.deps.config.evolution.enableThinking; }
+    });
     this.stepSequenceLearning = new StepSequenceLearningPipeline({
       repos: deps.repos,
       get config() { return owner.deps.config; },
@@ -169,6 +200,11 @@ export class EvolutionJobProcessor {
       buildMemory: deps.buildMemory,
       upsertEvolutionMemory: this.upsertEvolutionMemory.bind(this),
       enqueueJob: deps.enqueueJob
+    });
+    this.multiScaleWindowPolicy = new MultiScaleWindowPolicyExperiment({
+      get config() { return owner.deps.config; },
+      get embedder() { return owner.deps.embedder; },
+      get llm() { return owner.deps.skillLlm; }
     });
     this.reward = new RewardPipeline({
       get config() { return owner.deps.config; },
@@ -238,6 +274,10 @@ export class EvolutionJobProcessor {
     await this.stepSequenceLearning.learnJob(job);
   }
 
+  async repairStepPolicy(job: EvolutionJobRecord): Promise<void> {
+    await this.stepSequenceLearning.repairPoliciesJob(job);
+  }
+
   async learnStepSequencesForReplay(input: {
     episodeId: string;
     at?: string;
@@ -245,6 +285,112 @@ export class EvolutionJobProcessor {
     const path = this.deps.repos.proceduralPaths.getActiveForEpisode(input.episodeId);
     if (!path) throw new Error(`active procedural Path not found: ${input.episodeId}`);
     return this.stepSequenceLearning.learnPath(path, input.at ?? nowIso());
+  }
+
+  async discoverMultiScaleWindowPoliciesForReplay(input: {
+    episodeIds: string[];
+    specs?: MultiScaleWindowSpec[];
+    coarseSimilarityThreshold?: number;
+    coarseSimilarityThresholdByScale?: Partial<Record<number, number>>;
+    fineMatchConfigs?: BandedMonotonicMatchConfig[];
+    medoidSwitchMargin?: number;
+    coarseMembershipMode?: MultiScaleWindowCoarseMembershipMode;
+    similarityThreshold?: number;
+    minSupportEpisodes?: number;
+    maxPolicyCandidates?: number;
+    policyConcurrency?: number;
+    inducePolicies?: boolean;
+  }): Promise<MultiScaleWindowPolicyExperimentResultV1> {
+    const episodes = input.episodeIds.map((episodeId) => {
+      const episode = this.deps.repos.runtime.getEpisode(episodeId);
+      const path = this.deps.repos.proceduralPaths.getActiveForEpisode(episodeId);
+      if (!episode || episode.status !== "closed" || !path) {
+        throw new Error(`closed Episode or active procedural Path not found: ${episodeId}`);
+      }
+      return {
+        episodeId,
+        pathId: path.id,
+        ...(episode.rTask === undefined ? {} : { terminalReward: episode.rTask }),
+        steps: path.path.steps
+      };
+    });
+    return this.multiScaleWindowPolicy.run({
+      episodes,
+      ...(input.specs ? { specs: input.specs } : {}),
+      ...(input.coarseSimilarityThreshold === undefined
+        ? {}
+        : { coarseSimilarityThreshold: input.coarseSimilarityThreshold }),
+      ...(input.coarseSimilarityThresholdByScale === undefined
+        ? {}
+        : { coarseSimilarityThresholdByScale: input.coarseSimilarityThresholdByScale }),
+      ...(input.fineMatchConfigs === undefined
+        ? {}
+        : { fineMatchConfigs: input.fineMatchConfigs }),
+      ...(input.medoidSwitchMargin === undefined
+        ? {}
+        : { medoidSwitchMargin: input.medoidSwitchMargin }),
+      ...(input.coarseMembershipMode === undefined
+        ? {}
+        : { coarseMembershipMode: input.coarseMembershipMode }),
+      ...(input.similarityThreshold === undefined
+        ? {}
+        : { similarityThreshold: input.similarityThreshold }),
+      ...(input.minSupportEpisodes === undefined
+        ? {}
+        : { minSupportEpisodes: input.minSupportEpisodes }),
+      ...(input.maxPolicyCandidates === undefined
+        ? {}
+        : { maxPolicyCandidates: input.maxPolicyCandidates }),
+      ...(input.policyConcurrency === undefined
+        ? {}
+        : { policyConcurrency: input.policyConcurrency }),
+      ...(input.inducePolicies === undefined
+        ? {}
+        : { inducePolicies: input.inducePolicies })
+    });
+  }
+
+  async prepareMultiScaleWindowPoliciesForReplay(input: {
+    episodeIds: string[];
+    specs?: MultiScaleWindowSpec[];
+  }): Promise<PreparedMultiScaleWindowPolicyExperimentV1> {
+    const episodes = input.episodeIds.map((episodeId) => {
+      const episode = this.deps.repos.runtime.getEpisode(episodeId);
+      const path = this.deps.repos.proceduralPaths.getActiveForEpisode(episodeId);
+      if (!episode || episode.status !== "closed" || !path) {
+        throw new Error(`closed Episode or active procedural Path not found: ${episodeId}`);
+      }
+      return {
+        episodeId,
+        pathId: path.id,
+        ...(episode.rTask === undefined ? {} : { terminalReward: episode.rTask }),
+        steps: path.path.steps
+      };
+    });
+    return this.multiScaleWindowPolicy.prepare({
+      episodes,
+      ...(input.specs ? { specs: input.specs } : {})
+    });
+  }
+
+  async induceMultiScaleWindowPoliciesForReplay(input: {
+    clusters: TrajectoryWindowClusterV1[];
+    concurrency?: number;
+  }): Promise<MultiScaleWindowPolicyDecisionV1[]> {
+    return this.multiScaleWindowPolicy.inducePolicies(
+      input.clusters,
+      input.concurrency ?? 4
+    );
+  }
+
+  async induceMultiScaleWindowSkillsForReplay(input: {
+    candidates: MultiScaleWindowSkillCandidateV1[];
+    concurrency?: number;
+  }): Promise<MultiScaleWindowSkillDecisionV1[]> {
+    return this.multiScaleWindowPolicy.induceSkills(
+      input.candidates,
+      input.concurrency ?? 4
+    );
   }
 
   async reconstructProceduralPathForReplay(input: {
@@ -256,6 +402,22 @@ export class EvolutionJobProcessor {
       activate: true,
       ...(input.at ? { createdAt: input.at } : {})
     });
+  }
+
+  async segmentEpisodeBoundariesForReplay(input: {
+    episodeId: string;
+  }): Promise<EpisodeBoundarySegmentationResultV1> {
+    const path = this.deps.repos.proceduralPaths.getActiveForEpisode(input.episodeId);
+    if (!path) throw new Error(`active procedural Path not found: ${input.episodeId}`);
+    return this.episodeBoundarySegmenter.segment(path.path);
+  }
+
+  async segmentEpisodeSubproblemContractsForReplay(input: {
+    episodeId: string;
+  }): Promise<SubproblemContractSegmentationResultV1> {
+    const path = this.deps.repos.proceduralPaths.getActiveForEpisode(input.episodeId);
+    if (!path) throw new Error(`active procedural Path not found: ${input.episodeId}`);
+    return this.episodeSubproblemContractSegmenter.segment(path.path);
   }
 
   materializeNegativeExperience(job: EvolutionJobRecord): void {

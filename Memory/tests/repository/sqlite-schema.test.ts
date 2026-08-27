@@ -134,7 +134,10 @@ describe("repository sqlite schema contract", () => {
       const stepOccurrenceColumns = db.db.prepare(
         `PRAGMA table_info(step_sequence_pattern_occurrences)`
       ).all() as Array<{ name: string }>;
-      expect(stepOccurrenceColumns.map((column) => column.name)).toContain("is_selected");
+      expect(stepOccurrenceColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
+        "is_selected",
+        "evidence_role"
+      ]));
       const skillPatternColumns = db.db.prepare(
         `PRAGMA table_info(step_policy_skill_patterns)`
       ).all() as Array<{ name: string }>;
@@ -146,7 +149,10 @@ describe("repository sqlite schema contract", () => {
       const skillOccurrenceColumns = db.db.prepare(
         `PRAGMA table_info(step_policy_skill_pattern_occurrences)`
       ).all() as Array<{ name: string }>;
-      expect(skillOccurrenceColumns.map((column) => column.name)).toContain("is_selected");
+      expect(skillOccurrenceColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
+        "is_selected",
+        "evidence_role"
+      ]));
       expect(db.db.prepare(`SELECT vec_version() AS version`).get()).toEqual({ version: "v0.1.9" });
       const memoryColumns = db.db.prepare(`PRAGMA table_info(memories)`).all() as Array<{ name: string }>;
       expect(memoryColumns.map((column) => column.name)).not.toEqual(expect.arrayContaining([
@@ -623,6 +629,93 @@ describe("repository sqlite schema contract", () => {
          WHERE type = 'table' AND name = 'policy_sequence_pattern_edges'`
       ).get()).toEqual({ name: "policy_sequence_pattern_edges" });
       expect(existsSync(`${dbPath}.pre-v${SCHEMA_VERSION}.bak`)).toBe(true);
+      migrated.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates schema v16 occurrence rewards into explicit evidence roles", () => {
+    const root = mkdtempSync(join(tmpdir(), "mindock-repo-v16-evidence-role-migration-"));
+    const dbPath = join(root, "memory.sqlite");
+    try {
+      const seeded = new MemoryDb({ path: dbPath });
+      seeded.close();
+      const v16 = new Database(dbPath);
+      v16.pragma("foreign_keys = OFF");
+      v16.exec(`
+        ALTER TABLE step_sequence_pattern_occurrences DROP COLUMN evidence_role;
+        ALTER TABLE step_policy_skill_pattern_occurrences DROP COLUMN evidence_role;
+        INSERT INTO step_sequence_patterns (
+          id, namespace_id, schema_version, algorithm_version, sequence_hash,
+          cluster_ids_json, sequence_length, lifecycle_status, occurrence_count,
+          distinct_episode_count, selected_occurrence_count, selected_episode_count,
+          is_maximal, membership_version, created_at, updated_at
+        ) VALUES (
+          'step-pattern-v16', 'user-v16', 'v1', 'v1', 'step-sequence-v16',
+          '["a","b"]', 2, 'observed', 3, 3, 0, 0, 1, 'membership-v16',
+          '2026-08-25T00:00:00.000Z', '2026-08-25T00:00:00.000Z'
+        );
+        INSERT INTO step_sequence_pattern_occurrences (
+          id, pattern_id, path_id, episode_id, session_id, start_step_index,
+          end_step_index, step_occurrence_ids_json, cluster_ids_json,
+          terminal_reward, created_at
+        ) VALUES
+          ('step-positive-v16', 'step-pattern-v16', 'path-positive', 'episode-positive',
+           'session-positive', 0, 1, '[]', '["a","b"]', 1,
+           '2026-08-25T00:00:00.000Z'),
+          ('step-negative-v16', 'step-pattern-v16', 'path-negative', 'episode-negative',
+           'session-negative', 0, 1, '[]', '["a","b"]', -1,
+           '2026-08-25T00:00:00.000Z'),
+          ('step-unknown-v16', 'step-pattern-v16', 'path-unknown', 'episode-unknown',
+           'session-unknown', 0, 1, '[]', '["a","b"]', NULL,
+           '2026-08-25T00:00:00.000Z');
+        INSERT INTO step_policy_skill_patterns (
+          id, namespace_id, schema_version, algorithm_version, sequence_hash,
+          policy_keys_json, lifecycle_status, occurrence_count, distinct_episode_count,
+          selected_occurrence_count, selected_episode_count, is_maximal,
+          membership_version, created_at, updated_at
+        ) VALUES (
+          'skill-pattern-v16', 'user-v16', 'v1', 'v1', 'skill-sequence-v16',
+          '["p1","p2"]', 'observed', 3, 3, 0, 0, 1, 'membership-v16',
+          '2026-08-25T00:00:00.000Z', '2026-08-25T00:00:00.000Z'
+        );
+        INSERT INTO step_policy_skill_pattern_occurrences (
+          id, pattern_id, projection_id, episode_id, path_id, session_id,
+          start_node_index, end_node_index, policy_keys_json,
+          policy_version_ids_json, step_occurrence_ids_json, terminal_reward, created_at
+        ) VALUES
+          ('skill-positive-v16', 'skill-pattern-v16', 'projection-positive',
+           'episode-positive', 'path-positive', 'session-positive', 0, 1,
+           '["p1","p2"]', '[]', '[]', 1, '2026-08-25T00:00:00.000Z'),
+          ('skill-negative-v16', 'skill-pattern-v16', 'projection-negative',
+           'episode-negative', 'path-negative', 'session-negative', 0, 1,
+           '["p1","p2"]', '[]', '[]', -1, '2026-08-25T00:00:00.000Z'),
+          ('skill-unknown-v16', 'skill-pattern-v16', 'projection-unknown',
+           'episode-unknown', 'path-unknown', 'session-unknown', 0, 1,
+           '["p1","p2"]', '[]', '[]', NULL, '2026-08-25T00:00:00.000Z');
+        DELETE FROM schema_migrations;
+        INSERT INTO schema_migrations (id, version, applied_at, checksum)
+        VALUES ('016_sequence_occurrence_governance', 16,
+          '2026-08-25T00:00:00.000Z', 'v16');
+      `);
+      v16.close();
+
+      const migrated = new MemoryDb({ path: dbPath });
+      expect(migrated.db.prepare(
+        `SELECT id, evidence_role FROM step_sequence_pattern_occurrences ORDER BY id`
+      ).all()).toEqual([
+        { id: "step-negative-v16", evidence_role: "counterexample" },
+        { id: "step-positive-v16", evidence_role: "support" },
+        { id: "step-unknown-v16", evidence_role: "unknown" }
+      ]);
+      expect(migrated.db.prepare(
+        `SELECT id, evidence_role FROM step_policy_skill_pattern_occurrences ORDER BY id`
+      ).all()).toEqual([
+        { id: "skill-negative-v16", evidence_role: "counterexample" },
+        { id: "skill-positive-v16", evidence_role: "support" },
+        { id: "skill-unknown-v16", evidence_role: "unknown" }
+      ]);
       migrated.close();
     } finally {
       rmSync(root, { recursive: true, force: true });

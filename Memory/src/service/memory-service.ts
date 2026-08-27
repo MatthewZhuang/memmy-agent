@@ -284,7 +284,8 @@ export class MemoryService {
           associateL2: (job) => this.evolutionJobs.associateL2(job),
           splitBigTurn: (job) => this.evolutionJobs.splitBigTurn(job),
           reconstructProceduralPath: (job) => this.evolutionJobs.reconstructProceduralPath(job),
-          learnStepSequences: (job) => this.evolutionJobs.learnStepSequences(job)
+          learnStepSequences: (job) => this.evolutionJobs.learnStepSequences(job),
+          repairStepPolicy: (job) => this.evolutionJobs.repairStepPolicy(job)
         },
         feedback: {
           applyReward: (job) => this.evolutionJobs.applyReward(job),
@@ -1834,12 +1835,84 @@ export class MemoryService {
     );
   }
 
+  segmentEpisodeBoundariesForReplay(input: {
+    episodeId: string;
+  }) {
+    return this.withModelTaskContext(() =>
+      this.evolutionJobs.segmentEpisodeBoundariesForReplay(input)
+    );
+  }
+
+  segmentEpisodeSubproblemContractsForReplay(input: {
+    episodeId: string;
+  }) {
+    return this.withModelTaskContext(() =>
+      this.evolutionJobs.segmentEpisodeSubproblemContractsForReplay(input)
+    );
+  }
+
   learnStepSequencesForReplay(input: {
     episodeId: string;
     at?: string;
   }) {
     return this.withModelTaskContext(() =>
       this.evolutionJobs.learnStepSequencesForReplay(input)
+    );
+  }
+
+  discoverMultiScaleWindowPoliciesForReplay(input: {
+    episodeIds: string[];
+    specs?: Array<{ length: number; stride: number }>;
+    coarseSimilarityThreshold?: number;
+    coarseSimilarityThresholdByScale?: Partial<Record<number, number>>;
+    fineMatchConfigs?: Array<{
+      scale: number;
+      bandWidth: number;
+      minStepSimilarity: number;
+      minMatchedSteps: number;
+      minCoverage: number;
+      minAverageMatchSimilarity: number;
+      maxInternalGap: number;
+      gapPenalty: number;
+      minAlignmentScore: number;
+    }>;
+    medoidSwitchMargin?: number;
+    coarseMembershipMode?: "exclusive" | "multi";
+    similarityThreshold?: number;
+    minSupportEpisodes?: number;
+    maxPolicyCandidates?: number;
+    policyConcurrency?: number;
+    inducePolicies?: boolean;
+  }) {
+    return this.withModelTaskContext(() =>
+      this.evolutionJobs.discoverMultiScaleWindowPoliciesForReplay(input)
+    );
+  }
+
+  prepareMultiScaleWindowPoliciesForReplay(input: {
+    episodeIds: string[];
+    specs?: Array<{ length: number; stride: number }>;
+  }) {
+    return this.withModelTaskContext(() =>
+      this.evolutionJobs.prepareMultiScaleWindowPoliciesForReplay(input)
+    );
+  }
+
+  induceMultiScaleWindowPoliciesForReplay(input: {
+    clusters: import("./evolution/multi-scale-window-policy.js").TrajectoryWindowClusterV1[];
+    concurrency?: number;
+  }) {
+    return this.withModelTaskContext(() =>
+      this.evolutionJobs.induceMultiScaleWindowPoliciesForReplay(input)
+    );
+  }
+
+  induceMultiScaleWindowSkillsForReplay(input: {
+    candidates: import("./evolution/multi-scale-window-policy.js").MultiScaleWindowSkillCandidateV1[];
+    concurrency?: number;
+  }) {
+    return this.withModelTaskContext(() =>
+      this.evolutionJobs.induceMultiScaleWindowSkillsForReplay(input)
     );
   }
 

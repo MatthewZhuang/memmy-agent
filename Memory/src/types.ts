@@ -49,6 +49,7 @@ export type JobType =
   | "reward"
   | "procedural_path"
   | "step_sequence_learning"
+  | "step_policy_repair"
   | "span_credit"
   | "procedural_span_cluster"
   | "episode_policy_projection"

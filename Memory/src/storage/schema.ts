@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 16;
-export const SCHEMA_MIGRATION_ID = "016_sequence_occurrence_governance";
+export const SCHEMA_VERSION = 17;
+export const SCHEMA_MIGRATION_ID = "017_step_evidence_roles";
 const API_LOG_SOURCE_AGENT_MIGRATION_FROM_VERSION = 2;
 const MEMORY_PROCESSING_STATE_MIGRATION_VERSION = 4;
 const PROCESSING_TAGS = new Set([
@@ -471,6 +471,8 @@ const statements = [
     cluster_ids_json TEXT NOT NULL CHECK (json_valid(cluster_ids_json)),
     is_selected INTEGER NOT NULL DEFAULT 0 CHECK (is_selected IN (0, 1)),
     terminal_reward REAL,
+    evidence_role TEXT NOT NULL DEFAULT 'unknown'
+      CHECK (evidence_role IN ('support', 'counterexample', 'unknown')),
     created_at TEXT NOT NULL,
     UNIQUE (pattern_id, path_id, start_step_index, end_step_index)
   )`,
@@ -565,6 +567,8 @@ const statements = [
     step_occurrence_ids_json TEXT NOT NULL CHECK (json_valid(step_occurrence_ids_json)),
     is_selected INTEGER NOT NULL DEFAULT 0 CHECK (is_selected IN (0, 1)),
     terminal_reward REAL,
+    evidence_role TEXT NOT NULL DEFAULT 'unknown'
+      CHECK (evidence_role IN ('support', 'counterexample', 'unknown')),
     created_at TEXT NOT NULL,
     UNIQUE (pattern_id, projection_id, start_node_index, end_node_index)
   )`,
@@ -1192,7 +1196,7 @@ export function migrate(db: Database.Database): void {
   const hasMemories = tableExists(db, "memories");
   const version = currentSchemaVersion(db);
 
-  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11 && version !== 12 && version !== 13 && version !== 14 && version !== 15) {
+  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11 && version !== 12 && version !== 13 && version !== 14 && version !== 15 && version !== 16) {
     throw new Error(
       `Unsupported memory database schema version ${version}; the database was left unchanged`
     );
@@ -1231,10 +1235,15 @@ export function migrate(db: Database.Database): void {
       addColumnIfMissing(db, "step_sequence_patterns", "selected_episode_count", "INTEGER NOT NULL DEFAULT 0 CHECK (selected_episode_count >= 0)");
       addColumnIfMissing(db, "step_sequence_patterns", "superseded_by_pattern_id", "TEXT");
       addColumnIfMissing(db, "step_sequence_pattern_occurrences", "is_selected", "INTEGER NOT NULL DEFAULT 0 CHECK (is_selected IN (0, 1))");
+      addColumnIfMissing(db, "step_sequence_pattern_occurrences", "evidence_role", "TEXT NOT NULL DEFAULT 'unknown' CHECK (evidence_role IN ('support', 'counterexample', 'unknown'))");
       addColumnIfMissing(db, "step_policy_skill_patterns", "selected_occurrence_count", "INTEGER NOT NULL DEFAULT 0 CHECK (selected_occurrence_count >= 0)");
       addColumnIfMissing(db, "step_policy_skill_patterns", "selected_episode_count", "INTEGER NOT NULL DEFAULT 0 CHECK (selected_episode_count >= 0)");
       addColumnIfMissing(db, "step_policy_skill_patterns", "superseded_by_pattern_id", "TEXT");
       addColumnIfMissing(db, "step_policy_skill_pattern_occurrences", "is_selected", "INTEGER NOT NULL DEFAULT 0 CHECK (is_selected IN (0, 1))");
+      addColumnIfMissing(db, "step_policy_skill_pattern_occurrences", "evidence_role", "TEXT NOT NULL DEFAULT 'unknown' CHECK (evidence_role IN ('support', 'counterexample', 'unknown'))");
+      if (version < 17) {
+        backfillStepEvidenceRoles(db);
+      }
       db.prepare(
         `CREATE UNIQUE INDEX IF NOT EXISTS uq_evolution_jobs_active_dedupe
          ON evolution_jobs (dedupe_key)
@@ -1257,6 +1266,22 @@ export function migrate(db: Database.Database): void {
     })();
   } finally {
     db.pragma(`foreign_keys = ${foreignKeys ? "ON" : "OFF"}`);
+  }
+}
+
+function backfillStepEvidenceRoles(db: Database.Database): void {
+  for (const table of [
+    "step_sequence_pattern_occurrences",
+    "step_policy_skill_pattern_occurrences"
+  ]) {
+    db.prepare(
+      `UPDATE ${table}
+       SET evidence_role = CASE
+         WHEN terminal_reward >= 0.5 THEN 'support'
+         WHEN terminal_reward <= -0.15 THEN 'counterexample'
+         ELSE 'unknown'
+       END`
+    ).run();
   }
 }
 

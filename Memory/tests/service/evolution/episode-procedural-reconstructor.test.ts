@@ -17,6 +17,11 @@ describe("EpisodeProceduralReconstructor / Step-only production path", () => {
   it("keeps the Step LLM contract minimal", () => {
     expect(EXECUTION_STEP_SEMANTICS_PROMPT).toContain("intent");
     expect(EXECUTION_STEP_SEMANTICS_PROMPT).toContain("summary");
+    expect(EXECUTION_STEP_SEMANTICS_PROMPT).toContain("reusable atomic operation");
+    expect(EXECUTION_STEP_SEMANTICS_PROMPT).toContain("incidental instance details");
+    expect(EXECUTION_STEP_SEMANTICS_PROMPT).toContain("inspect vs create vs edit vs execute vs verify");
+    expect(EXECUTION_STEP_SEMANTICS_PROMPT).toContain("success vs failure");
+    expect(EXECUTION_STEP_SEMANTICS_PROMPT).toContain("remain four different operations");
     expect(EXECUTION_STEP_SEMANTICS_PROMPT).not.toContain('"observations"');
     expect(EXECUTION_STEP_SEMANTICS_PROMPT).not.toContain('"operations"');
     expect(TASK_CONTRACT_PROMPT).toContain("acceptance_criteria");
@@ -46,7 +51,7 @@ describe("EpisodeProceduralReconstructor / Step-only production path", () => {
     expect(path.spans[0]!.segmentation.reason).toContain("compatibility envelope");
     expect(operations).toEqual([
       "procedural.task_contract.v1",
-      "procedural.step_semantics.v2.window"
+      "procedural.step_semantics.v3.window"
     ]);
     expect(operations.some((operation) => operation.includes("span_"))).toBe(false);
     expect(payloads).toHaveLength(2);
@@ -126,7 +131,7 @@ function stepOnlyLlm(
           }))
         } as unknown as T;
       }
-      if (options.operation.startsWith("procedural.step_semantics.v2")) {
+      if (options.operation.startsWith("procedural.step_semantics.v3")) {
         const candidates = payload.stepCandidates as Array<{
           candidateId: string;
           kind: "tool_action" | "response_generation";

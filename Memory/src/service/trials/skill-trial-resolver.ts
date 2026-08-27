@@ -193,6 +193,39 @@ updateSkillTrialStats(trial: SkillTrialRecord, at: string): void {
       source: "worker.skill_trial_resolve",
       createdAt: at
     });
+    if (status === "active" && currentSkill?.repairOrigin) {
+      const sequenceMeta = isRecord(saved.properties.internal_info.step_policy_sequence_skill)
+        ? saved.properties.internal_info.step_policy_sequence_skill
+        : {};
+      const patternId = textField(sequenceMeta.pattern_id);
+      const supersedesSkillMemoryId = textField(sequenceMeta.supersedes_skill_memory_id) ??
+        textField(saved.properties.internal_info.supersedes_skill_memory_id);
+      if (patternId && supersedesSkillMemoryId && supersedesSkillMemoryId !== saved.id) {
+        const previousSkill = this.deps.repos.memories.get(supersedesSkillMemoryId);
+        this.deps.repos.stepSequenceLearning.activateRepairedSkill({
+          patternId,
+          previousSkillMemoryId: supersedesSkillMemoryId,
+          repairedSkillMemoryId: saved.id,
+          at
+        });
+        const archived = this.deps.repos.memories.get(supersedesSkillMemoryId);
+        if (previousSkill && archived?.status === "archived") {
+          this.deps.repos.runtime.appendChange({
+            memoryId: archived.id,
+            namespaceId: namespaceIdFromMemory(archived),
+            kind: "skill",
+            op: "updated",
+            entityId: archived.id,
+            userId: archived.userId,
+            changeType: "skill_repair_superseded",
+            before: previousSkill,
+            after: archived,
+            source: "worker.skill_trial_resolve",
+            createdAt: at
+          });
+        }
+      }
+    }
     recordApiLog(this.deps.repos.runtime,
       "skill_evolve",
       { phase: "done", skillId: saved.id, trialId: trial.id, reason: "skill_trial_update" },
@@ -417,6 +450,10 @@ function updateSkillStats(memory: MemoryRow, input: {
 
 function memoryStatusForSkillStatus(status: "candidate" | "active" | "archived"): "activated" | "resolving" | "archived" {
   return memoryStatusForLifecycleStatus(status);
+}
+
+function textField(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function memoryStatusForLifecycleStatus(status: "candidate" | "active" | "archived"): "activated" | "resolving" | "archived" {

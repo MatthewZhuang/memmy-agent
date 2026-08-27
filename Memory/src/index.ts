@@ -67,6 +67,40 @@ export {
   buildTurnStepCandidates
 } from "./service/evolution/episode-procedural-reconstructor.js";
 export {
+  EPISODE_BOUNDARY_OPERATION,
+  EPISODE_BOUNDARY_MAX_TOKENS,
+  EPISODE_BOUNDARY_PROMPT,
+  EPISODE_BOUNDARY_SEGMENTATION_VERSION,
+  EPISODE_BOUNDARY_WINDOW_OVERLAP,
+  EPISODE_BOUNDARY_WINDOW_SIZE,
+  EpisodeBoundarySegmenter,
+  buildEpisodeBoundaryWindows,
+  compileEpisodeSegments,
+  compileEpisodeTaskContract
+} from "./service/evolution/episode-boundary-segmentation.js";
+export {
+  SUBPROBLEM_CONTRACT_MAX_TOKENS,
+  SUBPROBLEM_CONTRACT_OPERATION,
+  SUBPROBLEM_CONTRACT_PROMPT,
+  SUBPROBLEM_CONTRACT_SEGMENTATION_VERSION,
+  SUBPROBLEM_CONTRACT_WINDOW_OVERLAP,
+  SUBPROBLEM_CONTRACT_WINDOW_SIZE,
+  EpisodeSubproblemContractSegmenter
+} from "./service/evolution/episode-subproblem-contract-segmentation.js";
+export type {
+  SubproblemContractSegmentationResultV1,
+  SubproblemContractSegmentV1,
+  SubproblemContractV1,
+  SubproblemContractWindowV1
+} from "./service/evolution/episode-subproblem-contract-segmentation.js";
+export type {
+  EpisodeBoundaryDecisionV1,
+  EpisodeBoundarySegmentationResultV1,
+  EpisodeBoundaryWindowV1,
+  EpisodeSegmentV1,
+  EpisodeTaskContractV1
+} from "./service/evolution/episode-boundary-segmentation.js";
+export {
   EpisodeProceduralPathPersistencePipeline
 } from "./service/evolution/episode-procedural-path-pipeline.js";
 export type {
@@ -107,12 +141,64 @@ export {
   STEP_SEQUENCE_LEARNING_OPERATION,
   STEP_SEQUENCE_POLICY_OPERATION,
   STEP_SEQUENCE_POLICY_PROMPT,
+  STEP_SEQUENCE_POLICY_REPAIR_OPERATION,
   StepSequenceLearningPipeline
 } from "./service/evolution/step-sequence-learning.js";
 export type {
   StepSequenceLearningDeps,
-  StepSequenceLearningResult
+  StepSequenceLearningResult,
+  StepSequencePolicyRepairResult
 } from "./service/evolution/step-sequence-learning.js";
+export {
+  DEFAULT_MULTI_SCALE_WINDOW_COARSE_SIMILARITY_THRESHOLD,
+  DEFAULT_MULTI_SCALE_WINDOW_FINE_MATCH_CONFIGS,
+  DEFAULT_MULTI_SCALE_WINDOW_MEDOID_SWITCH_MARGIN,
+  DEFAULT_MULTI_SCALE_WINDOW_MIN_SUPPORT,
+  DEFAULT_MULTI_SCALE_WINDOW_SIMILARITY_THRESHOLD,
+  DEFAULT_MULTI_SCALE_WINDOW_SPECS,
+  MULTI_SCALE_WINDOW_POLICY_OPERATION,
+  MULTI_SCALE_WINDOW_POLICY_PROMPT,
+  MULTI_SCALE_WINDOW_POLICY_PROMPT_VERSION,
+  MULTI_SCALE_WINDOW_POLICY_VERSION,
+  MULTI_SCALE_WINDOW_SKILL_OPERATION,
+  MULTI_SCALE_WINDOW_SKILL_PROMPT,
+  MULTI_SCALE_WINDOW_SKILL_PROMPT_VERSION,
+  MULTI_SCALE_WINDOW_MULTI_MEMBERSHIP_CLUSTERING_METHOD,
+  MultiScaleWindowPolicyExperiment,
+  buildTrajectoryWindows,
+  clusterTrajectoryWindows,
+  selectMaximalWindowClusters
+} from "./service/evolution/multi-scale-window-policy.js";
+export type {
+  EmbeddedTrajectoryWindowV1,
+  MultiScaleWindowEpisodeInput,
+  MultiScaleWindowCoarseMembershipMode,
+  MultiScaleWindowFineMembershipMode,
+  MultiScaleWindowPolicyDecisionV1,
+  MultiScaleWindowPolicyExperimentDeps,
+  MultiScaleWindowPolicyExperimentResultV1,
+  MultiScaleWindowPolicyV1,
+  MultiScaleWindowSkillCandidateV1,
+  MultiScaleWindowSkillDecisionV1,
+  MultiScaleWindowSkillSequenceSpanV1,
+  MultiScaleWindowSkillV1,
+  MultiScaleWindowSpec,
+  PreparedMultiScaleWindowPolicyExperimentV1,
+  TrajectoryWindowClusteringResultV1,
+  TrajectoryWindowClusterMemberV1,
+  TrajectoryWindowClusterV1,
+  TrajectoryWindowFamilyV1,
+  TrajectoryWindowOccurrenceV1
+} from "./service/evolution/multi-scale-window-policy.js";
+export {
+  bandedMonotonicMatch,
+  selfBandedMonotonicMatch
+} from "./service/evolution/trajectory-window-alignment.js";
+export type {
+  BandedMonotonicMatchConfig,
+  BandedMonotonicMatchPairV1,
+  BandedMonotonicMatchResultV1
+} from "./service/evolution/trajectory-window-alignment.js";
 export {
   EPISODE_PROCEDURAL_PATH_SCHEMA_VERSION,
   EXECUTION_STEP_SCHEMA_VERSION,

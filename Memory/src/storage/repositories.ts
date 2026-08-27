@@ -5438,6 +5438,7 @@ function evolutionJobPrioritySql(): string {
              WHEN job_type = 'procedural_path' THEN 32
              WHEN job_type = 'span_credit' THEN 34
              WHEN job_type = 'step_sequence_learning' THEN 35
+             WHEN job_type = 'step_policy_repair' THEN 37
              WHEN job_type = 'span_big_turn' THEN 35
              WHEN job_type = 'procedural_span_cluster' THEN 36
              WHEN job_type = 'l2_association' THEN 40

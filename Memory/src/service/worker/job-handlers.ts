@@ -65,6 +65,7 @@ export interface WorkerJobProcessors {
     splitBigTurn(job: EvolutionJobRecord): MaybePromise<void>;
     reconstructProceduralPath(job: EvolutionJobRecord): MaybePromise<void>;
     learnStepSequences(job: EvolutionJobRecord): MaybePromise<void>;
+    repairStepPolicy(job: EvolutionJobRecord): MaybePromise<void>;
   };
   feedback: {
     applyReward(job: EvolutionJobRecord): MaybePromise<void>;
@@ -246,6 +247,9 @@ export async function processJob(
       return;
     case "step_sequence_learning":
       await deps.processors.evolution.learnStepSequences(job);
+      return;
+    case "step_policy_repair":
+      await deps.processors.evolution.repairStepPolicy(job);
       return;
     case "span_credit":
     case "procedural_span_cluster":
@@ -565,6 +569,10 @@ export function evolutionJobDedupeKey(input: Pick<EnqueueJobInput, "jobType" | "
     case "step_sequence_learning":
       return input.episodeId && payloadString("pathHash")
         ? `step_sequence_learning:${input.episodeId}:${payloadString("pathHash")}`
+        : undefined;
+    case "step_policy_repair":
+      return payloadString("repairId")
+        ? `step_policy_repair:${payloadString("repairId")}`
         : undefined;
     case "span_credit":
       return input.episodeId && payloadString("pathHash") && payloadString("rewardHash")

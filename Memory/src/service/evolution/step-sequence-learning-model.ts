@@ -2,13 +2,16 @@ import { stableHash } from "../../utils/id.js";
 import type { ExecutionStepOutcome, ExecutionStepV1 } from "./procedural-path-model.js";
 
 export const STEP_OCCURRENCE_SCHEMA_VERSION = "procedural-step-occurrence.v1" as const;
-export const STEP_EMBEDDING_VERSION = "procedural-step-intent-summary.v1" as const;
-export const STEP_CLUSTER_ALGORITHM_VERSION = "procedural-step-center-cluster.v1" as const;
+export const STEP_EMBEDDING_VERSION = "procedural-step-intent.v1" as const;
+export const STEP_CLUSTER_ALGORITHM_VERSION = "procedural-step-center-cluster.v3" as const;
 export const STEP_SEQUENCE_PATTERN_SCHEMA_VERSION = "step-sequence-pattern.v1" as const;
 export const STEP_SEQUENCE_MINING_ALGORITHM_VERSION = "step-sequence-exact-contiguous.v1" as const;
 export const STEP_SEQUENCE_POLICY_SCHEMA_VERSION = "step-sequence-policy.v1" as const;
 export const STEP_SEQUENCE_POLICY_INDUCTION_VERSION = "step-sequence-policy-induction.v1" as const;
 export const STEP_SEQUENCE_POLICY_PROMPT_VERSION = "step-sequence-policy-prompt.v1" as const;
+export const STEP_SEQUENCE_POLICY_REPAIR_VERSION = "step-sequence-policy-repair.v1" as const;
+export const STEP_SEQUENCE_POLICY_REPAIR_PROMPT_VERSION =
+  "step-sequence-policy-repair-prompt.v1" as const;
 export const EPISODE_STEP_POLICY_PROJECTION_SCHEMA_VERSION =
   "episode-step-policy-projection.v1" as const;
 export const EPISODE_STEP_POLICY_PROJECTION_ALGORITHM_VERSION =
@@ -27,6 +30,24 @@ export const STEP_SEQUENCE_SUPPORT_THRESHOLD = 2;
 export const STEP_POLICY_SKILL_MIN_LENGTH = 2;
 export const STEP_POLICY_SKILL_MAX_LENGTH = 6;
 export const STEP_POLICY_SKILL_SUPPORT_THRESHOLD = 2;
+
+export type StepEvidenceRole = "support" | "counterexample" | "unknown";
+
+export function stepEvidenceRoleFromReward(
+  terminalReward: number | undefined,
+  input: {
+    successThreshold: number;
+    failureThreshold: number;
+  }
+): StepEvidenceRole {
+  if (input.successThreshold <= input.failureThreshold) {
+    throw new Error("Step evidence success threshold must be greater than failure threshold");
+  }
+  if (terminalReward === undefined || !Number.isFinite(terminalReward)) return "unknown";
+  if (terminalReward >= input.successThreshold) return "support";
+  if (terminalReward <= input.failureThreshold) return "counterexample";
+  return "unknown";
+}
 
 export interface ProceduralStepOccurrenceV1 {
   id: string;
@@ -56,7 +77,7 @@ export interface ProceduralStepOccurrenceV1 {
 export interface StepSequencePolicyV1 {
   id: string;
   schemaVersion: typeof STEP_SEQUENCE_POLICY_SCHEMA_VERSION;
-  inductionVersion: typeof STEP_SEQUENCE_POLICY_INDUCTION_VERSION;
+  inductionVersion: string;
   policyKey: string;
   namespaceId: string;
   patternId: string;
@@ -79,9 +100,13 @@ export interface StepSequencePolicyV1 {
   supportEpisodeIds: string[];
   confidence: number;
   provenance: {
-    promptVersion: typeof STEP_SEQUENCE_POLICY_PROMPT_VERSION;
+    promptVersion: string;
     evidenceHash: string;
     model?: string;
+  };
+  revision?: {
+    basePolicyVersionId: string;
+    repairIds: string[];
   };
   contentHash: string;
 }
@@ -139,7 +164,7 @@ export interface StepPolicySequenceSkillDraftV1 {
 }
 
 export function stepSemanticText(step: ExecutionStepV1): string {
-  return `Intent: ${step.action.intent.trim()}\nResult: ${step.action.summary.trim()}`;
+  return `Intent: ${step.action.intent.trim()}`;
 }
 
 export function buildStepOccurrence(input: {
@@ -261,6 +286,60 @@ export function buildStepSequencePolicy(input: {
       promptVersion: STEP_SEQUENCE_POLICY_PROMPT_VERSION,
       evidenceHash,
       ...(input.model ? { model: input.model } : {})
+    },
+    contentHash
+  };
+}
+
+export function buildRepairedStepSequencePolicy(input: {
+  base: StepSequencePolicyV1;
+  draft: Omit<StepSequencePolicyV1,
+    "id" | "schemaVersion" | "inductionVersion" | "policyKey" | "namespaceId" |
+    "patternId" | "patternMembershipVersion" | "clusterIds" | "provenance" |
+    "revision" | "contentHash">;
+  repairId: string;
+  model?: string;
+}): StepSequencePolicyV1 {
+  const repairIds = [...new Set([
+    ...(input.base.revision?.repairIds ?? []),
+    input.repairId
+  ])];
+  const evidenceHash = stableHash({
+    basePolicyVersionId: input.base.id,
+    repairIds,
+    evidenceOccurrenceIds: [...input.draft.evidenceOccurrenceIds].sort()
+  });
+  const contentHash = stableHash({
+    ...input.draft,
+    clusterIds: input.base.clusterIds,
+    evidenceHash,
+    repairIds
+  });
+  const inductionVersion = `${STEP_SEQUENCE_POLICY_REPAIR_VERSION}:${stableHash(repairIds).slice(0, 24)}`;
+  const id = `step_sequence_policy_${stableHash({
+    patternId: input.base.patternId,
+    membershipVersion: input.base.patternMembershipVersion,
+    inductionVersion,
+    contentHash
+  }).slice(0, 24)}`;
+  return {
+    id,
+    schemaVersion: STEP_SEQUENCE_POLICY_SCHEMA_VERSION,
+    inductionVersion,
+    policyKey: input.base.policyKey,
+    namespaceId: input.base.namespaceId,
+    patternId: input.base.patternId,
+    patternMembershipVersion: input.base.patternMembershipVersion,
+    clusterIds: [...input.base.clusterIds],
+    ...input.draft,
+    provenance: {
+      promptVersion: STEP_SEQUENCE_POLICY_REPAIR_PROMPT_VERSION,
+      evidenceHash,
+      ...(input.model ? { model: input.model } : {})
+    },
+    revision: {
+      basePolicyVersionId: input.base.id,
+      repairIds
     },
     contentHash
   };

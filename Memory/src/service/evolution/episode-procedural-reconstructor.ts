@@ -22,10 +22,10 @@ import {
 } from "./procedural-path-model.js";
 import { buildSpanTrajectory, type SpanTrajectoryAction } from "./span-trajectory.js";
 
-export const EPISODE_PROCEDURAL_RECONSTRUCTION_VERSION = "episode-procedural-reconstruction.v7" as const;
+export const EPISODE_PROCEDURAL_RECONSTRUCTION_VERSION = "episode-procedural-reconstruction.v8" as const;
 
 const TASK_CONTRACT_OPERATION = "procedural.task_contract.v1";
-const STEP_SEMANTICS_OPERATION = "procedural.step_semantics.v2";
+const STEP_SEMANTICS_OPERATION = "procedural.step_semantics.v3";
 const MAX_SEMANTIC_REPAIR_ATTEMPTS = 2;
 const STEP_WINDOW_MAX_CANDIDATES = 30;
 const STEP_WINDOW_INPUT_CHAR_BUDGET = 30_000;
@@ -57,11 +57,22 @@ Return JSON only:
   ]
 }`;
 
-export const EXECUTION_STEP_SEMANTICS_PROMPT = `You reconstruct evidence-grounded execution steps from an agent episode.
+export const EXECUTION_STEP_SEMANTICS_PROMPT = `You reconstruct evidence-grounded, reusable execution-step semantics from an agent episode.
 
 Each supplied step candidate is one observable action and its immediate result. Compress it into:
-- intent: what the action attempted;
-- summary: what the supplied result actually established.
+- intent: the reusable atomic operation the action attempted;
+- summary: the normalized immediate result or state effect established by the supplied evidence.
+
+Normalize incidental instance details so semantically equivalent Steps can be recognized across Episodes:
+- Abstract project names, filenames, exact paths, URLs, domains, record IDs, literal values, and raw error strings when they do not change the reusable operation.
+- Preserve distinctions that change the procedure: inspect vs create vs edit vs execute vs verify; searching vs fetching; checking existence vs validating content; and success vs failure.
+- Preserve the result category or discovered constraint when it changes the next decision, such as access denied, missing dependency, invalid structure, execution failure, or verified artifact.
+- Use the narrowest reusable wording supported by the evidence. Do not collapse the intent into vague phrases such as "handle the task", "process data", or "work on the file".
+
+Examples of the intended abstraction level:
+- "fetch historical data from MarketWatch" with "HTTP 401 Unauthorized" becomes intent "retrieve historical market data from an external source" and summary "data retrieval failed because access authorization was unavailable";
+- "write generate_report.py" with "file created" becomes intent "create an artifact-generation script" and summary "the generation script source was created";
+- writing a script, executing it, checking that its output exists, and validating its content remain four different operations.
 
 Do not extract task state, observations, state operations, retries, recoveries, outcome labels, or evidence references. Those fields are derived elsewhere from immutable inputs. Do not group candidates into subtasks in this pass.
 

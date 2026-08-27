@@ -19,6 +19,7 @@ import {
   sequenceOccurrencesFullyCovered,
   type EpisodeStepPolicyProjectionV1,
   type ProceduralStepOccurrenceV1,
+  type StepEvidenceRole,
   type StepSequencePolicyV1
 } from "../service/evolution/step-sequence-learning-model.js";
 import { stableHash } from "../utils/id.js";
@@ -73,6 +74,7 @@ export interface StepSequencePatternOccurrenceRecord {
   clusterIds: string[];
   selected: boolean;
   terminalReward?: number;
+  evidenceRole: StepEvidenceRole;
   createdAt: string;
 }
 
@@ -141,6 +143,7 @@ export interface StepPolicySkillPatternOccurrenceRecord {
   stepOccurrenceIds: string[];
   selected: boolean;
   terminalReward?: number;
+  evidenceRole: StepEvidenceRole;
   createdAt: string;
 }
 
@@ -424,6 +427,7 @@ export class StepSequenceLearningRepository {
     pathId: string;
     sessionId: string;
     terminalReward?: number;
+    evidenceRole: StepEvidenceRole;
     windows: Array<{
       patternId: string;
       sequenceHash: string;
@@ -452,8 +456,8 @@ export class StepSequenceLearningRepository {
         `INSERT INTO step_sequence_pattern_occurrences (
           id, pattern_id, path_id, episode_id, session_id, start_step_index,
           end_step_index, step_occurrence_ids_json, cluster_ids_json,
-          terminal_reward, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          terminal_reward, evidence_role, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       for (const window of input.windows) {
         upsertPattern.run(
@@ -485,6 +489,7 @@ export class StepSequenceLearningRepository {
           toJson(window.stepOccurrenceIds),
           toJson(window.clusterIds),
           input.terminalReward ?? null,
+          input.evidenceRole,
           input.at
         );
       }
@@ -557,7 +562,7 @@ export class StepSequenceLearningRepository {
         input.policy.patternId,
         input.policy.patternMembershipVersion,
         STEP_SEQUENCE_POLICY_SCHEMA_VERSION,
-        STEP_SEQUENCE_POLICY_INDUCTION_VERSION,
+        input.policy.inductionVersion,
         input.policy.title,
         input.policy.confidence,
         input.policy.provenance.evidenceHash,
@@ -618,6 +623,100 @@ export class StepSequenceLearningRepository {
       `SELECT * FROM step_sequence_policy_versions WHERE id = ?`
     ).get(id) as StepPolicyRow | undefined;
     return row ? stepPolicyFromSql(row) : undefined;
+  }
+
+  getPolicyByMemoryId(l2MemoryId: string): StepSequencePolicyVersionRecord | undefined {
+    const row = this.db.prepare(
+      `SELECT * FROM step_sequence_policy_versions
+       WHERE l2_memory_id = ? ORDER BY created_at DESC LIMIT 1`
+    ).get(l2MemoryId) as StepPolicyRow | undefined;
+    return row ? stepPolicyFromSql(row) : undefined;
+  }
+
+  getPolicyRepairForDecision(
+    patternId: string,
+    repairId: string
+  ): StepSequencePolicyVersionRecord | undefined {
+    const row = this.db.prepare(
+      `SELECT versions.*
+       FROM step_sequence_policy_versions AS versions
+       WHERE versions.pattern_id = ?
+         AND EXISTS (
+           SELECT 1 FROM json_each(versions.payload_json, '$.revision.repairIds')
+           WHERE json_each.value = ?
+         )
+       ORDER BY versions.created_at DESC LIMIT 1`
+    ).get(patternId, repairId) as StepPolicyRow | undefined;
+    return row ? stepPolicyFromSql(row) : undefined;
+  }
+
+  saveAndActivateRepairedPolicy(input: {
+    policy: StepSequencePolicyV1;
+    l2MemoryId: string;
+    basePolicyVersionId: string;
+    at: string;
+  }): StepSequencePolicyVersionRecord {
+    const existing = this.getPolicy(input.policy.id);
+    if (existing) return existing;
+    const base = this.getPolicy(input.basePolicyVersionId);
+    const pattern = this.getStepPattern(input.policy.patternId);
+    if (!base || !pattern || base.status !== "active" || base.patternId !== input.policy.patternId ||
+        pattern?.activePolicyVersionId !== base.id ||
+        pattern.membershipVersion !== input.policy.patternMembershipVersion ||
+        pattern.lifecycleStatus !== "ready" ||
+        pattern.selectedEpisodeCount < STEP_SEQUENCE_SUPPORT_THRESHOLD ||
+        pattern.supersededByPatternId) {
+      throw new Error(`Step sequence Policy repair base is stale: ${input.basePolicyVersionId}`);
+    }
+    this.db.transaction(() => {
+      this.db.prepare(
+        `UPDATE step_sequence_policy_versions
+         SET status = 'inactive', deactivated_at = ?
+         WHERE pattern_id = ? AND status = 'active'`
+      ).run(input.at, pattern.id);
+      this.db.prepare(
+        `INSERT INTO step_sequence_policy_versions (
+          id, policy_key, namespace_id, pattern_id, pattern_membership_version,
+          schema_version, induction_version, status, title, confidence,
+          evidence_hash, l2_memory_id, compiler_model, payload_json,
+          created_at, activated_at, deactivated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      ).run(
+        input.policy.id,
+        input.policy.policyKey,
+        input.policy.namespaceId,
+        input.policy.patternId,
+        input.policy.patternMembershipVersion,
+        STEP_SEQUENCE_POLICY_SCHEMA_VERSION,
+        input.policy.inductionVersion,
+        input.policy.title,
+        input.policy.confidence,
+        input.policy.provenance.evidenceHash,
+        input.l2MemoryId,
+        input.policy.provenance.model ?? null,
+        toJson(input.policy),
+        input.at,
+        input.at
+      );
+      this.db.prepare(
+        `UPDATE step_sequence_patterns
+         SET active_policy_version_id = ?, updated_at = ? WHERE id = ?`
+      ).run(input.policy.id, input.at, pattern.id);
+      if (base.l2MemoryId && base.l2MemoryId !== input.l2MemoryId) {
+        this.db.prepare(
+          `UPDATE memories
+           SET status = 'archived',
+               properties_json = json_set(
+                 json_set(properties_json, '$.status', 'archived'),
+                 '$.internal_info.policy.status', 'archived'
+               ),
+               version = version + 1,
+               updated_at = ?
+           WHERE id = ? AND status NOT IN ('archived', 'deleted')`
+        ).run(input.at, base.l2MemoryId);
+      }
+    })();
+    return this.getPolicy(input.policy.id)!;
   }
 
   getPolicyForPatternMembership(
@@ -715,6 +814,7 @@ export class StepSequenceLearningRepository {
     pathId: string;
     sessionId: string;
     terminalReward?: number;
+    evidenceRole: StepEvidenceRole;
     windows: Array<{
       patternId: string;
       sequenceHash: string;
@@ -744,8 +844,9 @@ export class StepSequenceLearningRepository {
         `INSERT INTO step_policy_skill_pattern_occurrences (
           id, pattern_id, projection_id, episode_id, path_id, session_id,
           start_node_index, end_node_index, policy_keys_json,
-          policy_version_ids_json, step_occurrence_ids_json, terminal_reward, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          policy_version_ids_json, step_occurrence_ids_json, terminal_reward,
+          evidence_role, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       for (const window of input.windows) {
         upsertPattern.run(
@@ -778,6 +879,7 @@ export class StepSequenceLearningRepository {
           toJson(window.policyVersionIds),
           toJson(window.stepOccurrenceIds),
           input.terminalReward ?? null,
+          input.evidenceRole,
           input.at
         );
       }
@@ -831,6 +933,33 @@ export class StepSequenceLearningRepository {
       `UPDATE step_policy_skill_patterns
        SET active_skill_memory_id = ?, updated_at = ? WHERE id = ?`
     ).run(input.skillMemoryId, input.at, input.patternId);
+  }
+
+  activateRepairedSkill(input: {
+    patternId: string;
+    previousSkillMemoryId: string;
+    repairedSkillMemoryId: string;
+    at: string;
+  }): void {
+    const pattern = this.getSkillPattern(input.patternId);
+    if (!pattern || pattern.activeSkillMemoryId !== input.previousSkillMemoryId) return;
+    this.db.transaction(() => {
+      this.db.prepare(
+        `UPDATE memories
+         SET status = 'archived',
+             properties_json = json_set(
+               json_set(properties_json, '$.status', 'archived'),
+               '$.internal_info.skill.status', 'archived'
+             ),
+             version = version + 1,
+             updated_at = ?
+         WHERE id = ? AND status NOT IN ('archived', 'deleted')`
+      ).run(input.at, input.previousSkillMemoryId);
+      this.db.prepare(
+        `UPDATE step_policy_skill_patterns
+         SET active_skill_memory_id = ?, updated_at = ? WHERE id = ?`
+      ).run(input.repairedSkillMemoryId, input.at, input.patternId);
+    })();
   }
 
   retireStepPatternsCoveredBy(
@@ -960,6 +1089,15 @@ export class StepSequenceLearningRepository {
       pattern.id,
       unique((occurrences.get(pattern.id) ?? []).map((occurrence) => occurrence.episodeId))
     ]));
+    const supportOccurrences = new Map(patterns.map((pattern) => [
+      pattern.id,
+      (occurrences.get(pattern.id) ?? [])
+        .filter((occurrence) => occurrence.evidenceRole === "support")
+    ]));
+    const supportEpisodeIds = new Map(patterns.map((pattern) => [
+      pattern.id,
+      unique((supportOccurrences.get(pattern.id) ?? []).map((occurrence) => occurrence.episodeId))
+    ]));
     const candidatesByPath = new Map<string, Array<{
       id: string;
       startIndex: number;
@@ -968,9 +1106,9 @@ export class StepSequenceLearningRepository {
       support: number;
     }>>();
     for (const pattern of patterns) {
-      const support = episodeIds.get(pattern.id)?.length ?? 0;
+      const support = supportEpisodeIds.get(pattern.id)?.length ?? 0;
       if (support < STEP_SEQUENCE_SUPPORT_THRESHOLD) continue;
-      for (const occurrence of occurrences.get(pattern.id) ?? []) {
+      for (const occurrence of supportOccurrences.get(pattern.id) ?? []) {
         const key = `${occurrence.episodeId}\u0000${occurrence.pathId}`;
         const candidates = candidatesByPath.get(key) ?? [];
         candidates.push({
@@ -998,7 +1136,7 @@ export class StepSequenceLearningRepository {
     for (const id of selectedIds) selectOccurrence.run(id);
     const selectedOccurrences = new Map(patterns.map((pattern) => [
       pattern.id,
-      (occurrences.get(pattern.id) ?? []).filter((occurrence) => selectedIds.has(occurrence.id))
+      (supportOccurrences.get(pattern.id) ?? []).filter((occurrence) => selectedIds.has(occurrence.id))
     ]));
     for (const pattern of patterns) {
       if (!pattern.supersededByPatternId) continue;
@@ -1048,7 +1186,7 @@ export class StepSequenceLearningRepository {
         at,
         pattern.id
       );
-      if (lifecycle === "stale" && pattern.activePolicyVersionId) {
+      if (lifecycle !== "ready" && pattern.activePolicyVersionId) {
         this.retirePolicy(pattern.activePolicyVersionId, pattern.id, at);
       }
     }
@@ -1065,6 +1203,15 @@ export class StepSequenceLearningRepository {
       pattern.id,
       unique((occurrences.get(pattern.id) ?? []).map((occurrence) => occurrence.episodeId))
     ]));
+    const supportOccurrences = new Map(patterns.map((pattern) => [
+      pattern.id,
+      (occurrences.get(pattern.id) ?? [])
+        .filter((occurrence) => occurrence.evidenceRole === "support")
+    ]));
+    const supportEpisodeIds = new Map(patterns.map((pattern) => [
+      pattern.id,
+      unique((supportOccurrences.get(pattern.id) ?? []).map((occurrence) => occurrence.episodeId))
+    ]));
     const candidatesByProjection = new Map<string, Array<{
       id: string;
       startIndex: number;
@@ -1073,9 +1220,9 @@ export class StepSequenceLearningRepository {
       support: number;
     }>>();
     for (const pattern of patterns) {
-      const support = episodeIds.get(pattern.id)?.length ?? 0;
+      const support = supportEpisodeIds.get(pattern.id)?.length ?? 0;
       if (support < STEP_POLICY_SKILL_SUPPORT_THRESHOLD) continue;
-      for (const occurrence of occurrences.get(pattern.id) ?? []) {
+      for (const occurrence of supportOccurrences.get(pattern.id) ?? []) {
         const key = `${occurrence.episodeId}\u0000${occurrence.projectionId}`;
         const candidates = candidatesByProjection.get(key) ?? [];
         candidates.push({
@@ -1103,7 +1250,7 @@ export class StepSequenceLearningRepository {
     for (const id of selectedIds) selectOccurrence.run(id);
     const selectedOccurrences = new Map(patterns.map((pattern) => [
       pattern.id,
-      (occurrences.get(pattern.id) ?? []).filter((occurrence) => selectedIds.has(occurrence.id))
+      (supportOccurrences.get(pattern.id) ?? []).filter((occurrence) => selectedIds.has(occurrence.id))
     ]));
     for (const pattern of patterns) {
       if (!pattern.supersededByPatternId) continue;
@@ -1153,7 +1300,7 @@ export class StepSequenceLearningRepository {
         at,
         pattern.id
       );
-      if (lifecycle === "stale" && pattern.activeSkillMemoryId) {
+      if (lifecycle !== "ready" && pattern.activeSkillMemoryId) {
         this.retireSkill(pattern.activeSkillMemoryId, pattern.id, at);
       }
     }
@@ -1294,6 +1441,7 @@ interface StepPatternOccurrenceRow {
   cluster_ids_json: string;
   is_selected: number;
   terminal_reward: number | null;
+  evidence_role: StepEvidenceRole;
   created_at: string;
 }
 
@@ -1362,6 +1510,7 @@ interface SkillPatternOccurrenceRow {
   step_occurrence_ids_json: string;
   is_selected: number;
   terminal_reward: number | null;
+  evidence_role: StepEvidenceRole;
   created_at: string;
 }
 
@@ -1470,6 +1619,7 @@ function stepPatternOccurrenceFromSql(row: StepPatternOccurrenceRow): StepSequen
     clusterIds: stringArray(row.cluster_ids_json),
     selected: row.is_selected === 1,
     ...(row.terminal_reward === null ? {} : { terminalReward: row.terminal_reward }),
+    evidenceRole: row.evidence_role,
     createdAt: row.created_at
   };
 }
@@ -1550,6 +1700,7 @@ function skillPatternOccurrenceFromSql(
     stepOccurrenceIds: stringArray(row.step_occurrence_ids_json),
     selected: row.is_selected === 1,
     ...(row.terminal_reward === null ? {} : { terminalReward: row.terminal_reward }),
+    evidenceRole: row.evidence_role,
     createdAt: row.created_at
   };
 }

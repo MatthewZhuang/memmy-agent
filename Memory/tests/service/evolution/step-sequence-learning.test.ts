@@ -3,6 +3,7 @@ import {
   DEFAULT_MEMMY_CONFIG,
   STEP_POLICY_SKILL_OPERATION,
   STEP_SEQUENCE_POLICY_OPERATION,
+  STEP_SEQUENCE_POLICY_REPAIR_OPERATION,
   buildEpisodeProceduralPath,
   emptyObservedState,
   selectLongestNonOverlapping,
@@ -174,6 +175,8 @@ describe("StepCluster sequence learning", () => {
       .toEqual(expect.arrayContaining(policyMemories.map((memory) => memory.id)));
     expect(skillDetail.invocationGuide).toContain("Run and verify the two-stage workflow");
     expect(embeddedTexts).toHaveLength(14);
+    expect(embeddedTexts.every((text) => text.startsWith("Intent: "))).toBe(true);
+    expect(embeddedTexts.every((text) => !text.includes("\nResult: "))).toBe(true);
   });
 
   it("keeps a shorter Policy when the longer sequence does not cover its Episode evidence", async () => {
@@ -335,6 +338,197 @@ describe("StepCluster sequence learning", () => {
     });
     expect(repos.memories.get("legacy-short-skill-memory")?.status).toBe("archived");
   });
+
+  it("keeps failed and uncertain Episodes as non-support evidence", async () => {
+    const operations: string[] = [];
+    const { db, service } = createTestService({
+      skillLlm: stepSequenceLlm(operations),
+      embedder: stepSequenceEmbedder([]),
+      config: {
+        ...DEFAULT_MEMMY_CONFIG,
+        algorithm: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          capture: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            embedAfterCapture: false
+          }
+        }
+      }
+    });
+    const repos = new Repositories(db.db);
+    const episodes = [
+      persistStepSequenceEpisode(repos, "a", ["A", "B", "C", "X", "D", "E", "F"], 1),
+      persistStepSequenceEpisode(repos, "b", ["A", "B", "C", "Y", "D", "E", "F"], -1),
+      persistStepSequenceEpisode(repos, "c", ["A", "B", "C", "Z", "D", "E", "F"], 0),
+      persistStepSequenceEpisode(repos, "d", ["A", "B", "C", "W", "D", "E", "F"], 0.8)
+    ];
+
+    for (const [index, episode] of episodes.slice(0, 3).entries()) {
+      await service.learnStepSequencesForReplay({
+        episodeId: episode.episodeId,
+        at: `2026-08-25T05:0${index}:00.000Z`
+      });
+    }
+    expect(operations.filter((operation) => operation === STEP_SEQUENCE_POLICY_OPERATION))
+      .toHaveLength(0);
+    expect(operations.filter((operation) => operation === STEP_POLICY_SKILL_OPERATION))
+      .toHaveLength(0);
+
+    await service.learnStepSequencesForReplay({
+      episodeId: episodes[3]!.episodeId,
+      at: "2026-08-25T05:03:00.000Z"
+    });
+
+    const readyPatterns = repos.stepSequenceLearning.listStepPatterns("user-step-sequence")
+      .filter((pattern) => pattern.lifecycleStatus === "ready" && pattern.isMaximal);
+    expect(readyPatterns.map((pattern) => pattern.selectedEpisodeCount)).toEqual([2, 2]);
+    for (const pattern of readyPatterns) {
+      const occurrences = repos.stepSequenceLearning.listStepPatternOccurrences(pattern.id);
+      expect(new Set(occurrences.map((occurrence) => occurrence.evidenceRole)))
+        .toEqual(new Set(["support", "counterexample", "unknown"]));
+      expect(occurrences.filter((occurrence) => occurrence.selected)
+        .every((occurrence) => occurrence.evidenceRole === "support")).toBe(true);
+      const policy = repos.stepSequenceLearning.getPolicy(pattern.activePolicyVersionId!)!;
+      expect(policy.policy.supportEpisodeIds.sort()).toEqual([
+        episodes[0]!.episodeId,
+        episodes[3]!.episodeId
+      ].sort());
+    }
+
+    const readySkills = repos.stepSequenceLearning.listSkillPatterns("user-step-sequence")
+      .filter((pattern) => pattern.lifecycleStatus === "ready" && pattern.isMaximal);
+    expect(readySkills).toHaveLength(1);
+    expect(readySkills[0]!.selectedEpisodeCount).toBe(2);
+    const skillOccurrences = repos.stepSequenceLearning
+      .listSkillPatternOccurrences(readySkills[0]!.id);
+    expect(new Set(skillOccurrences.map((occurrence) => occurrence.evidenceRole)))
+      .toEqual(new Set(["support", "counterexample", "unknown"]));
+    expect(skillOccurrences.filter((occurrence) => occurrence.selected)
+      .every((occurrence) => occurrence.evidenceRole === "support")).toBe(true);
+
+    db.db.prepare(
+      `UPDATE episodes SET r_task = ?, updated_at = ? WHERE id = ?`
+    ).run(-1, "2026-08-25T05:04:00.000Z", episodes[3]!.episodeId);
+    await service.learnStepSequencesForReplay({
+      episodeId: episodes[3]!.episodeId,
+      at: "2026-08-25T05:04:00.000Z"
+    });
+    expect(readyPatterns.every((pattern) => {
+      const refreshed = repos.stepSequenceLearning.getStepPattern(pattern.id)!;
+      return refreshed.lifecycleStatus === "observed" && !refreshed.activePolicyVersionId;
+    })).toBe(true);
+    const retiredSkillPattern = repos.stepSequenceLearning.getSkillPattern(readySkills[0]!.id)!;
+    expect(retiredSkillPattern.lifecycleStatus).toBe("stale");
+    expect(retiredSkillPattern.activeSkillMemoryId).toBeFalsy();
+  });
+
+  it("creates repaired Policy versions and incrementally rebuilds only affected Skill candidates", async () => {
+    const operations: string[] = [];
+    const { db, service } = createTestService({
+      skillLlm: stepSequenceLlm(operations),
+      embedder: stepSequenceEmbedder([]),
+      config: {
+        ...DEFAULT_MEMMY_CONFIG,
+        algorithm: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          capture: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            embedAfterCapture: false
+          },
+          feedback: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.feedback,
+            useLlm: false,
+            cooldownMs: 0
+          }
+        }
+      }
+    });
+    const repos = new Repositories(db.db);
+    const episodes = [
+      persistStepSequenceEpisode(repos, "a", ["A", "B", "C", "X", "D", "E", "F"], 1),
+      persistStepSequenceEpisode(repos, "b", ["A", "B", "C", "Y", "D", "E", "F"], 1)
+    ];
+    for (const [index, episode] of episodes.entries()) {
+      await service.learnStepSequencesForReplay({
+        episodeId: episode.episodeId,
+        at: `2026-08-25T06:0${index}:00.000Z`
+      });
+    }
+
+    const policyPatterns = repos.stepSequenceLearning.listStepPatterns("user-step-sequence")
+      .filter((pattern) => pattern.activePolicyVersionId);
+    const basePolicies = policyPatterns.map((pattern) =>
+      repos.stepSequenceLearning.getPolicy(pattern.activePolicyVersionId!)!);
+    const basePolicyMemoryIds = basePolicies.map((policy) => policy.l2MemoryId!);
+    const skillPattern = repos.stepSequenceLearning.listSkillPatterns("user-step-sequence")
+      .find((pattern) => pattern.activeSkillMemoryId)!;
+    const baseSkillMemoryId = skillPattern.activeSkillMemoryId!;
+    const feedback = await service.feedback({
+      sessionId: "session-step-sequence-a",
+      episodeId: episodes[0]!.episodeId,
+      l1MemoryId: "trace-step-sequence-a",
+      channel: "explicit",
+      polarity: "negative",
+      magnitude: 1,
+      rationale: "Wrong: check the precondition before execution and never retry blindly."
+    });
+    expect(feedback.repair).toMatchObject({
+      skipped: false,
+      attachedPolicyIds: expect.arrayContaining(basePolicyMemoryIds)
+    });
+    expect(feedback.repair?.repairJobId).toBeTruthy();
+    const repair = repos.runtime.getDecisionRepair(feedback.repair!.repairId!)!;
+    const repairJob = repos.runtime.getJob(feedback.repair!.repairJobId!)!;
+
+    const run = await service.runWorkerOnce(10, {
+      targetMemoryIds: [repairJob.targetMemoryId!]
+    });
+    expect(run.failed).toBe(0);
+    expect(run.jobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ jobType: "step_policy_repair", status: "succeeded" })
+    ]));
+
+    const repairedPolicies = policyPatterns.map((pattern) => {
+      const current = repos.stepSequenceLearning.getStepPattern(pattern.id)!;
+      expect(current.activePolicyVersionId).not.toBe(pattern.activePolicyVersionId);
+      return repos.stepSequenceLearning.getPolicy(current.activePolicyVersionId!)!;
+    });
+    expect(repairedPolicies.every((policy) =>
+      policy.policy.revision?.repairIds.includes(repair.id))).toBe(true);
+    expect(repairedPolicies.every((policy) => policy.policy.supportEpisodeIds.length === 2))
+      .toBe(true);
+    expect(basePolicies.every((policy) =>
+      repos.stepSequenceLearning.getPolicy(policy.id)?.status === "inactive")).toBe(true);
+    expect(basePolicyMemoryIds.every((id) => repos.memories.get(id)?.status === "archived"))
+      .toBe(true);
+
+    const currentSkillPattern = repos.stepSequenceLearning.getSkillPattern(skillPattern.id)!;
+    expect(currentSkillPattern.activeSkillMemoryId).toBe(baseSkillMemoryId);
+    expect(repos.memories.get(baseSkillMemoryId)?.status).not.toBe("archived");
+    const repairCandidates = repos.memories.list({
+      memoryLayer: "Skill",
+      status: ["resolving", "activated"]
+    }, 100).filter((memory) => memory.tags.includes("repair_candidate"));
+    expect(repairCandidates).toHaveLength(1);
+    expect(repairCandidates[0]).toMatchObject({
+      properties: {
+        internal_info: {
+          repair_origin: true,
+          strict_trial: true,
+          repair_id: repair.id,
+          supersedes_skill_memory_id: baseSkillMemoryId
+        }
+      }
+    });
+    expect(repairCandidates[0]!.properties.internal_info
+      .source_step_sequence_policy_version_ids).toEqual(expect.arrayContaining(
+        repairedPolicies.map((policy) => policy.id)
+      ));
+    expect(operations.filter((operation) => operation === STEP_SEQUENCE_POLICY_REPAIR_OPERATION))
+      .toHaveLength(2);
+    expect(operations.filter((operation) => operation === STEP_POLICY_SKILL_OPERATION))
+      .toHaveLength(2);
+  });
 });
 
 function legacyArtifactMemory(
@@ -373,7 +567,8 @@ function legacyArtifactMemory(
 function persistStepSequenceEpisode(
   repos: Repositories,
   suffix: string,
-  labels: string[]
+  labels: string[],
+  terminalReward = 1
 ): { episodeId: string; pathId: string } {
   const at = `2026-08-25T00:0${suffix === "a" ? 0 : 1}:00.000Z`;
   const sessionId = `session-step-sequence-${suffix}`;
@@ -404,7 +599,7 @@ function persistStepSequenceEpisode(
     l3WorldModelIds: [],
     skillMemoryIds: [],
     turnCount: 1,
-    rTask: 1,
+    rTask: terminalReward,
     rewardDetail: {},
     pipelineStatus: "succeeded",
     meta: {},
@@ -439,7 +634,7 @@ function persistStepSequenceEpisode(
   const state = emptyObservedState();
   const sourceSnapshotHash = `step-sequence-snapshot-${suffix}`;
   const provenance = {
-    algorithmVersion: "episode-procedural-reconstruction.v7",
+    algorithmVersion: "episode-procedural-reconstruction.v8",
     model: "fixture-model",
     sourceSnapshotHash
   };
@@ -515,7 +710,7 @@ function persistStepSequenceEpisode(
     spans: [span],
     segmentationDecisions: [decision],
     sourceSnapshotHash,
-    terminalReward: 1
+    terminalReward
   });
   const saved = repos.proceduralPaths.save({
     path,
@@ -613,11 +808,15 @@ function stepSequenceLlm(operations: string[]): LlmClient {
       const payload = JSON.parse(messages.find((message) => message.role === "user")!.content) as {
         evidence: Array<Record<string, unknown>>;
       };
-      if (options.operation === STEP_SEQUENCE_POLICY_OPERATION) {
+      if (options.operation === STEP_SEQUENCE_POLICY_OPERATION ||
+          options.operation === STEP_SEQUENCE_POLICY_REPAIR_OPERATION) {
         const evidence = payload.evidence as Array<{
           occurrence_id: string;
           steps: Array<{ step_occurrence_id: string; step_id: string; intent: string }>;
         }>;
+        const decisionRepair = (payload as unknown as {
+          decision_repair?: { repair_id?: string }
+        }).decision_repair;
         const firstLabel = evidence[0]!.steps[0]!.intent.split(" ")[0]!;
         return {
           title: `Execute ${firstLabel} local procedure`,
@@ -629,7 +828,8 @@ function stepSequenceLlm(operations: string[]): LlmClient {
               evidence[0]!.occurrence_id,
               evidence[0]!.steps[0]!.step_occurrence_id,
               evidence[1]!.occurrence_id,
-              evidence[1]!.steps[0]!.step_id
+              evidence[1]!.steps[0]!.step_id,
+              ...(decisionRepair?.repair_id ? [decisionRepair.repair_id] : [])
             ]
           }],
           verification_steps: [{

@@ -1,6 +1,7 @@
 import type { MemmyConfig } from "../../config/index.js";
 import type { Embedder, LlmClient, LlmMessage } from "../../model/types.js";
 import type {
+  DecisionRepairRecord,
   EvolutionJobRecord,
   Repositories
 } from "../../storage/repositories.js";
@@ -32,12 +33,14 @@ import {
   STEP_SEQUENCE_POLICY_INDUCTION_VERSION,
   STEP_SEQUENCE_SUPPORT_THRESHOLD,
   buildEpisodeStepPolicyProjection,
+  buildRepairedStepSequencePolicy,
   buildStepOccurrence,
   buildStepSequencePolicy,
   contiguousWindows,
   hasMultipleDistinctValues,
   policySkillSequenceIdentity,
   selectLongestNonOverlapping,
+  stepEvidenceRoleFromReward,
   stepSequenceIdentity,
   type EpisodeStepPolicyProjectionNodeV1,
   type StepPolicySequenceSkillDraftV1,
@@ -48,6 +51,8 @@ import type { EnqueueJobInput } from "../worker/job-handlers.js";
 export const STEP_SEQUENCE_LEARNING_OPERATION = "procedural.step_sequence_learning.v1" as const;
 export const STEP_SEQUENCE_POLICY_OPERATION = "procedural.step_sequence_policy.induction.v1" as const;
 export const STEP_POLICY_SKILL_OPERATION = "procedural.step_policy_skill.compilation.v1" as const;
+export const STEP_SEQUENCE_POLICY_REPAIR_OPERATION =
+  "procedural.step_sequence_policy.repair.v1" as const;
 
 const MAX_POLICY_PATTERNS_PER_INGEST = 6;
 const MAX_EVIDENCE_OCCURRENCES = 6;
@@ -60,6 +65,7 @@ Each evidence occurrence contains the same ordered StepCluster backbone and conc
 
 Rules:
 - Generalize only behavior supported by at least two distinct Episodes.
+- Only evidence entries with evidence_role=support are positive support. Counterexamples may refine boundaries but must never justify procedure steps.
 - Preserve the observed order and method-defining actions.
 - A Policy is one reusable local procedure, not an Episode-wide Skill.
 - Every procedure and verification item must cite evidence_refs copied exactly from occurrence_id, step_occurrence_id, or step_id values in the payload.
@@ -84,6 +90,8 @@ The payload includes the stable Policy backbone and concrete Step evidence from 
 Rules:
 - Preserve the ordered Policy backbone while expressing an operational end-to-end procedure.
 - Generalize only behavior supported by at least two distinct Episodes.
+- Only evidence entries with evidence_role=support count toward Skill support. Counterexamples may refine do_not_use_when but must never justify Skill steps.
+- When decision_repair is present, compile a repaired candidate that applies it; repair_id may ground the changed Skill step or verification item.
 - Do not restate Policy titles without operational details.
 - Every Skill step and verification item must cite evidence_refs copied exactly from the payload.
 - evidence_occurrence_ids must cite at least two sequence occurrences from distinct Episodes.
@@ -102,6 +110,29 @@ Rules:
   "tools": ["..."],
   "tags": ["..."],
   "evidence_occurrence_ids": ["step_policy_skill_occurrence_..."],
+  "confidence": 0.0
+}`;
+
+export const STEP_SEQUENCE_POLICY_REPAIR_PROMPT = `You revise one existing atomic Policy using an explicit DecisionRepair.
+
+The positive evidence remains the grounding contract. The DecisionRepair is authoritative correction evidence, but it does not permit unrelated invention.
+
+Rules:
+- Preserve still-valid behavior and the Policy's original local scope.
+- Apply the preference operationally and prevent the anti-pattern.
+- Positive evidence from at least two distinct Episodes must still ground the reusable procedure.
+- The repair_id may be cited by procedure or verification items changed by the correction.
+- Every other evidence_ref must be copied exactly from the payload.
+- evidence_occurrence_ids must cite at least two positive support occurrences from distinct Episodes.
+- Return JSON only with exactly these keys:
+{
+  "title": "...",
+  "goal_pattern": "...",
+  "trigger_conditions": ["..."],
+  "procedure_steps": [{"instruction": "...", "evidence_refs": ["..."]}],
+  "verification_steps": [{"check": "...", "success_signal": "...", "evidence_refs": ["..."]}],
+  "do_not_apply_when": ["..."],
+  "evidence_occurrence_ids": ["step_sequence_occurrence_..."],
   "confidence": 0.0
 }`;
 
@@ -129,6 +160,14 @@ export interface StepSequenceLearningResult {
   projectionIds: string[];
   readySkillPatternCount: number;
   compiledSkillIds: string[];
+}
+
+export interface StepSequencePolicyRepairResult {
+  repairId: string;
+  repairedPolicyVersionIds: string[];
+  repairedPolicyMemoryIds: string[];
+  reprojectedEpisodeIds: string[];
+  rebuiltSkillCandidateIds: string[];
 }
 
 interface PolicyDraftResult extends Record<string, unknown> {
@@ -176,6 +215,86 @@ export class StepSequenceLearningPipeline {
     if (!path || path.status !== "active" || path.episodeId !== job.episodeId) return undefined;
     if (pathHash && path.pathHash !== pathHash) return undefined;
     return this.learnPath(path, job.updatedAt);
+  }
+
+  async repairPoliciesJob(job: EvolutionJobRecord): Promise<StepSequencePolicyRepairResult> {
+    const repairId = text(job.payload.repairId);
+    if (!repairId) throw new Error(`Step Policy repair job missing repairId: ${job.id}`);
+    const repair = this.deps.repos.runtime.getDecisionRepair(repairId);
+    if (!repair) throw new Error(`DecisionRepair not found: ${repairId}`);
+    const requestedMemoryIds = stringList(job.payload.policyMemoryIds);
+    const policyMemoryIds = unique(requestedMemoryIds.length > 0
+      ? requestedMemoryIds
+      : repair.attachedPolicyMemoryIds);
+    const requestedTargets = policyMemoryIds.flatMap((memoryId) => {
+      const memory = this.deps.repos.memories.get(memoryId);
+      const policy = this.deps.repos.stepSequenceLearning.getPolicyByMemoryId(memoryId);
+      return memory && policy && memory.userId === repair.userId
+        ? [{ memory, policy }]
+        : [];
+    });
+    const targets = [...new Map(requestedTargets.map((target) => {
+      const activeId = this.deps.repos.stepSequenceLearning
+        .getStepPattern(target.policy.patternId)?.activePolicyVersionId;
+      const active = activeId
+        ? this.deps.repos.stepSequenceLearning.getPolicy(activeId)
+        : undefined;
+      const activeMemory = active?.l2MemoryId
+        ? this.deps.repos.memories.get(active.l2MemoryId)
+        : undefined;
+      const resolved = active && activeMemory && activeMemory.userId === repair.userId
+        ? { policy: active, memory: activeMemory }
+        : target;
+      return [resolved.policy.id, resolved] as const;
+    })).values()];
+    const affectedSkills = this.affectedSkillsForPolicyVersions(uniquePolicyVersions([
+      ...requestedTargets.map((target) => target.policy),
+      ...targets.map((target) => target.policy)
+    ]));
+    const repairedPolicies: StepSequencePolicyVersionRecord[] = [];
+    const repairedMemories: MemoryRow[] = [];
+    const affectedEpisodeIds = new Set<string>();
+    for (const target of targets) {
+      const existing = this.deps.repos.stepSequenceLearning.getPolicyRepairForDecision(
+        target.policy.patternId,
+        repair.id
+      );
+      if (existing) {
+        repairedPolicies.push(existing);
+        if (existing.l2MemoryId) {
+          const memory = this.deps.repos.memories.get(existing.l2MemoryId);
+          if (memory) repairedMemories.push(memory);
+        }
+      } else {
+        const repaired = await this.repairPolicyVersion(target.policy, target.memory, repair, job.updatedAt);
+        repairedPolicies.push(repaired.policy);
+        repairedMemories.push(repaired.memory);
+      }
+      for (const occurrence of this.deps.repos.stepSequenceLearning
+        .listStepPatternOccurrences(target.policy.patternId)) {
+        affectedEpisodeIds.add(occurrence.episodeId);
+      }
+    }
+    for (const episodeId of [...affectedEpisodeIds].sort()) {
+      this.projectEpisode(episodeId, job.updatedAt);
+    }
+    const rebuiltSkills: MemoryRow[] = [];
+    for (const affected of affectedSkills.values()) {
+      const currentPattern = this.deps.repos.stepSequenceLearning.getSkillPattern(affected.patternId);
+      if (!currentPattern) continue;
+      const skill = await this.compileSkill(currentPattern, job.updatedAt, {
+        repair,
+        supersedesSkillMemoryId: affected.skill.id
+      });
+      if (skill) rebuiltSkills.push(skill);
+    }
+    return {
+      repairId,
+      repairedPolicyVersionIds: unique(repairedPolicies.map((policy) => policy.id)),
+      repairedPolicyMemoryIds: unique(repairedMemories.map((memory) => memory.id)),
+      reprojectedEpisodeIds: [...affectedEpisodeIds].sort(),
+      rebuiltSkillCandidateIds: unique(rebuiltSkills.map((skill) => skill.id))
+    };
   }
 
   async learnPath(
@@ -244,6 +363,7 @@ export class StepSequenceLearningPipeline {
       pathId: path.id,
       sessionId: path.sessionId,
       ...(episode.rTask === undefined ? {} : { terminalReward: episode.rTask }),
+      evidenceRole: this.evidenceRole(episode.rTask),
       windows,
       at
     });
@@ -313,6 +433,285 @@ export class StepSequenceLearningPipeline {
     };
   }
 
+  private affectedSkillsForPolicyVersions(
+    policies: readonly StepSequencePolicyVersionRecord[]
+  ): Map<string, { patternId: string; skill: MemoryRow }> {
+    const versionIds = new Set(policies.map((policy) => policy.id));
+    const memoryIds = new Set(policies.flatMap((policy) => policy.l2MemoryId ? [policy.l2MemoryId] : []));
+    const affected = new Map<string, { patternId: string; skill: MemoryRow }>();
+    for (const skill of this.deps.repos.memories.list({
+      memoryLayer: "Skill",
+      status: ["activated", "resolving"]
+    }, 10_000)) {
+      const internal = skill.properties.internal_info;
+      const sourceVersions = stringList(internal.source_step_sequence_policy_version_ids);
+      const nestedSkill = isRecord(internal.skill) ? internal.skill : {};
+      const sourcePolicies = unique([
+        ...stringList(internal.source_policy_ids),
+        ...stringList(nestedSkill.source_policy_ids)
+      ]);
+      if (!sourceVersions.some((id) => versionIds.has(id)) &&
+          !sourcePolicies.some((id) => memoryIds.has(id))) continue;
+      const sequenceMeta = isRecord(internal.step_policy_sequence_skill)
+        ? internal.step_policy_sequence_skill
+        : {};
+      const patternId = text(sequenceMeta.pattern_id);
+      if (!patternId) continue;
+      const pattern = this.deps.repos.stepSequenceLearning.getSkillPattern(patternId);
+      if (pattern?.activeSkillMemoryId !== skill.id) continue;
+      affected.set(patternId, { patternId, skill });
+    }
+    return affected;
+  }
+
+  private async repairPolicyVersion(
+    base: StepSequencePolicyVersionRecord,
+    baseMemory: MemoryRow,
+    repair: DecisionRepairRecord,
+    at: string
+  ): Promise<{ policy: StepSequencePolicyVersionRecord; memory: MemoryRow }> {
+    if (base.status !== "active") {
+      throw new Error(`Step Policy repair requires the active base version: ${base.id}`);
+    }
+    if (!this.deps.skillLlm.isConfigured()) {
+      throw new Error("Step sequence Policy repair requires a configured LLM");
+    }
+    const selected = selectDistinctEpisodeOccurrences(
+      this.deps.repos.stepSequenceLearning.listStepPatternOccurrences(
+        base.patternId,
+        { selectedOnly: true }
+      ),
+      MAX_EVIDENCE_OCCURRENCES
+    );
+    if (new Set(selected.map((occurrence) => occurrence.episodeId)).size < 2 ||
+        selected.some((occurrence) => occurrence.evidenceRole !== "support")) {
+      throw new Error(`Step Policy repair lacks positive support evidence: ${base.id}`);
+    }
+    const context = this.policyEvidenceContext(
+      this.deps.repos.stepSequenceLearning.getStepPattern(base.patternId)!,
+      selected
+    );
+    context.validRefs.add(repair.id);
+    const payload = {
+      ...context.payload,
+      base_policy: {
+        policy_version_id: base.id,
+        title: base.policy.title,
+        goal_pattern: base.policy.goalPattern,
+        trigger_conditions: base.policy.triggerConditions,
+        procedure_steps: base.policy.procedureSteps,
+        verification_steps: base.policy.verificationSteps,
+        do_not_apply_when: base.policy.doNotApplyWhen,
+        prior_repair_ids: base.policy.revision?.repairIds ?? []
+      },
+      decision_repair: {
+        repair_id: repair.id,
+        issue: repair.issue,
+        suggestion: repair.suggestion,
+        preference: repair.preference,
+        anti_pattern: repair.antiPattern
+      }
+    };
+    const messages: LlmMessage[] = [
+      { role: "system", content: STEP_SEQUENCE_POLICY_REPAIR_PROMPT },
+      { role: "user", content: stableStringify(payload) }
+    ];
+    const options = {
+      operation: STEP_SEQUENCE_POLICY_REPAIR_OPERATION,
+      thinkingMode: this.deps.config.evolution.enableThinking
+        ? "enabled" as const
+        : "disabled" as const,
+      temperature: 0.1,
+      maxTokens: 5_000,
+      jsonMode: true
+    };
+    let result = await this.deps.skillLlm.completeJson<PolicyDraftResult>(messages, options);
+    let draft: ReturnType<typeof parsePolicyDraft>;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        draft = parsePolicyDraft(result, context);
+        break;
+      } catch (error) {
+        if (attempt >= MAX_POLICY_REPAIR_ATTEMPTS) throw error;
+        result = await this.deps.skillLlm.completeJson<PolicyDraftResult>([
+          ...messages,
+          { role: "assistant", content: stableStringify(result) },
+          { role: "user", content: repairInstruction(error) }
+        ], { ...options, operation: `${STEP_SEQUENCE_POLICY_REPAIR_OPERATION}.format_repair` });
+      }
+    }
+    const policy = buildRepairedStepSequencePolicy({
+      base: base.policy,
+      draft,
+      repairId: repair.id,
+      model: this.deps.skillLlm.config.model
+    });
+    const memory = this.repairedPolicyMemory(baseMemory, policy, repair, at);
+    let savedMemory: MemoryRow;
+    let savedPolicy: StepSequencePolicyVersionRecord;
+    this.deps.repos.transaction(() => {
+      savedMemory = this.deps.upsertEvolutionMemory(memory).memory;
+      savedPolicy = this.deps.repos.stepSequenceLearning.saveAndActivateRepairedPolicy({
+        policy,
+        l2MemoryId: savedMemory.id,
+        basePolicyVersionId: base.id,
+        at
+      });
+      for (const episodeId of policy.supportEpisodeIds) {
+        this.deps.repos.runtime.appendEpisodeDerivedMemory(episodeId, "L2", savedMemory.id, at);
+      }
+      for (const traceId of stringList(savedMemory.properties.internal_info.source_trace_ids)) {
+        this.deps.repos.runtime.insertTracePolicyLink({
+          userId: savedMemory.userId,
+          l1MemoryId: traceId,
+          l2MemoryId: savedMemory.id,
+          relation: "supports",
+          strength: policy.confidence,
+          createdAt: at
+        });
+      }
+    });
+    this.deps.repos.runtime.appendChange({
+      memoryId: savedMemory!.id,
+      namespaceId: policy.namespaceId,
+      kind: "policy",
+      op: "created",
+      entityId: savedMemory!.id,
+      userId: savedMemory!.userId,
+      changeType: "policy_repair_version_created",
+      before: baseMemory,
+      after: savedMemory!,
+      source: STEP_SEQUENCE_POLICY_REPAIR_OPERATION,
+      createdAt: at
+    });
+    const firstOccurrence = selected[0]!;
+    const firstStep = this.deps.repos.stepSequenceLearning
+      .getStep(firstOccurrence.stepOccurrenceIds[0]!);
+    if (firstStep) this.scheduleEmbedding(savedMemory!, firstStep.sessionId, firstStep.episodeId, at);
+    return { policy: savedPolicy!, memory: savedMemory! };
+  }
+
+  private repairedPolicyMemory(
+    baseMemory: MemoryRow,
+    policy: StepSequencePolicyV1,
+    repair: DecisionRepairRecord,
+    at: string
+  ): MemoryRow {
+    const sourceTraceIds = unique([
+      ...stringList(baseMemory.properties.internal_info.source_trace_ids),
+      ...stringList(baseMemory.properties.internal_info.source_l1_memory_ids)
+    ]);
+    const currentPolicy = isRecord(baseMemory.properties.internal_info.policy)
+      ? baseMemory.properties.internal_info.policy
+      : {};
+    const currentGuidance = isRecord(currentPolicy.decision_guidance)
+      ? currentPolicy.decision_guidance
+      : {};
+    const preference = unique([
+      ...stringList(currentGuidance.preference),
+      ...(repair.preference ? [repair.preference] : [])
+    ]);
+    const antiPattern = unique([
+      ...stringList(currentGuidance.anti_pattern),
+      ...(repair.antiPattern ? [repair.antiPattern] : [])
+    ]);
+    const repairIds = policy.revision?.repairIds ?? [repair.id];
+    const trigger = policy.triggerConditions.join("\n");
+    const procedure = policy.procedureSteps.map((step) => step.instruction).join("\n");
+    const verification = policy.verificationSteps.map((step) =>
+      `${step.check}: ${step.successSignal}`).join("\n");
+    const boundary = policy.doNotApplyWhen.join("\n");
+    const expectedOutcome = policy.verificationSteps.map((step) => step.successSignal).join("\n");
+    const support = policy.supportEpisodeIds.length;
+    return this.deps.buildMemory({
+      userId: baseMemory.userId,
+      conversationId: baseMemory.conversationId,
+      sessionId: baseMemory.sessionId,
+      agentId: baseMemory.agentId,
+      appId: baseMemory.appId,
+      layer: "L2",
+      kind: "policy",
+      lifecycleStatus: "candidate",
+      memoryType: baseMemory.memoryType,
+      key: `${policy.policyKey}:revision:${stableHash(repairIds).slice(0, 16)}`,
+      value: renderPolicy(policy),
+      tags: unique([...baseMemory.tags, "repair-version"]),
+      info: {
+        ...baseMemory.info,
+        title: policy.title,
+        support,
+        policy_confidence: policy.confidence,
+        status: "candidate",
+        step_sequence_policy_version_id: policy.id,
+        source_episode_ids: policy.supportEpisodeIds,
+        repair_ids: repairIds,
+        supersedes_policy_memory_id: baseMemory.id
+      },
+      internal: {
+        ...baseMemory.properties.internal_info,
+        source: STEP_SEQUENCE_POLICY_REPAIR_OPERATION,
+        source_memory_ids: sourceTraceIds,
+        source_l1_memory_ids: sourceTraceIds,
+        title: policy.title,
+        trigger,
+        procedure,
+        verification,
+        boundary,
+        expected_outcome: expectedOutcome,
+        exclusions: policy.doNotApplyWhen,
+        support,
+        policy_confidence: policy.confidence,
+        status: "candidate",
+        source_episode_ids: policy.supportEpisodeIds,
+        source_trace_ids: sourceTraceIds,
+        decision_guidance: {
+          preference,
+          anti_pattern: antiPattern,
+          repair_ids: repairIds
+        },
+        step_sequence_policy: {
+          policy_version_id: policy.id,
+          pattern_id: policy.patternId,
+          pattern_membership_version: policy.patternMembershipVersion,
+          sequence_hash: this.deps.repos.stepSequenceLearning
+            .getStepPattern(policy.patternId)?.sequenceHash,
+          cluster_ids: policy.clusterIds,
+          evidence_hash: policy.provenance.evidenceHash,
+          base_policy_version_id: policy.revision?.basePolicyVersionId,
+          repair_ids: repairIds
+        },
+        policy: {
+          ...currentPolicy,
+          title: policy.title,
+          goal_pattern: policy.goalPattern,
+          trigger,
+          procedure,
+          verification,
+          boundary,
+          expected_outcome: expectedOutcome,
+          exclusions: policy.doNotApplyWhen,
+          support,
+          policy_confidence: policy.confidence,
+          status: "candidate",
+          experience_type: "repair_instruction",
+          evidence_polarity: "mixed",
+          skill_eligible: false,
+          induction_version: policy.inductionVersion,
+          source_episode_ids: policy.supportEpisodeIds,
+          source_trace_ids: sourceTraceIds,
+          source_occurrence_ids: policy.evidenceOccurrenceIds,
+          decision_guidance: {
+            preference,
+            anti_pattern: antiPattern,
+            repair_ids: repairIds
+          },
+          vec: null
+        }
+      },
+      createdAt: at
+    });
+  }
+
   private async ensureEmbeddings(
     occurrences: readonly ReturnType<typeof buildStepOccurrence>[],
     at: string
@@ -359,6 +758,13 @@ export class StepSequenceLearningPipeline {
   ): Promise<StepSequencePolicyVersionRecord | undefined> {
     const current = this.currentPromotablePolicyPattern(pattern);
     if (!current) return undefined;
+    if (current.activePolicyVersionId) {
+      const active = this.deps.repos.stepSequenceLearning.getPolicy(current.activePolicyVersionId);
+      if (active?.status === "active" &&
+          active.patternMembershipVersion === current.membershipVersion) {
+        return active;
+      }
+    }
     const existing = this.deps.repos.stepSequenceLearning.getPolicyForPatternMembership(
       current.id,
       current.membershipVersion
@@ -388,6 +794,9 @@ export class StepSequenceLearningPipeline {
     const allOccurrences = this.deps.repos.stepSequenceLearning
       .listStepPatternOccurrences(pattern.id, { selectedOnly: true });
     const selected = selectDistinctEpisodeOccurrences(allOccurrences, MAX_EVIDENCE_OCCURRENCES);
+    if (selected.some((occurrence) => occurrence.evidenceRole !== "support")) {
+      throw new Error(`Step sequence Policy selected non-support evidence: ${pattern.id}`);
+    }
     if (new Set(selected.map((occurrence) => occurrence.episodeId)).size < 2) {
       throw new Error(`Step sequence Policy requires two Episodes: ${pattern.id}`);
     }
@@ -601,9 +1010,31 @@ export class StepSequenceLearningPipeline {
         occurrence_id: occurrence.id,
         episode_id: occurrence.episodeId,
         terminal_reward: occurrence.terminalReward,
+        evidence_role: occurrence.evidenceRole,
         steps
       };
     });
+    const counterexamples = this.deps.repos.stepSequenceLearning
+      .listStepPatternOccurrences(pattern.id)
+      .filter((occurrence) => occurrence.evidenceRole === "counterexample")
+      .slice(0, MAX_EVIDENCE_OCCURRENCES)
+      .map((occurrence) => ({
+        occurrence_id: occurrence.id,
+        episode_id: occurrence.episodeId,
+        terminal_reward: occurrence.terminalReward,
+        evidence_role: occurrence.evidenceRole,
+        steps: occurrence.stepOccurrenceIds.map((id) => {
+          const step = this.deps.repos.stepSequenceLearning.getStep(id);
+          if (!step) throw new Error(`Step sequence counterexample Step is missing: ${id}`);
+          return {
+            step_index: step.stepIndex,
+            intent: clip(step.intent, 600),
+            summary: clip(step.summary, 900),
+            outcome: step.outcome,
+            tool_name: step.toolName
+          };
+        })
+      }));
     return {
       payload: {
         pattern: {
@@ -611,7 +1042,8 @@ export class StepSequenceLearningPipeline {
           sequence_length: pattern.clusterIds.length,
           distinct_episode_count: pattern.selectedEpisodeCount
         },
-        evidence
+        evidence,
+        counterexamples
       },
       validRefs,
       occurrenceEpisodes
@@ -694,13 +1126,14 @@ export class StepSequenceLearningPipeline {
       namespaceId: path.namespaceId,
       at
     });
-    this.mineSkillPatterns(saved, episode.rTask, at);
+    this.mineSkillPatterns(saved, episode.rTask, this.evidenceRole(episode.rTask), at);
     return saved;
   }
 
   private mineSkillPatterns(
     projection: EpisodeStepPolicyProjectionRecord,
     terminalReward: number | undefined,
+    evidenceRole: ReturnType<typeof stepEvidenceRoleFromReward>,
     at: string
   ): void {
     const policyNodes = projection.projection.nodes.filter((node) => node.kind === "policy");
@@ -732,6 +1165,7 @@ export class StepSequenceLearningPipeline {
       pathId: projection.pathId,
       sessionId: projection.sessionId,
       ...(terminalReward === undefined ? {} : { terminalReward }),
+      evidenceRole,
       windows,
       at
     });
@@ -759,7 +1193,11 @@ export class StepSequenceLearningPipeline {
 
   private async compileSkill(
     pattern: StepPolicySkillPatternRecord,
-    at: string
+    at: string,
+    repairOptions?: {
+      repair: DecisionRepairRecord;
+      supersedesSkillMemoryId: string;
+    }
   ): Promise<MemoryRow | undefined> {
     if (!this.deps.skillLlm.isConfigured()) {
       throw new Error("Step Policy sequence Skill compilation requires a configured LLM");
@@ -771,10 +1209,24 @@ export class StepSequenceLearningPipeline {
       ),
       MAX_EVIDENCE_OCCURRENCES
     );
+    if (occurrences.some((occurrence) => occurrence.evidenceRole !== "support")) {
+      throw new Error(`Step Policy Skill selected non-support evidence: ${pattern.id}`);
+    }
     if (new Set(occurrences.map((occurrence) => occurrence.episodeId)).size < 2) {
       throw new Error(`Step Policy Skill requires two Episodes: ${pattern.id}`);
     }
     const context = this.skillEvidenceContext(pattern, occurrences);
+    if (repairOptions) {
+      context.validRefs.add(repairOptions.repair.id);
+      context.payload.decision_repair = {
+        repair_id: repairOptions.repair.id,
+        issue: repairOptions.repair.issue,
+        suggestion: repairOptions.repair.suggestion,
+        preference: repairOptions.repair.preference,
+        anti_pattern: repairOptions.repair.antiPattern,
+        supersedes_skill_memory_id: repairOptions.supersedesSkillMemoryId
+      };
+    }
     const messages: LlmMessage[] = [
       { role: "system", content: STEP_POLICY_SKILL_PROMPT },
       { role: "user", content: stableStringify(context.payload) }
@@ -826,10 +1278,26 @@ export class StepSequenceLearningPipeline {
       betaPosterior,
       patternId: current.id,
       evidenceOccurrenceIds: draft.evidenceOccurrenceIds,
-      sourcePolicyIds: policyMemories
+      sourcePolicyIds: policyMemories,
+      repair: repairOptions?.repair
     });
-    const skillKey = `skill:step-policy-sequence:${current.sequenceHash}`;
+    const skillKey = repairOptions
+      ? `skill:step-policy-sequence:${current.sequenceHash}:repair:${stableHash({
+          repairId: repairOptions.repair.id,
+          policyVersions
+        }).slice(0, 16)}`
+      : `skill:step-policy-sequence:${current.sequenceHash}`;
     const value = renderSkill(draft);
+    const repairMeta = repairOptions
+      ? {
+          repair_origin: true,
+          repairOrigin: true,
+          strict_trial: true,
+          strictTrial: true,
+          repair_id: repairOptions.repair.id,
+          supersedes_skill_memory_id: repairOptions.supersedesSkillMemoryId
+        }
+      : {};
     const memory = this.deps.buildMemory({
       userId: firstStep.userId,
       layer: "Skill",
@@ -838,7 +1306,11 @@ export class StepSequenceLearningPipeline {
       memoryType: "SkillMemory",
       key: skillKey,
       value,
-      tags: ["skill", "procedural", "step-policy-sequence", "v2", "shadow", ...draft.tags],
+      tags: [
+        "skill", "procedural", "step-policy-sequence", "v2", "shadow",
+        ...(repairOptions ? ["repair_candidate"] : []),
+        ...draft.tags
+      ],
       info: {
         name: draft.name,
         title: draft.displayTitle,
@@ -847,10 +1319,13 @@ export class StepSequenceLearningPipeline {
         support,
         source_memory_ids: policyMemories,
         source_pattern_id: current.id,
-        source_episode_ids: unique(occurrences.map((occurrence) => occurrence.episodeId))
+        source_episode_ids: unique(occurrences.map((occurrence) => occurrence.episodeId)),
+        ...repairMeta
       },
       internal: {
-        source: "worker.step_policy_sequence_skill_compilation.v1",
+        source: repairOptions
+          ? "worker.step_policy_sequence_skill_repair.v1"
+          : "worker.step_policy_sequence_skill_compilation.v1",
         plugin_algorithm: STEP_POLICY_SKILL_COMPILER_VERSION,
         source_memory_ids: policyMemories,
         source_policy_ids: policyMemories,
@@ -863,12 +1338,14 @@ export class StepSequenceLearningPipeline {
         name: draft.name,
         invocation_guide: value,
         procedure_json: procedureJson,
+        ...repairMeta,
         step_policy_sequence_skill: {
           compiler_version: STEP_POLICY_SKILL_COMPILER_VERSION,
           pattern_id: current.id,
           pattern_membership_version: current.membershipVersion,
           sequence_hash: current.sequenceHash,
           policy_keys: current.policyKeys,
+          ...repairMeta,
           executable: true
         },
         skill: {
@@ -886,6 +1363,7 @@ export class StepSequenceLearningPipeline {
           trials_passed: 0,
           success_rate: successRate,
           beta_posterior: betaPosterior,
+          ...repairMeta,
           vec: null
         }
       },
@@ -894,17 +1372,34 @@ export class StepSequenceLearningPipeline {
     let saved: MemoryRow;
     this.deps.repos.transaction(() => {
       saved = this.deps.upsertEvolutionMemory(memory).memory;
-      this.deps.repos.stepSequenceLearning.markSkillCompiled({
-        patternId: current.id,
-        membershipVersion: current.membershipVersion,
-        skillMemoryId: saved!.id,
-        at
-      });
+      if (!repairOptions) {
+        this.deps.repos.stepSequenceLearning.markSkillCompiled({
+          patternId: current.id,
+          membershipVersion: current.membershipVersion,
+          skillMemoryId: saved!.id,
+          at
+        });
+      }
     });
     for (const episodeId of unique(occurrences.map((occurrence) => occurrence.episodeId))) {
       this.deps.repos.runtime.appendEpisodeDerivedMemory(episodeId, "Skill", saved!.id, at);
     }
     this.scheduleEmbedding(saved!, firstStep.sessionId, firstStep.episodeId, at);
+    if (repairOptions) {
+      this.deps.repos.runtime.appendChange({
+        memoryId: saved!.id,
+        namespaceId: current.namespaceId,
+        kind: "skill",
+        op: "created",
+        entityId: saved!.id,
+        userId: saved!.userId,
+        changeType: "skill_repair_candidate_created",
+        before: this.deps.repos.memories.get(repairOptions.supersedesSkillMemoryId),
+        after: saved!,
+        source: STEP_SEQUENCE_POLICY_REPAIR_OPERATION,
+        createdAt: at
+      });
+    }
     return saved!;
   }
 
@@ -972,10 +1467,21 @@ export class StepSequenceLearningPipeline {
         sequence_occurrence_id: occurrence.id,
         episode_id: occurrence.episodeId,
         terminal_reward: occurrence.terminalReward,
+        evidence_role: occurrence.evidenceRole,
         policies,
         full_step_path: steps
       };
     });
+    const counterexamples = this.deps.repos.stepSequenceLearning
+      .listSkillPatternOccurrences(pattern.id)
+      .filter((occurrence) => occurrence.evidenceRole === "counterexample")
+      .slice(0, MAX_EVIDENCE_OCCURRENCES)
+      .map((occurrence) => ({
+        sequence_occurrence_id: occurrence.id,
+        episode_id: occurrence.episodeId,
+        terminal_reward: occurrence.terminalReward,
+        evidence_role: occurrence.evidenceRole
+      }));
     return {
       payload: {
         pattern: {
@@ -984,7 +1490,8 @@ export class StepSequenceLearningPipeline {
           distinct_episode_count: pattern.selectedEpisodeCount
         },
         observed_tools: [...observedTools].sort(),
-        evidence
+        evidence,
+        counterexamples
       },
       validRefs,
       occurrenceEpisodes,
@@ -1010,6 +1517,13 @@ export class StepSequenceLearningPipeline {
         contentHash: memory.contentHash ?? undefined
       },
       createdAt: at
+    });
+  }
+
+  private evidenceRole(terminalReward: number | undefined) {
+    return stepEvidenceRoleFromReward(terminalReward, {
+      successThreshold: this.deps.config.algorithm.skill.outcomeRTaskSuccessThreshold,
+      failureThreshold: this.deps.config.algorithm.skill.outcomeRTaskFailureThreshold
     });
   }
 
@@ -1048,6 +1562,7 @@ function canonicalStepPolicySkillProcedure(input: {
   patternId: string;
   evidenceOccurrenceIds: readonly string[];
   sourcePolicyIds: readonly string[];
+  repair?: DecisionRepairRecord;
 }): Record<string, unknown> {
   return {
     retrievalBlurb: input.draft.retrievalBlurb,
@@ -1070,8 +1585,8 @@ function canonicalStepPolicySkillProcedure(input: {
     })),
     doNotUseWhen: [...input.draft.doNotUseWhen],
     decisionGuidance: {
-      preference: [],
-      antiPattern: []
+      preference: input.repair?.preference ? [input.repair.preference] : [],
+      antiPattern: input.repair?.antiPattern ? [input.repair.antiPattern] : []
     },
     reliability: {
       supportCount: input.support,
@@ -1083,7 +1598,11 @@ function canonicalStepPolicySkillProcedure(input: {
     grounding: {
       patternId: input.patternId,
       evidenceOccurrenceIds: [...input.evidenceOccurrenceIds],
-      sourcePolicyMemoryIds: [...input.sourcePolicyIds]
+      sourcePolicyMemoryIds: [...input.sourcePolicyIds],
+      ...(input.repair ? {
+        repairId: input.repair.id,
+        repairFeedbackId: input.repair.feedbackId
+      } : {})
     }
   };
 }
@@ -1358,4 +1877,16 @@ function unique(values: readonly string[]): string[] {
 
 function text(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+}
+
+function uniquePolicyVersions(
+  policies: readonly StepSequencePolicyVersionRecord[]
+): StepSequencePolicyVersionRecord[] {
+  return [...new Map(policies.map((policy) => [policy.id, policy])).values()];
 }
