@@ -20,7 +20,7 @@ import {
 } from "./skill-pipeline.js";
 
 export const PROCEDURAL_PATTERN_SKILL_PROMPT_VERSION =
-  "procedural-pattern-skill.v2" as const;
+  "procedural-pattern-skill.v3" as const;
 
 const PROCEDURAL_PATTERN_SKILL_PROMPT = `You compile one reusable Skill directly from an aligned cross-Episode execution pattern.
 
@@ -31,7 +31,10 @@ Input semantics:
 - occurrences[].aligned_sequence projects those anchors back to each concrete Episode in execution order.
 - role=core is aligned evidence for one common_core anchor.
 - role=gap is an occurrence-local Step between two aligned anchors. A Gap is context for causal completeness, not automatically shared proof.
-- boundary_context_read_only exposes at most one adjacent Step on either side for trigger/boundary interpretation. It is never positive procedure or verification evidence.
+- completion.shared_prefix/shared_suffix are bounded outward extensions repeated across successful Episodes. They complete the procedure without changing Cluster identity.
+- completion.activated=false means no repeated outward Step was found; both extension arrays are empty and the candidate must be compiled exactly from Core plus Gap evidence.
+- prefix_extension/suffix_extension project the outward context into each Episode. role=shared_extension is positive evidence; role=local_context is read-only.
+- boundary_context_read_only exposes at most one Step beyond the expanded region on either side. It is never positive procedure or verification evidence.
 
 Admission rules:
 - Admit only a coherent, reusable method repeated in at least two distinct successful Episodes.
@@ -41,10 +44,12 @@ Admission rules:
 - Use Gaps to detect missing causal bridges such as edit -> rerun -> verify. If equivalent Gaps do not occur in at least two distinct successful Episodes, do not turn them into a mandatory procedure Step.
 - If the common Core plus its occurrence-local Gaps does not support one shared causally complete method, reject the candidate instead of hiding the disagreement.
 - A mandatory procedure or verification item that uses Gap evidence must cite equivalent Gap step_id values from at least two distinct successful Episodes.
+- A mandatory procedure or verification item that uses outward extension evidence must cite shared_extension step_id values from at least two distinct successful Episodes.
+- Never turn local_context into a procedure or verification Step. It may only explain triggers, boundaries, or why the candidate should be rejected.
 - Never cite boundary_context_read_only as procedure or verification evidence.
 - counterexamples_read_only may inform boundaries and do_not_apply_when only. Never use it as procedure, verification, support, or evidence_occurrence_ids evidence.
 - If counterexamples_read_only is empty, do_not_apply_when may be empty. Any exclusion must be a conservative restatement of a positive precondition, not an invented failure mode.
-- Every procedure and verification item must cite exact step_id values from the payload when an occurrence contains a Gap or a failed Step. An occurrence_id may be cited only when its complete aligned_sequence has neither.
+- Every procedure and verification item must cite exact step_id values from the payload when an occurrence contains a Gap, a failed Step, or any outward extension. An occurrence_id may be cited only when its complete aligned_sequence has neither and both extension arrays are empty.
 - Verification must be grounded by successful evidence from at least two distinct Episodes.
 - Do not invent tools, constraints, files, checks, results, or causal explanations.
 - evidence_occurrence_ids must cite at least two occurrences from distinct Episodes.
@@ -114,6 +119,35 @@ export interface ProceduralSkillBoundaryContext {
   nextStep?: ProceduralSkillEvidenceStep;
 }
 
+export interface ProceduralSkillExtensionAnchor {
+  anchorId: string;
+  side: "prefix" | "suffix";
+  referenceStepId: string;
+  supportEpisodeIds: string[];
+  evidenceStepIds: string[];
+  averageMatchSimilarity: number;
+}
+
+export type ProceduralSkillExpansionStep = ProceduralSkillEvidenceStep & {
+  role: "shared_extension" | "local_context";
+  side: "prefix" | "suffix";
+  extensionAnchorId?: string;
+  matchSimilarity?: number;
+};
+
+export interface ProceduralSkillCompletion {
+  id: string;
+  version: string;
+  activated: boolean;
+  referenceOccurrenceId: string;
+  maxPrefixSteps: number;
+  maxSuffixSteps: number;
+  minStepSimilarity: number;
+  sharedPrefix: ProceduralSkillExtensionAnchor[];
+  sharedSuffix: ProceduralSkillExtensionAnchor[];
+  extensionAgreement: number;
+}
+
 export interface ProceduralSkillEvidenceOccurrence {
   occurrenceId: string;
   episodeId: string;
@@ -121,7 +155,9 @@ export interface ProceduralSkillEvidenceOccurrence {
   scale: number;
   alignmentScore: number;
   sourceTraceIds: string[];
+  prefixExpansion: ProceduralSkillExpansionStep[];
   alignedSequence: ProceduralSkillAlignedSequenceStep[];
+  suffixExpansion: ProceduralSkillExpansionStep[];
   boundaryContextReadOnly: ProceduralSkillBoundaryContext;
 }
 
@@ -131,6 +167,7 @@ export interface ProceduralPatternSkillInput {
   clusterVersionId: string;
   commonCoreId: string;
   commonCore: ProceduralSkillCommonCoreAnchor[];
+  completion: ProceduralSkillCompletion;
   userId: string;
   scale: number;
   supportEpisodeIds: string[];
@@ -280,6 +317,18 @@ export class ProceduralPatternSkillMaterializer {
               evidence_step_ids: anchor.evidenceStepIds
             }))
           },
+          completion: {
+            id: input.completion.id,
+            version: input.completion.version,
+            activated: input.completion.activated,
+            reference_occurrence_id: input.completion.referenceOccurrenceId,
+            max_prefix_steps: input.completion.maxPrefixSteps,
+            max_suffix_steps: input.completion.maxSuffixSteps,
+            min_step_similarity: input.completion.minStepSimilarity,
+            extension_agreement: input.completion.extensionAgreement,
+            shared_prefix: input.completion.sharedPrefix.map(serializeExtensionAnchor),
+            shared_suffix: input.completion.sharedSuffix.map(serializeExtensionAnchor)
+          },
           occurrences: evidence.map((occurrence) => ({
             occurrence_id: occurrence.occurrenceId,
             episode_id: occurrence.episodeId,
@@ -287,7 +336,9 @@ export class ProceduralPatternSkillMaterializer {
             boundary_context_read_only: serializeBoundaryContext(
               occurrence.boundaryContextReadOnly
             ),
-            aligned_sequence: occurrence.alignedSequence.map(serializeAlignedStep)
+            prefix_extension: occurrence.prefixExpansion.map(serializeExpansionStep),
+            aligned_sequence: occurrence.alignedSequence.map(serializeAlignedStep),
+            suffix_extension: occurrence.suffixExpansion.map(serializeExpansionStep)
           })),
           counterexamples_read_only: counterexamples.map((occurrence) => ({
             occurrence_id: occurrence.occurrenceId,
@@ -295,7 +346,9 @@ export class ProceduralPatternSkillMaterializer {
             boundary_context_read_only: serializeBoundaryContext(
               occurrence.boundaryContextReadOnly
             ),
-            aligned_sequence: occurrence.alignedSequence.map(serializeAlignedStep)
+            prefix_extension: occurrence.prefixExpansion.map(serializeExpansionStep),
+            aligned_sequence: occurrence.alignedSequence.map(serializeAlignedStep),
+            suffix_extension: occurrence.suffixExpansion.map(serializeExpansionStep)
           }))
         })
       }
@@ -431,6 +484,14 @@ export class ProceduralPatternSkillMaterializer {
         source_pattern_version_id: input.patternVersionId,
         source_cluster_id: input.clusterId,
         source_cluster_version_id: input.clusterVersionId,
+        source_completion_id: input.completion.id,
+        completion_version: input.completion.version,
+        completion_activated: input.completion.activated,
+        completion_extension_agreement: input.completion.extensionAgreement,
+        completion_shared_prefix_anchor_ids: input.completion.sharedPrefix.map((item) =>
+          item.anchorId),
+        completion_shared_suffix_anchor_ids: input.completion.sharedSuffix.map((item) =>
+          item.anchorId),
         window_scale: input.scale,
         alignment_config_version: input.algorithmVersion,
         induction_prompt_version: PROCEDURAL_PATTERN_SKILL_PROMPT_VERSION,
@@ -534,6 +595,35 @@ function serializeAlignedStep(
       };
 }
 
+function serializeExtensionAnchor(
+  anchor: ProceduralSkillExtensionAnchor
+): Record<string, unknown> {
+  return {
+    anchor_id: anchor.anchorId,
+    side: anchor.side,
+    reference_step_id: anchor.referenceStepId,
+    support_episode_ids: anchor.supportEpisodeIds,
+    evidence_step_ids: anchor.evidenceStepIds,
+    average_match_similarity: anchor.averageMatchSimilarity
+  };
+}
+
+function serializeExpansionStep(
+  step: ProceduralSkillExpansionStep
+): Record<string, unknown> {
+  return {
+    role: step.role,
+    side: step.side,
+    ...(step.extensionAnchorId
+      ? { extension_anchor_id: step.extensionAnchorId }
+      : {}),
+    ...(step.matchSimilarity === undefined
+      ? {}
+      : { match_similarity: step.matchSimilarity }),
+    ...serializeEvidenceStep(step)
+  };
+}
+
 function serializeBoundaryContext(
   context: ProceduralSkillBoundaryContext
 ): Record<string, unknown> {
@@ -572,7 +662,9 @@ function materializedSkillSteps(
   for (const occurrence of evidence) {
     const refs = [
       occurrence.occurrenceId,
-      ...occurrence.alignedSequence.flatMap((step) => [step.stepId, ...step.evidenceRefs])
+      ...occurrence.prefixExpansion.flatMap((step) => [step.stepId, ...step.evidenceRefs]),
+      ...occurrence.alignedSequence.flatMap((step) => [step.stepId, ...step.evidenceRefs]),
+      ...occurrence.suffixExpansion.flatMap((step) => [step.stepId, ...step.evidenceRefs])
     ];
     for (const ref of refs) {
       occurrencesByRef.set(ref, unique([
@@ -651,21 +743,28 @@ function parseSkillResult(
   // A failed action may remain visible to the compiler as counterfactual
   // context, but it can never prove a positive procedure or verification.
   // Occurrence-level citations are therefore allowed only when the complete
-  // occurrence contains neither a failed Step nor a Gap. Mixed or gap-bearing
-  // windows must cite concrete Steps so the validator can distinguish shared
-  // Core proof from occurrence-local causal context.
-  const positiveRefsByOccurrence = new Map(evidence.map((item) => [
-    item.occurrenceId,
-    [
-      ...(item.alignedSequence.some((step) =>
-        step.outcome === "failure" || step.role === "gap")
-        ? []
-        : [item.occurrenceId]),
+  // occurrence contains neither a failed Step, a Gap, nor outward context.
+  // Mixed or context-bearing windows must cite concrete Steps so the validator
+  // can distinguish shared Core/extension proof from occurrence-local context.
+  const positiveRefsByOccurrence = new Map(evidence.map((item) => {
+    const sharedExtensions = [
+      ...item.prefixExpansion,
+      ...item.suffixExpansion
+    ].filter((step) => step.role === "shared_extension");
+    const occurrenceLevelCitationAllowed = !item.alignedSequence.some((step) =>
+      step.outcome === "failure" || step.role === "gap") &&
+      sharedExtensions.length === 0 &&
+      item.prefixExpansion.length === 0 && item.suffixExpansion.length === 0;
+    return [item.occurrenceId, [
+      ...(occurrenceLevelCitationAllowed ? [item.occurrenceId] : []),
       ...item.alignedSequence.flatMap((step) => step.outcome === "failure"
         ? []
+        : [step.stepId, ...step.evidenceRefs]),
+      ...sharedExtensions.flatMap((step) => step.outcome === "failure"
+        ? []
         : [step.stepId, ...step.evidenceRefs])
-    ]
-  ]));
+    ]] as const;
+  }));
   const allowedRefs = new Set([...positiveRefsByOccurrence.values()].flat());
   const citedRefs = [
     ...procedureSteps.flatMap((item) => item.evidenceRefs),
@@ -709,8 +808,34 @@ function parseSkillResult(
       return { ok: false, reason: "insufficient-gap-episode-support" };
     }
   }
+  const extensionEpisodesByRef = new Map<string, string[]>();
+  for (const occurrence of evidence) {
+    for (const step of [...occurrence.prefixExpansion, ...occurrence.suffixExpansion]) {
+      if (step.role !== "shared_extension" || step.outcome === "failure") continue;
+      for (const ref of [step.stepId, ...step.evidenceRefs]) {
+        extensionEpisodesByRef.set(ref, unique([
+          ...(extensionEpisodesByRef.get(ref) ?? []),
+          occurrence.episodeId
+        ]));
+      }
+    }
+  }
+  for (const item of [...procedureSteps, ...verificationSteps]) {
+    const citedExtensionRefs = item.evidenceRefs.filter((ref) =>
+      extensionEpisodesByRef.has(ref));
+    if (citedExtensionRefs.length === 0) continue;
+    const supportingEpisodes = unique(citedExtensionRefs.flatMap((ref) =>
+      extensionEpisodesByRef.get(ref) ?? []));
+    if (supportingEpisodes.length < 2) {
+      return { ok: false, reason: "insufficient-extension-episode-support" };
+    }
+  }
   const evidenceTools = new Set(evidence.flatMap((item) =>
-    item.alignedSequence
+    [
+      ...item.prefixExpansion.filter((step) => step.role === "shared_extension"),
+      ...item.alignedSequence,
+      ...item.suffixExpansion.filter((step) => step.role === "shared_extension")
+    ]
       .map((step) => step.toolName?.trim().toLowerCase())
       .filter(isString)));
   if (tools.some((tool) => !evidenceTools.has(tool.trim().toLowerCase()))) {

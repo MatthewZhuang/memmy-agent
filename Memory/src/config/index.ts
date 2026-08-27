@@ -179,6 +179,10 @@ export interface AlgorithmConfig {
     minSupportEpisodes: number;
     maxSkillEvidenceEpisodes: number;
     medoidSwitchMargin: number;
+    completionExpansionEnabled: boolean;
+    maxPrefixExpansionSteps: number;
+    maxSuffixExpansionSteps: number;
+    minExtensionStepSimilarity: number;
     scales: Array<{
       length: number;
       stride: number;
@@ -422,6 +426,10 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
       minSupportEpisodes: 2,
       maxSkillEvidenceEpisodes: 6,
       medoidSwitchMargin: 0.01,
+      completionExpansionEnabled: true,
+      maxPrefixExpansionSteps: 3,
+      maxSuffixExpansionSteps: 5,
+      minExtensionStepSimilarity: 0.70,
       scales: [
         {
           length: 5,
@@ -1095,6 +1103,22 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
       medoidSwitchMargin: numberValue(
         proceduralWindow.medoidSwitchMargin,
         DEFAULT_MEMMY_CONFIG.algorithm.proceduralWindow.medoidSwitchMargin
+      ),
+      completionExpansionEnabled: booleanValue(
+        proceduralWindow.completionExpansionEnabled,
+        DEFAULT_MEMMY_CONFIG.algorithm.proceduralWindow.completionExpansionEnabled
+      ),
+      maxPrefixExpansionSteps: numberValue(
+        proceduralWindow.maxPrefixExpansionSteps,
+        DEFAULT_MEMMY_CONFIG.algorithm.proceduralWindow.maxPrefixExpansionSteps
+      ),
+      maxSuffixExpansionSteps: numberValue(
+        proceduralWindow.maxSuffixExpansionSteps,
+        DEFAULT_MEMMY_CONFIG.algorithm.proceduralWindow.maxSuffixExpansionSteps
+      ),
+      minExtensionStepSimilarity: numberValue(
+        proceduralWindow.minExtensionStepSimilarity,
+        DEFAULT_MEMMY_CONFIG.algorithm.proceduralWindow.minExtensionStepSimilarity
       ),
       scales: normalizeProceduralWindowScales(proceduralWindow.scales)
     },

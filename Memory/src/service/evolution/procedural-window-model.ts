@@ -16,6 +16,7 @@ export const TRAJECTORY_WINDOW_OCCURRENCE_SCHEMA_VERSION =
 export const PROCEDURAL_SPAN_OCCURRENCE_SCHEMA_VERSION =
   "procedural-span-occurrence.v1" as const;
 export const ALIGNED_COMMON_CORE_SCHEMA_VERSION = "aligned-common-core.v1" as const;
+export const ANCHORED_COMPLETION_SCHEMA_VERSION = "anchored-completion.v2" as const;
 /**
  * Mechanical 5/10 projection identity. Keep this stable so the v2 Family
  * miner can reuse v1 Window rows and embeddings instead of duplicating them.
@@ -247,6 +248,149 @@ export interface AlignedCommonCoreV1 {
   steps: AlignedCommonCoreStepV1[];
   supportEpisodeIds: string[];
   spanOccurrences: ProceduralSpanOccurrenceV1[];
+}
+
+export interface AnchoredCompletionStepCandidateV2 {
+  stepId: string;
+  vector: number[];
+}
+
+export interface AnchoredCompletionOccurrenceCandidateV2 {
+  occurrenceId: string;
+  episodeId: string;
+  evidenceRole: ProceduralEvidenceRole;
+  prefix: AnchoredCompletionStepCandidateV2[];
+  suffix: AnchoredCompletionStepCandidateV2[];
+}
+
+export interface SharedExtensionAnchorV2 {
+  anchorId: string;
+  side: "prefix" | "suffix";
+  referenceOffset: number;
+  referenceStepId: string;
+  supportEpisodeIds: string[];
+  evidenceStepIds: string[];
+  averageMatchSimilarity: number;
+}
+
+export interface CompletionStepProjectionV2 {
+  stepId: string;
+  role: "shared_extension" | "local_context";
+  extensionAnchorId?: string;
+  matchSimilarity?: number;
+}
+
+export interface AnchoredCompletionOccurrenceProjectionV2 {
+  occurrenceId: string;
+  prefix: CompletionStepProjectionV2[];
+  suffix: CompletionStepProjectionV2[];
+}
+
+export interface AnchoredCompletionOverlayV2 {
+  id: string;
+  schemaVersion: typeof ANCHORED_COMPLETION_SCHEMA_VERSION;
+  commonCoreId: string;
+  referenceOccurrenceId: string;
+  maxPrefixSteps: number;
+  maxSuffixSteps: number;
+  minStepSimilarity: number;
+  minSupportEpisodes: number;
+  sharedPrefix: SharedExtensionAnchorV2[];
+  sharedSuffix: SharedExtensionAnchorV2[];
+  projections: AnchoredCompletionOccurrenceProjectionV2[];
+  extensionAgreement: number;
+}
+
+/**
+ * Complete an already-stable Common Core without changing Cluster identity.
+ * The reference occurrence provides bounded prefix/suffix candidate anchors;
+ * other occurrences align monotonically to those candidates. Only extension
+ * positions repeated by enough successful Episodes become shared evidence.
+ */
+export function extractAnchoredCompletionOverlay(
+  commonCoreId: string,
+  occurrences: readonly AnchoredCompletionOccurrenceCandidateV2[],
+  options: {
+    referenceOccurrenceId?: string;
+    maxPrefixSteps: number;
+    maxSuffixSteps: number;
+    minStepSimilarity: number;
+    minSupportEpisodes: number;
+  }
+): AnchoredCompletionOverlayV2 | undefined {
+  if (!Number.isInteger(options.maxPrefixSteps) || options.maxPrefixSteps < 0 ||
+      !Number.isInteger(options.maxSuffixSteps) || options.maxSuffixSteps < 0) {
+    throw new Error("anchored completion expansion budgets must be non-negative integers");
+  }
+  if (!(options.minStepSimilarity > 0 && options.minStepSimilarity <= 1)) {
+    throw new Error("anchored completion minStepSimilarity must be in (0, 1]");
+  }
+  if (!Number.isInteger(options.minSupportEpisodes) || options.minSupportEpisodes < 2) {
+    throw new Error("anchored completion minSupportEpisodes must be >= 2");
+  }
+  const ordered = occurrences.map((item) => ({
+    ...item,
+    prefix: options.maxPrefixSteps === 0
+      ? []
+      : item.prefix.slice(-options.maxPrefixSteps),
+    suffix: item.suffix.slice(0, options.maxSuffixSteps)
+  })).sort((left, right) =>
+    left.episodeId.localeCompare(right.episodeId) ||
+    left.occurrenceId.localeCompare(right.occurrenceId));
+  const supports = ordered.filter((item) => item.evidenceRole === "support");
+  if (supports.length < options.minSupportEpisodes) return undefined;
+  const reference = supports.find((item) =>
+    item.occurrenceId === options.referenceOccurrenceId) ?? supports[0]!;
+  const prefix = projectCompletionSide(
+    "prefix",
+    reference,
+    ordered,
+    options.minStepSimilarity,
+    options.minSupportEpisodes
+  );
+  const suffix = projectCompletionSide(
+    "suffix",
+    reference,
+    ordered,
+    options.minStepSimilarity,
+    options.minSupportEpisodes
+  );
+  const projections = ordered.map((occurrence) => ({
+    occurrenceId: occurrence.occurrenceId,
+    prefix: prefix.projections.get(occurrence.occurrenceId) ?? [],
+    suffix: suffix.projections.get(occurrence.occurrenceId) ?? []
+  }));
+  const referenceCandidateCount = reference.prefix.length + reference.suffix.length;
+  const sharedCount = prefix.anchors.length + suffix.anchors.length;
+  const extensionAgreement = referenceCandidateCount === 0
+    ? 1
+    : sharedCount / referenceCandidateCount;
+  const identity = {
+    version: ANCHORED_COMPLETION_SCHEMA_VERSION,
+    commonCoreId,
+    referenceOccurrenceId: reference.occurrenceId,
+    maxPrefixSteps: options.maxPrefixSteps,
+    maxSuffixSteps: options.maxSuffixSteps,
+    minStepSimilarity: options.minStepSimilarity,
+    minSupportEpisodes: options.minSupportEpisodes,
+    sharedPrefix: prefix.anchors,
+    sharedSuffix: suffix.anchors,
+    projections
+  };
+  return {
+    id: `anchored_completion_${stableHash(identity).slice(0, 24)}`,
+    schemaVersion: ANCHORED_COMPLETION_SCHEMA_VERSION,
+    commonCoreId,
+    referenceOccurrenceId: reference.occurrenceId,
+    maxPrefixSteps: options.maxPrefixSteps,
+    maxSuffixSteps: options.maxSuffixSteps,
+    minStepSimilarity: options.minStepSimilarity,
+    minSupportEpisodes: options.minSupportEpisodes,
+    sharedPrefix: prefix.anchors,
+    sharedSuffix: suffix.anchors,
+    projections,
+    extensionAgreement
+  };
 }
 
 export function proceduralEvidenceRoleForReward(
@@ -676,6 +820,164 @@ export function extractAlignedCommonCore(
     supportEpisodeIds: projectedSupportEpisodeIds,
     spanOccurrences
   };
+}
+
+function projectCompletionSide(
+  side: "prefix" | "suffix",
+  reference: AnchoredCompletionOccurrenceCandidateV2,
+  occurrences: readonly AnchoredCompletionOccurrenceCandidateV2[],
+  minStepSimilarity: number,
+  minSupportEpisodes: number
+): {
+  anchors: SharedExtensionAnchorV2[];
+  projections: Map<string, CompletionStepProjectionV2[]>;
+} {
+  const referenceSteps = reference[side];
+  const matches = new Map<string, ReturnType<typeof monotonicExtensionPairs>>();
+  for (const occurrence of occurrences) {
+    matches.set(occurrence.occurrenceId,
+      occurrence.occurrenceId === reference.occurrenceId
+        ? referenceSteps.map((_, index) => ({
+            leftIndex: index,
+            rightIndex: index,
+            similarity: 1
+          }))
+        : monotonicExtensionPairs(
+            occurrence[side].map((item) => item.vector),
+            referenceSteps.map((item) => item.vector),
+            minStepSimilarity
+          ));
+  }
+  const evidenceByReferenceOffset = new Map<number, Map<string, {
+    stepId: string;
+    similarity: number;
+  }>>();
+  for (const occurrence of occurrences) {
+    if (occurrence.evidenceRole !== "support") continue;
+    for (const pair of matches.get(occurrence.occurrenceId) ?? []) {
+      const step = occurrence[side][pair.leftIndex];
+      if (!step) continue;
+      const byEpisode = evidenceByReferenceOffset.get(pair.rightIndex) ?? new Map();
+      const previous = byEpisode.get(occurrence.episodeId);
+      if (!previous || pair.similarity > previous.similarity) {
+        byEpisode.set(occurrence.episodeId, {
+          stepId: step.stepId,
+          similarity: pair.similarity
+        });
+      }
+      evidenceByReferenceOffset.set(pair.rightIndex, byEpisode);
+    }
+  }
+  const anchors = [...evidenceByReferenceOffset.entries()]
+    .filter(([, byEpisode]) => byEpisode.size >= minSupportEpisodes)
+    .sort(([left], [right]) => left - right)
+    .map(([referenceOffset, byEpisode]) => {
+      const evidence = [...byEpisode.entries()].sort(([left], [right]) =>
+        left.localeCompare(right));
+      return {
+        anchorId: `extension_${side}_${referenceOffset}`,
+        side,
+        referenceOffset,
+        referenceStepId: referenceSteps[referenceOffset]!.stepId,
+        supportEpisodeIds: evidence.map(([episodeId]) => episodeId),
+        evidenceStepIds: evidence.map(([, item]) => item.stepId),
+        averageMatchSimilarity: average(evidence.map(([, item]) => item.similarity))
+      } satisfies SharedExtensionAnchorV2;
+    });
+  const anchorByOffset = new Map(anchors.map((anchor) => [
+    anchor.referenceOffset,
+    anchor
+  ]));
+  const projections = new Map<string, CompletionStepProjectionV2[]>();
+  for (const occurrence of occurrences) {
+    const sharedByStepIndex = new Map<number, {
+      anchor: SharedExtensionAnchorV2;
+      similarity: number;
+    }>();
+    for (const pair of matches.get(occurrence.occurrenceId) ?? []) {
+      const anchor = anchorByOffset.get(pair.rightIndex);
+      if (anchor) sharedByStepIndex.set(pair.leftIndex, {
+        anchor,
+        similarity: pair.similarity
+      });
+    }
+    projections.set(occurrence.occurrenceId, occurrence[side].map((step, index) => {
+      const shared = sharedByStepIndex.get(index);
+      return shared
+        ? {
+            stepId: step.stepId,
+            role: "shared_extension",
+            extensionAnchorId: shared.anchor.anchorId,
+            matchSimilarity: shared.similarity
+          }
+        : { stepId: step.stepId, role: "local_context" };
+    }));
+  }
+  return { anchors, projections };
+}
+
+function monotonicExtensionPairs(
+  left: readonly (readonly number[])[],
+  right: readonly (readonly number[])[],
+  minStepSimilarity: number
+): Array<{ leftIndex: number; rightIndex: number; similarity: number }> {
+  const scores = Array.from({ length: left.length + 1 }, () =>
+    Array.from({ length: right.length + 1 }, () => 0));
+  const operations = Array.from({ length: left.length + 1 }, () =>
+    Array.from({ length: right.length + 1 }, () => "start" as
+      "start" | "match" | "skip_left" | "skip_right"));
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      const candidates: Array<{
+        score: number;
+        operation: "match" | "skip_left" | "skip_right";
+        priority: number;
+      }> = [
+        {
+          score: scores[leftIndex - 1]![rightIndex]!,
+          operation: "skip_left",
+          priority: 1
+        },
+        {
+          score: scores[leftIndex]![rightIndex - 1]!,
+          operation: "skip_right",
+          priority: 0
+        }
+      ];
+      const similarity = cosineSimilarity(left[leftIndex - 1]!, right[rightIndex - 1]!);
+      if (similarity >= minStepSimilarity) {
+        candidates.push({
+          score: scores[leftIndex - 1]![rightIndex - 1]! + similarity,
+          operation: "match",
+          priority: 2
+        });
+      }
+      const selected = candidates.sort((a, b) =>
+        b.score - a.score || b.priority - a.priority)[0]!;
+      scores[leftIndex]![rightIndex] = selected.score;
+      operations[leftIndex]![rightIndex] = selected.operation;
+    }
+  }
+  const pairs: Array<{ leftIndex: number; rightIndex: number; similarity: number }> = [];
+  let leftIndex = left.length;
+  let rightIndex = right.length;
+  while (leftIndex > 0 && rightIndex > 0) {
+    const operation = operations[leftIndex]![rightIndex]!;
+    if (operation === "match") {
+      pairs.push({
+        leftIndex: leftIndex - 1,
+        rightIndex: rightIndex - 1,
+        similarity: cosineSimilarity(left[leftIndex - 1]!, right[rightIndex - 1]!)
+      });
+      leftIndex -= 1;
+      rightIndex -= 1;
+    } else if (operation === "skip_left") {
+      leftIndex -= 1;
+    } else {
+      rightIndex -= 1;
+    }
+  }
+  return pairs.reverse();
 }
 
 interface InternalFineCluster {

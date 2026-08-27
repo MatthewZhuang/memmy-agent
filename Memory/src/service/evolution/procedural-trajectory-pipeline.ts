@@ -32,19 +32,23 @@ import {
   type ProceduralPatternSkillInput,
   type ProceduralSkillAlignedSequenceStep,
   type ProceduralSkillEvidenceOccurrence,
-  type ProceduralSkillEvidenceStep
+  type ProceduralSkillEvidenceStep,
+  type ProceduralSkillExpansionStep
 } from "./procedural-pattern-skill.js";
 import {
+  ANCHORED_COMPLETION_SCHEMA_VERSION,
   PROCEDURAL_WINDOW_MECHANICAL_VERSION,
   PROCEDURAL_WINDOW_MINING_VERSION,
   buildExclusiveFineClusters,
   buildTrajectoryWindows,
+  extractAnchoredCompletionOverlay,
   extractAlignedCommonCore,
   fineEvidenceSignature,
   selectConstrainedRealMedoid,
   selectMaximalWindowClusters,
   unitVector,
   type AlignedCommonCoreV1,
+  type AnchoredCompletionOccurrenceCandidateV2,
   type EmbeddedTrajectoryWindowV1,
   type EpisodeExecutionPathLiteV1,
   type ExecutionStepLiteV1,
@@ -108,6 +112,11 @@ interface PipelineConfig {
   fineConfigByScale: Map<number, BandedMonotonicMatchConfig>;
   minSupportEpisodes: number;
   medoidSwitchMargin: number;
+  completionExpansionEnabled: boolean;
+  maxPrefixExpansionSteps: number;
+  maxSuffixExpansionSteps: number;
+  minExtensionStepSimilarity: number;
+  skillCompletionConfigHash: string;
 }
 
 interface ClusterSnapshot {
@@ -477,6 +486,7 @@ export class ProceduralTrajectoryPipeline {
       return;
     }
     const config = this.pipelineConfig();
+    const inductionVersion = this.skillInductionVersion(config);
     if (head.algorithmVersion !== config.algorithmVersion ||
         head.configHash !== config.clusteringConfigHash) {
       return;
@@ -549,7 +559,7 @@ export class ProceduralTrajectoryPipeline {
         skillMemoryId: upsert.memory.id,
         payload: {
           admitted: true,
-          inductionVersion: PROCEDURAL_PATTERN_SKILL_PROMPT_VERSION,
+          inductionVersion,
           commonCoreId: snapshot.core!.id,
           patternHash: input.patternHash,
           supportEpisodeIds: input.supportEpisodeIds,
@@ -634,6 +644,27 @@ export class ProceduralTrajectoryPipeline {
       medoidSwitchMargin: procedural.medoidSwitchMargin,
       minSupportEpisodes
     });
+    const completionExpansionEnabled = procedural.completionExpansionEnabled;
+    const maxPrefixExpansionSteps = Math.max(
+      0,
+      Math.floor(procedural.maxPrefixExpansionSteps)
+    );
+    const maxSuffixExpansionSteps = Math.max(
+      0,
+      Math.floor(procedural.maxSuffixExpansionSteps)
+    );
+    const minExtensionStepSimilarity = Math.min(
+      1,
+      Math.max(0.01, procedural.minExtensionStepSimilarity)
+    );
+    const skillCompletionConfigHash = stableHash({
+      version: ANCHORED_COMPLETION_SCHEMA_VERSION,
+      completionExpansionEnabled,
+      maxPrefixExpansionSteps,
+      maxSuffixExpansionSteps,
+      minExtensionStepSimilarity,
+      minSupportEpisodes
+    });
     return {
       algorithmVersion: PROCEDURAL_WINDOW_MINING_VERSION,
       mechanicalWindowHash,
@@ -655,8 +686,17 @@ export class ProceduralTrajectoryPipeline {
         minAlignmentScore: scale.minAlignmentScore
       }])),
       minSupportEpisodes,
-      medoidSwitchMargin: procedural.medoidSwitchMargin
+      medoidSwitchMargin: procedural.medoidSwitchMargin,
+      completionExpansionEnabled,
+      maxPrefixExpansionSteps,
+      maxSuffixExpansionSteps,
+      minExtensionStepSimilarity,
+      skillCompletionConfigHash
     };
+  }
+
+  private skillInductionVersion(config: PipelineConfig): string {
+    return `${PROCEDURAL_PATTERN_SKILL_PROMPT_VERSION}:${config.skillCompletionConfigHash}`;
   }
 
   private enqueueWindowIngest(
@@ -1289,7 +1329,8 @@ export class ProceduralTrajectoryPipeline {
       }
       if (this.activeSkillDecisionMatchesClusterVersion(
         snapshot.head,
-        snapshot.version.id
+        snapshot.version.id,
+        config
       )) continue;
       this.deps.enqueueJob({
         jobType: "procedural_skill_induction",
@@ -1301,7 +1342,7 @@ export class ProceduralTrajectoryPipeline {
           clusterId: snapshot.head.id,
           clusterVersionId: snapshot.version.id,
           membershipVersion: snapshot.version.versionNo,
-          inductionVersion: PROCEDURAL_PATTERN_SKILL_PROMPT_VERSION,
+          inductionVersion: this.skillInductionVersion(config),
           commonCoreId: snapshot.core!.id
         },
         createdAt: at
@@ -1357,10 +1398,24 @@ export class ProceduralTrajectoryPipeline {
       member
     ]));
     const pathById = new Map<string, EpisodeExecutionPathLiteV1>();
-    const evidence: ProceduralSkillEvidenceOccurrence[] = core.spanOccurrences.flatMap((span) => {
+    const vectorByPathId = new Map<string, Map<string, number[]>>();
+    const drafts: Array<{
+      span: AlignedCommonCoreV1["spanOccurrences"][number];
+      path: EpisodeExecutionPathLiteV1;
+      member: TrajectoryWindowClusterMemberV1;
+      alignedSequence: ProceduralSkillAlignedSequenceStep[];
+      prefixSteps: ExecutionStepLiteV1[];
+      suffixSteps: ExecutionStepLiteV1[];
+      corePreviousStep?: ExecutionStepLiteV1;
+      coreNextStep?: ExecutionStepLiteV1;
+      expandedPreviousStep?: ExecutionStepLiteV1;
+      expandedNextStep?: ExecutionStepLiteV1;
+      coreTraceSteps: ExecutionStepLiteV1[];
+    }> = [];
+    for (const span of core.spanOccurrences) {
       const path = pathById.get(span.pathId) ??
         this.deps.repos.proceduralTrajectory.getPath(span.pathId)?.path;
-      if (!path) return [];
+      if (!path) continue;
       pathById.set(span.pathId, path);
       const stepById = new Map(path.steps.map((step) => [step.id, step]));
       const matchedSteps = span.matchedStepIds
@@ -1370,9 +1425,9 @@ export class ProceduralTrajectoryPipeline {
         .map((stepId) => stepById.get(stepId))
         .filter(isDefined);
       if (matchedSteps.length !== span.matchedStepIds.length ||
-          gapSteps.length !== span.gapStepIds.length) return [];
+          gapSteps.length !== span.gapStepIds.length) continue;
       const member = memberByWindowId.get(span.sourceWindowOccurrenceId);
-      if (!member) return [];
+      if (!member) continue;
       const coreMetaByStepId = new Map<string, {
         anchorId: string;
         matchSimilarity: number;
@@ -1381,18 +1436,19 @@ export class ProceduralTrajectoryPipeline {
         const anchorIndex = anchorIndexByOffset.get(pair.rightIndex);
         if (anchorIndex === undefined) continue;
         const step = member.occurrence.steps[pair.leftIndex];
-        if (!step) return [];
+        if (!step) continue;
         coreMetaByStepId.set(step.id, {
           anchorId: commonCore[anchorIndex]!.anchorId,
           matchSimilarity: pair.similarity
         });
       }
-      if (matchedSteps.some((step) => !coreMetaByStepId.has(step.id))) return [];
+      if (matchedSteps.some((step) => !coreMetaByStepId.has(step.id))) continue;
       const gapStepIds = new Set(gapSteps.map((step) => step.id));
       const orderedSteps = [...matchedSteps, ...gapSteps]
         .sort((left, right) => left.stepIndex - right.stepIndex ||
           left.id.localeCompare(right.id));
       const alignedSequence: ProceduralSkillAlignedSequenceStep[] = [];
+      let invalidSequence = false;
       for (let index = 0; index < orderedSteps.length; index += 1) {
         const step = orderedSteps[index]!;
         const common = coreMetaByStepId.get(step.id);
@@ -1405,12 +1461,18 @@ export class ProceduralTrajectoryPipeline {
           });
           continue;
         }
-        if (!gapStepIds.has(step.id)) return [];
+        if (!gapStepIds.has(step.id)) {
+          invalidSequence = true;
+          break;
+        }
         const previous = [...alignedSequence].reverse().find((item) => item.role === "core");
         const nextStep = orderedSteps.slice(index + 1).find((item) =>
           coreMetaByStepId.has(item.id));
         const next = nextStep ? coreMetaByStepId.get(nextStep.id) : undefined;
-        if (!previous || previous.role !== "core" || !next) return [];
+        if (!previous || previous.role !== "core" || !next) {
+          invalidSequence = true;
+          break;
+        }
         alignedSequence.push({
           role: "gap",
           afterAnchorId: previous.anchorId,
@@ -1418,28 +1480,194 @@ export class ProceduralTrajectoryPipeline {
           ...skillEvidenceStep(step)
         });
       }
+      if (invalidSequence) continue;
+      const pathSteps = [...path.steps]
+        .sort((left, right) => left.stepIndex - right.stepIndex ||
+          left.id.localeCompare(right.id));
       const windowSteps = [...member.occurrence.steps]
         .sort((left, right) => left.stepIndex - right.stepIndex ||
           left.id.localeCompare(right.id));
-      const previousStep = [...windowSteps].reverse().find((step) =>
+      const corePreviousStep = [...windowSteps].reverse().find((step) =>
         step.stepIndex < span.startStepIndex);
-      const nextStep = windowSteps.find((step) => step.stepIndex > span.endStepIndex);
+      const coreNextStep = windowSteps.find((step) =>
+        step.stepIndex > span.endStepIndex);
+      const prefixBudget = config.completionExpansionEnabled
+        ? config.maxPrefixExpansionSteps
+        : 0;
+      const suffixBudget = config.completionExpansionEnabled
+        ? config.maxSuffixExpansionSteps
+        : 0;
+      const prefixSteps = prefixBudget === 0
+        ? []
+        : pathSteps
+          .filter((step) => step.stepIndex < span.startStepIndex)
+          .slice(-prefixBudget);
+      const suffixSteps = pathSteps
+        .filter((step) => step.stepIndex > span.endStepIndex)
+        .slice(0, suffixBudget);
+      const expandedStart = prefixSteps[0]?.stepIndex ?? span.startStepIndex;
+      const expandedEnd = suffixSteps.at(-1)?.stepIndex ?? span.endStepIndex;
+      const expandedPreviousStep = [...pathSteps].reverse().find((step) =>
+        step.stepIndex < expandedStart);
+      const expandedNextStep = pathSteps.find((step) => step.stepIndex > expandedEnd);
       const positive = positiveSpanOccurrenceIds.has(span.id);
       const readOnlyCounterexample = span.evidenceRole === "counterexample" ||
         matchedSteps.some((step) => step.outcome === "failure");
-      if (!positive && !readOnlyCounterexample) return [];
-      const sourceTraceIds = this.sourceTraceIdsForSteps(span.episodeId, orderedSteps);
-      return [{
-        occurrenceId: span.id,
-        episodeId: span.episodeId,
-        pathId: span.pathId,
-        scale: span.scale,
-        alignmentScore: span.averageMatchSimilarity,
-        sourceTraceIds,
+      if (!positive && !readOnlyCounterexample) continue;
+      drafts.push({
+        span,
+        path,
+        member,
         alignedSequence,
+        prefixSteps,
+        suffixSteps,
+        ...(corePreviousStep ? { corePreviousStep } : {}),
+        ...(coreNextStep ? { coreNextStep } : {}),
+        ...(expandedPreviousStep ? { expandedPreviousStep } : {}),
+        ...(expandedNextStep ? { expandedNextStep } : {}),
+        coreTraceSteps: orderedSteps
+      });
+    }
+    const completionCandidates: AnchoredCompletionOccurrenceCandidateV2[] = [];
+    for (const draft of drafts) {
+      let vectorByStepId = vectorByPathId.get(draft.path.id);
+      if (!vectorByStepId) {
+        vectorByStepId = new Map(this.deps.repos.proceduralTrajectory
+          .listStepEmbeddings({
+            pathId: draft.path.id,
+            representationVersion: STEP_INTENT_REPRESENTATION_VERSION,
+            embeddingSignature: this.embeddingSignature()
+          }).map((item) => [item.stepId, item.vector]));
+        vectorByPathId.set(draft.path.id, vectorByStepId);
+      }
+      const prefix = draft.prefixSteps.flatMap((step) => {
+        const vector = vectorByStepId!.get(step.id);
+        return vector ? [{ stepId: step.id, vector }] : [];
+      });
+      const suffix = draft.suffixSteps.flatMap((step) => {
+        const vector = vectorByStepId!.get(step.id);
+        return vector ? [{ stepId: step.id, vector }] : [];
+      });
+      if (prefix.length !== draft.prefixSteps.length ||
+          suffix.length !== draft.suffixSteps.length) continue;
+      completionCandidates.push({
+        occurrenceId: draft.span.id,
+        episodeId: draft.span.episodeId,
+        evidenceRole: draft.span.evidenceRole,
+        prefix,
+        suffix
+      });
+    }
+    if (completionCandidates.length !== drafts.length) return undefined;
+    const referenceOccurrenceId = drafts.find((draft) =>
+      draft.span.sourceWindowOccurrenceId === core.medoidOccurrenceId &&
+      draft.span.evidenceRole === "support")?.span.id;
+    const completionOverlay = extractAnchoredCompletionOverlay(
+      core.id,
+      completionCandidates,
+      {
+        ...(referenceOccurrenceId ? { referenceOccurrenceId } : {}),
+        maxPrefixSteps: config.completionExpansionEnabled
+          ? config.maxPrefixExpansionSteps
+          : 0,
+        maxSuffixSteps: config.completionExpansionEnabled
+          ? config.maxSuffixExpansionSteps
+          : 0,
+        minStepSimilarity: config.minExtensionStepSimilarity,
+        minSupportEpisodes: config.minSupportEpisodes
+      }
+    );
+    if (!completionOverlay) return undefined;
+    const completionActivated = completionOverlay.sharedPrefix.length > 0 ||
+      completionOverlay.sharedSuffix.length > 0;
+    const effectiveCompletionOverlay = completionActivated
+      ? completionOverlay
+      : {
+          ...completionOverlay,
+          id: `anchored_completion_${stableHash({
+            version: ANCHORED_COMPLETION_SCHEMA_VERSION,
+            mode: "core_only",
+            commonCoreId: core.id,
+            referenceOccurrenceId: completionOverlay.referenceOccurrenceId
+          }).slice(0, 24)}`,
+          maxPrefixSteps: 0,
+          maxSuffixSteps: 0,
+          sharedPrefix: [],
+          sharedSuffix: [],
+          projections: completionOverlay.projections.map((item) => ({
+            occurrenceId: item.occurrenceId,
+            prefix: [],
+            suffix: []
+          })),
+          extensionAgreement: 0
+        };
+    const projectionByOccurrenceId = new Map(
+      effectiveCompletionOverlay.projections.map((item) => [
+      item.occurrenceId,
+      item
+    ]));
+    const evidence: ProceduralSkillEvidenceOccurrence[] = drafts.flatMap((draft) => {
+      const projection = projectionByOccurrenceId.get(draft.span.id);
+      const effectivePrefixSteps = completionActivated ? draft.prefixSteps : [];
+      const effectiveSuffixSteps = completionActivated ? draft.suffixSteps : [];
+      if (!projection || projection.prefix.length !== effectivePrefixSteps.length ||
+          projection.suffix.length !== effectiveSuffixSteps.length) return [];
+      const expansionSteps = (
+        steps: ExecutionStepLiteV1[],
+        projected: typeof projection.prefix,
+        side: "prefix" | "suffix"
+      ): ProceduralSkillExpansionStep[] => steps.map((step, index) => {
+        const item = projected[index]!;
+        return {
+          role: item.role,
+          side,
+          ...(item.extensionAnchorId
+            ? { extensionAnchorId: item.extensionAnchorId }
+            : {}),
+          ...(item.matchSimilarity === undefined
+            ? {}
+            : { matchSimilarity: item.matchSimilarity }),
+          ...skillEvidenceStep(step)
+        };
+      });
+      return [{
+        occurrenceId: draft.span.id,
+        episodeId: draft.span.episodeId,
+        pathId: draft.span.pathId,
+        scale: draft.span.scale,
+        alignmentScore: draft.span.averageMatchSimilarity,
+        sourceTraceIds: this.sourceTraceIdsForSteps(
+          draft.span.episodeId,
+          completionActivated
+            ? [...draft.prefixSteps, ...draft.coreTraceSteps, ...draft.suffixSteps]
+            : draft.coreTraceSteps
+        ),
+        prefixExpansion: expansionSteps(
+          effectivePrefixSteps,
+          projection.prefix,
+          "prefix"
+        ),
+        alignedSequence: draft.alignedSequence,
+        suffixExpansion: expansionSteps(
+          effectiveSuffixSteps,
+          projection.suffix,
+          "suffix"
+        ),
         boundaryContextReadOnly: {
-          ...(previousStep ? { previousStep: skillEvidenceStep(previousStep) } : {}),
-          ...(nextStep ? { nextStep: skillEvidenceStep(nextStep) } : {})
+          ...((completionActivated
+            ? draft.expandedPreviousStep
+            : draft.corePreviousStep)
+            ? { previousStep: skillEvidenceStep((completionActivated
+                ? draft.expandedPreviousStep
+                : draft.corePreviousStep)!) }
+            : {}),
+          ...((completionActivated
+            ? draft.expandedNextStep
+            : draft.coreNextStep)
+            ? { nextStep: skillEvidenceStep((completionActivated
+                ? draft.expandedNextStep
+                : draft.coreNextStep)!) }
+            : {})
         }
       }];
     });
@@ -1450,7 +1678,9 @@ export class ProceduralTrajectoryPipeline {
     const patternHash = stableHash({
       algorithmVersion: config.algorithmVersion,
       clusterVersionId: snapshot.version.id,
-      commonCore: core
+      commonCore: core,
+      completion: effectiveCompletionOverlay,
+      skillCompletionConfigHash: config.skillCompletionConfigHash
     });
     return {
       patternVersionId: `aligned_core_version_${patternHash.slice(0, 24)}`,
@@ -1458,6 +1688,18 @@ export class ProceduralTrajectoryPipeline {
       clusterVersionId: snapshot.version.id,
       commonCoreId: core.id,
       commonCore,
+      completion: {
+        id: effectiveCompletionOverlay.id,
+        version: effectiveCompletionOverlay.schemaVersion,
+        activated: completionActivated,
+        referenceOccurrenceId: effectiveCompletionOverlay.referenceOccurrenceId,
+        maxPrefixSteps: effectiveCompletionOverlay.maxPrefixSteps,
+        maxSuffixSteps: effectiveCompletionOverlay.maxSuffixSteps,
+        minStepSimilarity: effectiveCompletionOverlay.minStepSimilarity,
+        sharedPrefix: effectiveCompletionOverlay.sharedPrefix,
+        sharedSuffix: effectiveCompletionOverlay.sharedSuffix,
+        extensionAgreement: effectiveCompletionOverlay.extensionAgreement
+      },
       userId: snapshot.head.userId,
       scale: snapshot.head.scale,
       supportEpisodeIds,
@@ -1500,14 +1742,15 @@ export class ProceduralTrajectoryPipeline {
 
   private activeSkillDecisionMatchesClusterVersion(
     head: TrajectoryWindowClusterRecord,
-    clusterVersionId: string
+    clusterVersionId: string,
+    config: PipelineConfig
   ): boolean {
     if (!head.activeSkillVersionId) return false;
     const version = this.deps.repos.proceduralTrajectory.getSkillVersion(
       head.activeSkillVersionId
     );
     if (!version || version.clusterVersionId !== clusterVersionId) return false;
-    if (version.payload.inductionVersion !== PROCEDURAL_PATTERN_SKILL_PROMPT_VERSION) {
+    if (version.payload.inductionVersion !== this.skillInductionVersion(config)) {
       return false;
     }
     if (version.skillMemoryId) return this.activeSkillMatchesClusterVersion(
@@ -1549,6 +1792,7 @@ export class ProceduralTrajectoryPipeline {
     at: string
   ): void {
     if (!version || head.status !== "active" || head.activeVersionId !== version.id) return;
+    const inductionVersion = this.skillInductionVersion(this.pipelineConfig());
     this.deps.repos.transaction(() => {
       const current = this.deps.repos.proceduralTrajectory.getClusterHead(head.id);
       if (!current || current.status !== "active" || current.activeVersionId !== version.id) return;
@@ -1564,7 +1808,7 @@ export class ProceduralTrajectoryPipeline {
         skillKey: proceduralSkillKey(current.userId, current.id),
         payload: {
           admitted: false,
-          inductionVersion: PROCEDURAL_PATTERN_SKILL_PROMPT_VERSION,
+          inductionVersion,
           reason,
           clusterVersionId: version.id,
           supportEpisodeCount: version.supportEpisodeCount
@@ -1572,7 +1816,7 @@ export class ProceduralTrajectoryPipeline {
         contentHash: stableHash({
           admitted: false,
           clusterVersionId: version.id,
-          inductionVersion: PROCEDURAL_PATTERN_SKILL_PROMPT_VERSION,
+          inductionVersion,
           reason
         }),
         createdAt: at

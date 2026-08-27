@@ -10,6 +10,7 @@ import {
   V15_WINDOW_SPECS,
   buildTrajectoryWindows,
   clusterTrajectoryWindows,
+  extractAnchoredCompletionOverlay,
   extractAlignedCommonCore,
   fineEvidenceSignature,
   ingestWindowIntoCoarseFamilies,
@@ -318,6 +319,84 @@ describe("procedural multi-scale windows", () => {
     expect(projected?.gapStepIds).toEqual([shifted.steps[2]!.id]);
     expect(core?.spanOccurrences.find((span) => span.episodeId === "episode-negative")
       ?.evidenceRole).toBe("counterexample");
+  });
+
+  it("projects only repeated outward Steps as shared completion evidence", () => {
+    const overlay = extractAnchoredCompletionOverlay("core-1", [
+      {
+        occurrenceId: "occ-a",
+        episodeId: "episode-a",
+        evidenceRole: "support",
+        prefix: [
+          { stepId: "a-prefix-shared", vector: [1, 0, 0] },
+          { stepId: "a-prefix-local", vector: [0, 1, 0] }
+        ],
+        suffix: [{ stepId: "a-suffix-shared", vector: [0, 0, 1] }]
+      },
+      {
+        occurrenceId: "occ-b",
+        episodeId: "episode-b",
+        evidenceRole: "support",
+        prefix: [
+          { stepId: "b-prefix-shared", vector: [1, 0, 0] },
+          { stepId: "b-prefix-local", vector: [0.5, 0.5, 0] }
+        ],
+        suffix: [{ stepId: "b-suffix-shared", vector: [0, 0, 1] }]
+      }
+    ], {
+      referenceOccurrenceId: "occ-a",
+      maxPrefixSteps: 2,
+      maxSuffixSteps: 1,
+      minStepSimilarity: 0.8,
+      minSupportEpisodes: 2
+    });
+
+    expect(overlay?.sharedPrefix).toHaveLength(1);
+    expect(overlay?.sharedSuffix).toHaveLength(1);
+    expect(overlay?.sharedPrefix[0]).toMatchObject({
+      referenceStepId: "a-prefix-shared",
+      supportEpisodeIds: ["episode-a", "episode-b"],
+      evidenceStepIds: ["a-prefix-shared", "b-prefix-shared"]
+    });
+    expect(overlay?.projections.find((item) => item.occurrenceId === "occ-a")?.prefix)
+      .toEqual([
+        expect.objectContaining({ stepId: "a-prefix-shared", role: "shared_extension" }),
+        { stepId: "a-prefix-local", role: "local_context" }
+      ]);
+    expect(overlay?.projections.find((item) => item.occurrenceId === "occ-b")?.prefix)
+      .toEqual([
+        expect.objectContaining({ stepId: "b-prefix-shared", role: "shared_extension" }),
+        { stepId: "b-prefix-local", role: "local_context" }
+      ]);
+  });
+
+  it("treats zero expansion budget as an empty overlay", () => {
+    const overlay = extractAnchoredCompletionOverlay("core-1", [
+      {
+        occurrenceId: "occ-a",
+        episodeId: "episode-a",
+        evidenceRole: "support",
+        prefix: [{ stepId: "a-prefix", vector: [1, 0] }],
+        suffix: [{ stepId: "a-suffix", vector: [0, 1] }]
+      },
+      {
+        occurrenceId: "occ-b",
+        episodeId: "episode-b",
+        evidenceRole: "support",
+        prefix: [{ stepId: "b-prefix", vector: [1, 0] }],
+        suffix: [{ stepId: "b-suffix", vector: [0, 1] }]
+      }
+    ], {
+      maxPrefixSteps: 0,
+      maxSuffixSteps: 0,
+      minStepSimilarity: 0.7,
+      minSupportEpisodes: 2
+    });
+
+    expect(overlay?.sharedPrefix).toEqual([]);
+    expect(overlay?.sharedSuffix).toEqual([]);
+    expect(overlay?.projections.every((item) =>
+      item.prefix.length === 0 && item.suffix.length === 0)).toBe(true);
   });
 });
 

@@ -351,7 +351,7 @@ function atomicityLlm(input: {
           }))
         } as unknown as T;
       }
-      if (options.operation === "procedural.procedural-pattern-skill.v2") {
+      if (options.operation === "procedural.procedural-pattern-skill.v3") {
         const payload = JSON.parse(content) as {
           occurrences?: Array<{ occurrence_id: string }>;
         };

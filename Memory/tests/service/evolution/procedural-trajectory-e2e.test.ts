@@ -147,6 +147,11 @@ describe("procedural trajectory direct Skill E2E", () => {
     expect(skillMetaFromMemory(skillMemory!)?.sourcePolicyIds).toEqual([]);
     expect(skillMemory?.properties.internal_info.plugin_algorithm)
       .toBe("procedural.pattern.skill.v1");
+    expect(skillMemory?.properties.internal_info.completion_activated).toBe(false);
+    expect(skillMemory?.properties.internal_info.completion_shared_prefix_anchor_ids)
+      .toEqual([]);
+    expect(skillMemory?.properties.internal_info.completion_shared_suffix_anchor_ids)
+      .toEqual([]);
     expect(service.listSkills({ userId: USER_ID }).items.map((item) => item.id))
       .toContain(skillMemoryId);
     expect(service.getSkill(skillMemoryId!, { namespace: first.namespace })).toMatchObject({
@@ -154,7 +159,7 @@ describe("procedural trajectory direct Skill E2E", () => {
       sourcePolicyIds: []
     });
     expect(operations.filter(isStepSemanticsOperation)).toHaveLength(2);
-    expect(operations).toContain("procedural.procedural-pattern-skill.v2");
+    expect(operations).toContain("procedural.procedural-pattern-skill.v3");
 
     const familyBeforeDrift = db.db.prepare(
       `SELECT id, active_revision_id AS activeRevisionId
@@ -362,7 +367,7 @@ describe("procedural trajectory direct Skill E2E", () => {
     expect(repos.proceduralTrajectory.listFamilyMembers(familyXAfter.activeRevisionId)
       .map((member) => member.episodeId)).toContain(localX.episodeId);
     expect(operations.filter((operation) =>
-      operation === "procedural.procedural-pattern-skill.v2")).toHaveLength(0);
+      operation === "procedural.procedural-pattern-skill.v3")).toHaveLength(0);
 
     const sharedA = await executeSuccessfulEpisode(service, "codex", "shared-a", "z");
     await runWorkerRounds(service, 16);
@@ -404,7 +409,7 @@ describe("procedural trajectory direct Skill E2E", () => {
     const sharedCluster = repos.proceduralTrajectory.getClusterHead(sharedClusters[0]!.id)!;
     expect(sharedCluster.activeSkillMemoryId).toBeTruthy();
     expect(operations.filter((operation) =>
-      operation === "procedural.procedural-pattern-skill.v2")).toHaveLength(1);
+      operation === "procedural.procedural-pattern-skill.v3")).toHaveLength(1);
     expect(service.listSkills({ userId: USER_ID }).items.map((item) => item.id))
       .toEqual([sharedCluster.activeSkillMemoryId]);
   });
@@ -581,7 +586,7 @@ function proceduralE2eLlm(
           }))
         } as unknown as T;
       }
-      if (options.operation === "procedural.procedural-pattern-skill.v2") {
+      if (options.operation === "procedural.procedural-pattern-skill.v3") {
         const payload = JSON.parse(content) as {
           occurrences?: Array<{ occurrence_id: string }>;
         };

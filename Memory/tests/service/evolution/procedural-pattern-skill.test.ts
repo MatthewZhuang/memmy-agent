@@ -33,6 +33,18 @@ describe("procedural pattern Skill compatibility", () => {
     expect(meta?.evidenceAnchorIds).toEqual(["trace-a", "trace-b"]);
     expect(saved.properties.internal_info.source_memory_ids).toEqual(["trace-a", "trace-b"]);
     expect(saved.properties.internal_info.source_policy_ids).toEqual([]);
+    expect(saved.properties.internal_info.completion_activated).toBe(false);
+    expect(harness.llmPayloads[0]).toMatchObject({
+      completion: {
+        activated: false,
+        shared_prefix: [],
+        shared_suffix: []
+      },
+      occurrences: expect.arrayContaining([expect.objectContaining({
+        prefix_extension: [],
+        suffix_extension: []
+      })])
+    });
 
     const procedure = saved.properties.internal_info.procedure_json as {
       steps: Array<{
@@ -362,6 +374,118 @@ describe("procedural pattern Skill compatibility", () => {
     expect(result.admitted).toBe(true);
   });
 
+  it("allows a shared outward extension cited by two successful Episodes", async () => {
+    const input = skillInput();
+    input.completion.activated = true;
+    input.completion.sharedSuffix = [{
+      anchorId: "extension_suffix_0",
+      side: "suffix",
+      referenceStepId: "extension-a",
+      supportEpisodeIds: ["episode-a", "episode-b"],
+      evidenceStepIds: ["extension-a", "extension-b"],
+      averageMatchSimilarity: 0.91
+    }];
+    for (const [index, item] of input.evidence.entries()) {
+      item.suffixExpansion.push({
+        role: "shared_extension",
+        side: "suffix",
+        extensionAnchorId: "extension_suffix_0",
+        matchSimilarity: 0.91,
+        stepId: `extension-${index === 0 ? "a" : "b"}`,
+        stepIndex: 3,
+        toolName: "shell",
+        intent: "Inspect the generated artifact content",
+        summary: "The generated artifact content was valid",
+        outcome: "success",
+        evidenceRefs: [`extension-evidence-${index}`]
+      });
+    }
+    const response = validSkillResponse();
+    response.procedure_steps = [{
+      title: "Inspect generated content",
+      body: "Inspect the generated artifact content.",
+      evidence_refs: ["extension-a", "extension-b"]
+    }];
+    const harness = createHarness({ skillResponse: response });
+
+    const result = await harness.induce(input);
+
+    expect(result.admitted).toBe(true);
+    expect(harness.llmPayloads[0]).toMatchObject({
+      completion: {
+        activated: true,
+        shared_suffix: [expect.objectContaining({
+          anchor_id: "extension_suffix_0"
+        })]
+      },
+      occurrences: expect.arrayContaining([expect.objectContaining({
+        suffix_extension: [expect.objectContaining({
+          role: "shared_extension",
+          extension_anchor_id: "extension_suffix_0"
+        })]
+      })])
+    });
+  });
+
+  it("never accepts an occurrence-local outward Step as positive evidence", async () => {
+    const input = skillInput();
+    for (const [index, item] of input.evidence.entries()) {
+      item.prefixExpansion.push({
+        role: "local_context",
+        side: "prefix",
+        stepId: `local-${index}`,
+        stepIndex: -1,
+        toolName: "shell",
+        intent: "Perform occurrence-specific setup",
+        summary: "Local setup completed",
+        outcome: "success",
+        evidenceRefs: [`local-evidence-${index}`]
+      });
+    }
+    const response = validSkillResponse();
+    response.procedure_steps = [{
+      title: "Use local setup",
+      body: "Make occurrence-specific setup mandatory.",
+      evidence_refs: ["local-0", "local-1"]
+    }];
+    const harness = createHarness({ skillResponse: response });
+
+    const result = await harness.induce(input);
+
+    expect(result).toEqual({ admitted: false, reason: "invalid-evidence-citation" });
+  });
+
+  it("rejects a shared extension cited from only one successful Episode", async () => {
+    const input = skillInput();
+    input.evidence[0]!.suffixExpansion.push({
+      role: "shared_extension",
+      side: "suffix",
+      extensionAnchorId: "extension_suffix_0",
+      matchSimilarity: 1,
+      stepId: "extension-a",
+      stepIndex: 3,
+      toolName: "shell",
+      intent: "Inspect generated content",
+      summary: "Generated content was inspected",
+      outcome: "success",
+      evidenceRefs: ["extension-evidence-a"]
+    });
+    const response = validSkillResponse();
+    response.procedure_steps = [{
+      title: "Inspect generated content",
+      body: "Inspect the generated content.",
+      evidence_refs: ["extension-a"]
+    }];
+    const harness = createHarness({ skillResponse: response });
+
+    const result = await harness.induce(input);
+
+    expect(result).toEqual({
+      admitted: false,
+      reason: "insufficient-extension-episode-support"
+    });
+  });
+
   it("never accepts boundary context as positive evidence", async () => {
     const input = skillInput();
     input.evidence[0]!.boundaryContextReadOnly.previousStep = {
@@ -545,6 +669,18 @@ function skillInput(): ProceduralPatternSkillInput {
         evidenceStepIds: ["step-a-verify", "step-b-verify"]
       }
     ],
+    completion: {
+      id: "anchored-completion-1",
+      version: "anchored-completion.v2",
+      activated: false,
+      referenceOccurrenceId: "occ-a",
+      maxPrefixSteps: 3,
+      maxSuffixSteps: 5,
+      minStepSimilarity: 0.7,
+      sharedPrefix: [],
+      sharedSuffix: [],
+      extensionAgreement: 1
+    },
     userId: USER_ID,
     scale: 5,
     supportEpisodeIds: ["episode-a", "episode-b"],
@@ -574,6 +710,7 @@ function occurrence(
     scale: 5,
     alignmentScore: 0.9,
     sourceTraceIds: [episodeId === "episode-a" ? "trace-a" : "trace-b"],
+    prefixExpansion: [],
     alignedSequence: [
       {
         role: "core" as const,
@@ -600,6 +737,7 @@ function occurrence(
         evidenceRefs: [`evidence-${stepId}-verify`]
       }
     ],
+    suffixExpansion: [],
     boundaryContextReadOnly: {}
   };
 }
