@@ -26,7 +26,7 @@ afterEach(() => {
 });
 
 describe("procedural Skill atomic publication", () => {
-  it("never lets a slow obsolete cluster version overwrite the current public Skill", async () => {
+  it("serializes same-user V2 induction and never publishes a slow obsolete version", async () => {
     const firstSkillStarted = deferred<void>();
     const releaseFirstSkill = deferred<void>();
     let skillCalls = 0;
@@ -70,42 +70,165 @@ describe("procedural Skill atomic publication", () => {
     await executeSuccessfulEpisode(service, "codex", "first");
     await runWorkerRounds(service, 16);
     await executeSuccessfulEpisode(service, "cursor", "second");
-    await runUntilQueuedSkill(service, repos);
+    await runUntilRunnableQueuedSkill(service, repos);
 
     const obsoleteRun = service.runWorkerOnce(100);
     await firstSkillStarted.promise;
 
     await executeSuccessfulEpisode(service, "claude", "third");
     await runWorkerRounds(service, 24);
-    expect(skillCalls).toBeGreaterThanOrEqual(2);
-
-    const clusterBeforeRelease = activeSpanFiveCluster(repos);
-    const currentMemoryId = clusterBeforeRelease.activeSkillMemoryId;
-    expect(currentMemoryId).toBeTruthy();
-    const currentMemory = repos.memories.get(currentMemoryId!);
-    expect(currentMemory?.memoryValue).toContain("current");
-    expect(currentMemory?.memoryValue).not.toContain("obsolete");
-    const currentMemoryVersion = currentMemory?.version;
-    const currentContentHash = currentMemory?.contentHash;
-    const currentClusterVersionId = clusterBeforeRelease.activeVersionId;
-    const currentSkillVersionId = clusterBeforeRelease.activeSkillVersionId;
+    expect(skillCalls).toBe(1);
 
     releaseFirstSkill.resolve();
     await obsoleteRun;
+    await runWorkerRounds(service, 24);
+    expect(skillCalls).toBeGreaterThanOrEqual(2);
 
     const clusterAfterRelease = activeSpanFiveCluster(repos);
-    expect(clusterAfterRelease).toMatchObject({
-      activeVersionId: currentClusterVersionId,
-      activeSkillVersionId: currentSkillVersionId,
-      activeSkillMemoryId: currentMemoryId
-    });
-    expect(repos.memories.get(currentMemoryId!)).toMatchObject({
-      version: currentMemoryVersion,
-      contentHash: currentContentHash,
-      memoryValue: currentMemory?.memoryValue
-    });
+    const currentMemoryId = clusterAfterRelease.activeSkillMemoryId;
+    expect(currentMemoryId).toBeTruthy();
+    expect(repos.memories.get(currentMemoryId!)?.memoryValue).toContain("current");
+    expect(repos.memories.get(currentMemoryId!)?.memoryValue).not.toContain("obsolete");
     expect(repos.proceduralTrajectory.listSkillVersions(clusterAfterRelease.id)
       .filter((version) => version.skillMemoryId)).toHaveLength(1);
+  });
+
+  it("keeps the last-known-good V2 Skill live when its replacement fails validation", async () => {
+    let rejectReplacement = false;
+    let skillCalls = 0;
+    const llm = atomicityLlm({
+      async onSkillCall(occurrenceIds) {
+        skillCalls += 1;
+        const response = skillResponse(
+          rejectReplacement ? "rejected-replacement" : "known-good-skill",
+          rejectReplacement ? "rejected" : "known-good",
+          occurrenceIds
+        );
+        if (!rejectReplacement) return response;
+        const procedureSteps = response.procedure_steps as Array<Record<string, unknown>>;
+        return {
+          ...response,
+          procedure_steps: procedureSteps.map((step, index) => index === 0
+            ? { ...step, source_anchor_ids: ["not-an-allowed-evidence-ref"] }
+            : step)
+        };
+      }
+    });
+    const config = {
+      ...DEFAULT_MEMMY_CONFIG,
+      algorithm: {
+        ...DEFAULT_MEMMY_CONFIG.algorithm,
+        negativeExperience: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.negativeExperience,
+          enabled: false
+        },
+        l2Induction: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+          useLlm: false
+        },
+        l3Abstraction: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+          useLlm: false
+        }
+      }
+    };
+    const { db, service } = createTestService({
+      config,
+      llm,
+      skillLlm: llm,
+      embedder: createCapturingEmbedder([])
+    });
+    const repos = new Repositories(db.db);
+
+    await executeSuccessfulEpisode(service, "codex", "known-good-first");
+    await runWorkerRounds(service, 16);
+    const second = await executeSuccessfulEpisode(service, "cursor", "known-good-second");
+    await runWorkerRounds(service, 20);
+
+    const original = activeSpanFiveCluster(repos);
+    const originalClusterVersionId = original.activeVersionId!;
+    const originalSkillVersionId = original.activeSkillVersionId!;
+    const originalSkillMemoryId = original.activeSkillMemoryId!;
+    const originalMemory = repos.memories.get(originalSkillMemoryId)!;
+    expect(originalMemory.status).toBe("resolving");
+
+    rejectReplacement = true;
+    const previousVersion = repos.proceduralTrajectory.getClusterVersion(
+      originalClusterVersionId
+    )!;
+    const previousMembers = repos.proceduralTrajectory.listClusterMembers(
+      originalClusterVersionId
+    );
+    const committedAt = new Date().toISOString();
+    const replacementClusterVersion = repos.proceduralTrajectory.commitClusterVersion({
+      clusterId: original.id,
+      expectedActiveVersionId: originalClusterVersionId,
+      medoidOccurrenceId: previousVersion.medoidOccurrenceId,
+      members: [
+        ...previousMembers.map((member, index) => ({
+          occurrenceId: member.occurrenceId,
+          rewardHash: index === 0
+            ? `${member.rewardHash}:replacement-revision`
+            : member.rewardHash,
+          coarseSimilarity: member.coarseSimilarity,
+          alignment: member.alignment
+        }))
+      ],
+      metrics: previousVersion.metrics,
+      createdAt: committedAt
+    }).record;
+    const inductionVersion = repos.proceduralTrajectory.getSkillVersion(
+      originalSkillVersionId
+    )!.payload.inductionVersion as string;
+    repos.runtime.enqueueJob({
+      id: `job_v2_last_known_good_${replacementClusterVersion.id}`,
+      jobType: "procedural_skill_induction",
+      status: "queued",
+      userId: USER_ID,
+      sessionId: second.sessionId,
+      episodeId: second.episodeId,
+      targetMemoryId: original.id,
+      payload: {
+        clusterId: original.id,
+        clusterVersionId: replacementClusterVersion.id,
+        inductionVersion
+      },
+      attempts: 0,
+      maxAttempts: 1,
+      createdAt: committedAt,
+      updatedAt: committedAt
+    });
+    await runWorkerRounds(service, 12);
+
+    const current = repos.proceduralTrajectory.getClusterHead(original.id)!;
+    expect(current.activeVersionId).not.toBe(originalClusterVersionId);
+    expect(current.activeSkillVersionId).toBe(originalSkillVersionId);
+    expect(current.activeSkillMemoryId).toBe(originalSkillMemoryId);
+    expect(repos.proceduralTrajectory.getSkillVersion(originalSkillVersionId)?.status)
+      .toBe("active");
+    expect(repos.memories.get(originalSkillMemoryId)).toMatchObject({
+      status: "resolving",
+      version: originalMemory.version,
+      contentHash: originalMemory.contentHash
+    });
+
+    const decisions = repos.proceduralTrajectory.listSkillVersions(original.id);
+    expect(decisions).toHaveLength(2);
+    const rejection = decisions.find((version) => !version.skillMemoryId);
+    expect(rejection).toMatchObject({
+      clusterVersionId: current.activeVersionId,
+      status: "superseded"
+    });
+    expect(rejection?.payload).toMatchObject({
+      admitted: false,
+      reason: "invalid-evidence-anchor",
+      preservedActiveSkillVersionId: originalSkillVersionId,
+      preservedActiveSkillMemoryId: originalSkillMemoryId
+    });
+
+    const callsAfterRejectedReplacement = skillCalls;
+    await runWorkerRounds(service, 12);
+    expect(skillCalls).toBe(callsAfterRejectedReplacement);
   });
 
   it("rolls public archival back when rejection head publication fails", async () => {
@@ -197,19 +320,30 @@ describe("procedural Skill atomic publication", () => {
   });
 });
 
-async function runUntilQueuedSkill(
+async function runUntilRunnableQueuedSkill(
   service: ReturnType<typeof createTestService>["service"],
   repos: Repositories
 ): Promise<void> {
   for (let round = 0; round < 30; round += 1) {
-    const queued = repos.db.prepare(
-      `SELECT COUNT(*) AS count FROM evolution_jobs
-       WHERE job_type = 'procedural_skill_induction' AND status = 'queued'`
-    ).get() as { count: number };
-    if (queued.count > 0) return;
+    const state = repos.db.prepare(
+      `SELECT
+         SUM(CASE WHEN job_type = 'procedural_skill_induction' AND status = 'queued'
+                  THEN 1 ELSE 0 END) AS queuedV2,
+         SUM(CASE WHEN job_type IN (
+                    'l2_association',
+                    'l2_induction',
+                    'skill_crystallization',
+                    'long_trajectory_mining',
+                    'long_trajectory_skill_induction'
+                  ) AND status IN ('queued', 'leased', 'failed')
+                  THEN 1 ELSE 0 END) AS blockers
+       FROM evolution_jobs
+       WHERE user_id = ?`
+    ).get(USER_ID) as { queuedV2: number; blockers: number };
+    if (state.queuedV2 > 0 && state.blockers === 0) return;
     await service.runWorkerOnce(1);
   }
-  throw new Error("procedural_skill_induction was not queued");
+  throw new Error("procedural_skill_induction was not runnable");
 }
 
 function activeSpanFiveCluster(repos: Repositories) {
@@ -351,13 +485,44 @@ function atomicityLlm(input: {
           }))
         } as unknown as T;
       }
-      if (options.operation === "procedural.procedural-pattern-skill.v3") {
+      if (options.operation === "procedural.procedural-skill-coverage.v1") {
+        return {
+          decision: "distinct",
+          target_skill_id: null,
+          target_route: null,
+          relation: "distinct",
+          reason: "No existing Skill covers this Draft."
+        } as unknown as T;
+      }
+      if (options.operation === "procedural.procedural-pattern-skill.v12") {
         const payload = JSON.parse(content) as {
-          occurrences?: Array<{ occurrence_id: string }>;
+          evidence_anchor_catalog?: Array<{
+            anchor_id: string;
+            allowed_usage: "mandatory" | "conditional_only";
+            support_episode_ids: string[];
+          }>;
         };
-        return await input.onSkillCall(
-          (payload.occurrences ?? []).map((item) => item.occurrence_id)
-        ) as T;
+        const mandatoryAnchors = (payload.evidence_anchor_catalog ?? [])
+          .filter((anchor) => anchor.allowed_usage === "mandatory" &&
+            anchor.support_episode_ids.length >= 2);
+        const response = await input.onSkillCall(
+          mandatoryAnchors.map((anchor) => anchor.anchor_id)
+        );
+        const supportEpisodeIds = [...new Set(mandatoryAnchors.flatMap((anchor) =>
+          anchor.support_episode_ids))];
+        return {
+          ...response,
+          local_subproblem_closure: {
+            closed: true,
+            subproblem: "Complete a repeated local artifact stage.",
+            entry_condition: "The artifact stage is incomplete.",
+            resolution: "Run the shared construction actions.",
+            resolved_state: "The artifact stage is complete.",
+            success_check: "Observe the shared output verification.",
+            support_episode_ids: supportEpisodeIds,
+            reason: "The same successful Episodes support construction and verification."
+          }
+        } as unknown as T;
       }
       return {} as T;
     },
@@ -373,7 +538,7 @@ function atomicityLlm(input: {
 function skillResponse(
   name: string,
   marker: string,
-  occurrenceIds: string[]
+  sourceAnchorIds: string[]
 ): Record<string, unknown> {
   return {
     admit: true,
@@ -388,19 +553,18 @@ function skillResponse(
     procedure_steps: [{
       title: `${marker} construction`,
       body: `Run the ${marker} ordered construction stages.`,
-      evidence_refs: occurrenceIds
+      source_anchor_ids: sourceAnchorIds
     }],
     verification_steps: [{
       check: `${marker} verification`,
       success_signal: `The ${marker} output check succeeds.`,
-      evidence_refs: occurrenceIds
+      source_anchor_ids: sourceAnchorIds.slice(-1)
     }],
     do_not_apply_when: [],
     decision_guidance: { preference: [], anti_pattern: [] },
     examples: [],
     tags: [marker],
     tools: [],
-    evidence_occurrence_ids: occurrenceIds,
     confidence: 0.9
   };
 }

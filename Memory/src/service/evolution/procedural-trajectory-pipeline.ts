@@ -17,6 +17,11 @@ import {
   type TrajectoryWindowClusterVersionRecord,
   type TrajectoryWindowOccurrenceRecord
 } from "../../storage/procedural-trajectory-repository.js";
+import {
+  LONG_TRAJECTORY_EPISODE_REPRESENTATION_VERSION,
+  type LongTrajectoryCandidateRecord,
+  type LongTrajectoryEpisodeRepresentationRecord
+} from "../../storage/long-trajectory-repository.js";
 import type { MemoryRow } from "../../types.js";
 import { stableHash } from "../../utils/id.js";
 import { isRecord } from "../../utils/json.js";
@@ -26,10 +31,14 @@ import {
   EpisodePathCompiler
 } from "./episode-path-compiler.js";
 import {
+  PROCEDURAL_LONG_TRAJECTORY_SKILL_PROMPT_VERSION,
   PROCEDURAL_PATTERN_SKILL_PROMPT_VERSION,
   ProceduralPatternSkillMaterializer,
   proceduralSkillKey,
+  type ProceduralPatternSkillDraft,
   type ProceduralPatternSkillInput,
+  type ProceduralSkillComparisonCandidate,
+  type ProceduralSkillCoverageDecision,
   type ProceduralSkillAlignedSequenceStep,
   type ProceduralSkillEvidenceOccurrence,
   type ProceduralSkillEvidenceStep,
@@ -64,11 +73,34 @@ import {
   type BandedMonotonicMatchConfig,
   type BandedMonotonicMatchResultV1
 } from "./trajectory-window-alignment.js";
+import {
+  LONG_TRAJECTORY_MINING_VERSION,
+  buildEpisodeTrajectoryFamily,
+  extendLongCommonTrajectoryWithProjection,
+  mineLongCommonSpanSequences,
+  projectEpisodeToReferenceSpans,
+  selectMaximalLongCommonTrajectories,
+  trajectoryIntentSequenceText,
+  type EpisodeTrajectoryDocumentV1,
+  type EpisodeTrajectoryFamilyV1,
+  type LongCommonTrajectoryV1,
+  type LongTrajectoryMiningConfigV1
+} from "./long-trajectory-model.js";
+import { buildLongTrajectorySkillInput } from "./long-trajectory-skill-input.js";
 
 const STEP_INTENT_REPRESENTATION_VERSION =
   PROCEDURAL_STEP_EMBEDDING_SCHEMA_VERSION;
 const WINDOW_INTENT_SEQUENCE_REPRESENTATION_VERSION =
   "trajectory-window-intent-sequence.v1";
+const PROCEDURAL_PATTERN_SKILL_ALGORITHM = "procedural.pattern.skill.v1";
+const LONG_TRAJECTORY_SKILL_ALGORITHM = "procedural.long-trajectory.skill.v1";
+const LEGACY_SKILL_ALGORITHM = "skill.crystallization.v7";
+const V2_SKILL_COMPARISON_LIMIT_PER_PHASE = 6;
+
+function isProceduralSkillAlgorithm(value: unknown): boolean {
+  return value === PROCEDURAL_PATTERN_SKILL_ALGORITHM ||
+    value === LONG_TRAJECTORY_SKILL_ALGORITHM;
+}
 
 type TraceMeta = NonNullable<ReturnType<ProceduralTrajectoryPipelineDeps["traceMeta"]>>;
 
@@ -117,6 +149,23 @@ interface PipelineConfig {
   maxSuffixExpansionSteps: number;
   minExtensionStepSimilarity: number;
   skillCompletionConfigHash: string;
+}
+
+interface LongTrajectoryPipelineConfig {
+  mining: LongTrajectoryMiningConfigV1;
+  specs: MultiScaleWindowSpec[];
+  miningConfigHash: string;
+  mechanicalWindowHash: string;
+}
+
+interface LongTrajectorySkillCandidateRow {
+  trajectory: LongCommonTrajectoryV1;
+  skillInput: ProceduralPatternSkillInput;
+  /** Present when Episode C semantically matched an already linked Candidate. */
+  candidateId?: string;
+  candidateStructureKey: string;
+  evidenceSignature: string;
+  quality: number;
 }
 
 interface ClusterSnapshot {
@@ -186,6 +235,8 @@ export class ProceduralTrajectoryPipeline {
     const affectedClusterIds = new Set(
       this.deps.repos.proceduralTrajectory.listAffectedClusterIdsForPath(activePath.id)
     );
+    const affectedLongCandidateIds = this.deps.repos.longTrajectory
+      .listAffectedCandidateIdsForPath(activePath.id);
     this.deps.repos.proceduralTrajectory.deactivatePathVersion(activePath.id, input.at);
     // Panel governance is synchronous. Make stale procedural knowledge
     // unretrievable immediately, then let the durable compile/ingest jobs
@@ -200,6 +251,25 @@ export class ProceduralTrajectoryPipeline {
           input.at
         );
       }
+    }
+    for (const candidateId of affectedLongCandidateIds) {
+      this.deps.repos.transaction(() => {
+        const candidate = this.deps.repos.longTrajectory.getCandidate(candidateId);
+        if (!candidate) return;
+        if (candidate.activeSkillMemoryId) {
+          this.archiveProceduralSkillMemory(
+            candidate.activeSkillMemoryId,
+            `source-governance-invalidated:${input.reason}`,
+            input.at
+          );
+        }
+        if (candidate.status === "retired") return;
+        this.deps.repos.longTrajectory.retireCandidate({
+          candidateId,
+          expectedActiveVersionId: candidate.activeVersionId ?? null,
+          retiredAt: input.at
+        });
+      });
     }
     if (input.recompile !== false && episode?.status === "closed") {
       this.enqueueGovernedClusterReconcile(
@@ -225,7 +295,7 @@ export class ProceduralTrajectoryPipeline {
     const current = this.deps.repos.memories.getIncludingDeleted(memory.id) ?? memory;
     const internal = current.properties.internal_info;
     if (current.memoryLayer !== "Skill" ||
-        internal.plugin_algorithm !== "procedural.pattern.skill.v1") {
+        !isProceduralSkillAlgorithm(internal.plugin_algorithm)) {
       return current;
     }
     const skill = isRecord(internal.skill) ? internal.skill : {};
@@ -440,8 +510,9 @@ export class ProceduralTrajectoryPipeline {
     const embeddedNew = await this.persistAndEmbedWindows(
       occurrences,
       stepVectorById,
-      config,
-      at
+      config.mechanicalWindowHash,
+      at,
+      true
     );
 
     // Reward drift updates existing immutable Window identities in place. All
@@ -471,6 +542,7 @@ export class ProceduralTrajectoryPipeline {
 
     this.retireUnlinkedCanonicalClusters(affectedClusterIds, at);
     this.reconcileSkillEligibility(pathRecord.userId, affectedClusterIds, config, at);
+    this.enqueueLongTrajectoryMining(job, pathRecord, previousPathId);
   }
 
   async induceProceduralSkill(job: EvolutionJobRecord): Promise<void> {
@@ -502,10 +574,19 @@ export class ProceduralTrajectoryPipeline {
     const snapshot = this.loadClusterSnapshot(head, config);
     if (!snapshot || !snapshot.core ||
         snapshot.version.supportEpisodeCount < config.minSupportEpisodes) {
-      await this.rejectAndDowngradeSkill(head, snapshot?.version, "insufficient-common-core", at);
+      this.recordProceduralSkillRejection(
+        head,
+        snapshot?.version,
+        "insufficient-common-core",
+        at
+      );
       return;
     }
-    const maximal = this.maximalQualifiedClusters(head.userId, config);
+    const maximal = this.maximalQualifiedClustersForAffected(
+      head.userId,
+      new Set([head.id]),
+      config
+    );
     const selected = maximal.find((item) => item.domain.id === head.id);
     if (!selected || selected.domain.suppressedByClusterId) {
       await this.rejectAndDowngradeSkill(
@@ -519,15 +600,77 @@ export class ProceduralTrajectoryPipeline {
       return;
     }
 
-    const input = this.buildSkillInput(snapshot, config);
-    if (!input) {
-      await this.rejectAndDowngradeSkill(head, snapshot.version, "invalid-positive-evidence", at);
+    const baseInput = this.buildSkillInput(snapshot, config);
+    if (!baseInput) {
+      this.recordProceduralSkillRejection(
+        head,
+        snapshot.version,
+        "invalid-positive-evidence",
+        at
+      );
       return;
     }
+    const existingSkillReadOnly = this.existingV2SkillReadOnly(head);
+    const previousEpisodeIds = new Set(existingSkillReadOnly?.sourceEpisodeIds ?? []);
+    const currentEpisodeIds = new Set(baseInput.supportEpisodeIds);
+    const input: ProceduralPatternSkillInput = {
+      ...baseInput,
+      ...(existingSkillReadOnly ? {
+        existingSkillReadOnly,
+        evidenceDeltaReadOnly: {
+          ...(head.activeSkillVersionId
+            ? { previousCandidateVersionId: head.activeSkillVersionId }
+            : {}),
+          addedEpisodeIds: baseInput.supportEpisodeIds.filter((id) =>
+            !previousEpisodeIds.has(id)),
+          retainedEpisodeIds: baseInput.supportEpisodeIds.filter((id) =>
+            previousEpisodeIds.has(id)),
+          removedEpisodeIds: [...previousEpisodeIds].filter((id) =>
+            !currentEpisodeIds.has(id)),
+          currentEvidenceEpisodeIds: [...baseInput.supportEpisodeIds]
+        }
+      } : {})
+    };
     const result = await this.skillMaterializer.compile(input);
     if (!result.admitted) {
-      await this.rejectAndDowngradeSkill(head, snapshot.version, result.reason, at);
+      this.recordProceduralSkillRejection(
+        head,
+        snapshot.version,
+        result.reason,
+        at
+      );
       return;
+    }
+    let postDraftCoverageDecision: ProceduralSkillCoverageDecision | undefined;
+    if (!existingSkillReadOnly) {
+      const comparisonSkills = await this.retrieveV2ComparisonSkills(result.draft);
+      const coverage = await this.skillMaterializer.compareDraftCoverage(
+        result.draft,
+        comparisonSkills
+      );
+      if (!coverage.ok) {
+        this.recordProceduralSkillRejection(
+          head,
+          snapshot.version,
+          coverage.reason,
+          at,
+          undefined,
+          coverage.rawDecision
+        );
+        return;
+      }
+      postDraftCoverageDecision = coverage.decision;
+      if (coverage.decision.decision === "covered") {
+        this.recordProceduralSkillRejection(
+          head,
+          snapshot.version,
+          `covered-by-${coverage.decision.targetRoute.toLowerCase()}:` +
+            coverage.decision.targetSkillId,
+          at,
+          coverage.decision
+        );
+        return;
+      }
     }
     // The user may archive/delete the Skill while a slow Skill LLM call is in
     // flight. Recheck the durable tombstone before entering the write txn.
@@ -555,7 +698,7 @@ export class ProceduralTrajectoryPipeline {
         clusterId: head.id,
         clusterVersionId: snapshot.version.id,
         expectedActiveSkillVersionId: current.activeSkillVersionId ?? null,
-        skillKey: proceduralSkillKey(head.userId, head.id),
+        skillKey: materialized.memory.memoryKey ?? proceduralSkillKey(head.userId, head.id),
         skillMemoryId: upsert.memory.id,
         payload: {
           admitted: true,
@@ -564,7 +707,9 @@ export class ProceduralTrajectoryPipeline {
           patternHash: input.patternHash,
           supportEpisodeIds: input.supportEpisodeIds,
           sourceSpanOccurrenceIds: input.sourceSpanOccurrenceIds,
-          skillMemoryId: upsert.memory.id
+          skillMemoryId: upsert.memory.id,
+          reuseDecision: result.draft.reuseDecision,
+          ...(postDraftCoverageDecision ? { postDraftCoverageDecision } : {})
         },
         contentHash: materialized.contentHash,
         createdAt: committedAt
@@ -604,6 +749,898 @@ export class ProceduralTrajectoryPipeline {
           createdAt: committedAt
         });
       }
+    });
+  }
+
+  async mineLongTrajectories(job: EvolutionJobRecord): Promise<void> {
+    if (!this.deps.config.algorithm.proceduralWindow.enabled ||
+        !this.deps.config.algorithm.longTrajectory.enabled) return;
+    const pathId = payloadString(job, "pathId") ?? job.targetMemoryId;
+    if (!pathId) throw new Error("long_trajectory_mining requires pathId");
+    const pathRecord = this.deps.repos.proceduralTrajectory.getPath(pathId);
+    if (!pathRecord || pathRecord.userId !== job.userId) {
+      throw new Error(`long_trajectory_mining Path not found in user scope: ${pathId}`);
+    }
+    const previousPathId = payloadString(job, "previousPathId");
+    if (previousPathId && previousPathId !== pathRecord.id) {
+      this.retireLongTrajectoryCandidatesForPath(
+        previousPathId,
+        "source-path-superseded",
+        new Date().toISOString()
+      );
+    }
+    if (pathRecord.status !== "active" ||
+        this.deps.repos.proceduralTrajectory.getActivePath(pathRecord.episodeId)?.id !== pathId) {
+      return;
+    }
+    const seedEpisode = this.deps.repos.runtime.getEpisode(pathRecord.episodeId);
+    if (!seedEpisode || seedEpisode.userId !== pathRecord.userId) return;
+    const successThreshold = this.deps.config.algorithm.skill.outcomeRTaskSuccessThreshold;
+    if (typeof seedEpisode.rTask !== "number" || seedEpisode.rTask < successThreshold) {
+      this.retireLongTrajectoryCandidatesForPath(
+        pathRecord.id,
+        "source-episode-not-successful",
+        new Date().toISOString()
+      );
+      return;
+    }
+    const config = this.longTrajectoryConfig();
+    const requestedConfigHash = payloadString(job, "miningConfigHash");
+    if (requestedConfigHash && requestedConfigHash !== config.miningConfigHash) {
+      this.enqueueLongTrajectoryMining(job, pathRecord, previousPathId);
+      return;
+    }
+
+    const activePaths = this.deps.repos.proceduralTrajectory
+      .listActivePathsForUser(pathRecord.userId)
+      .filter((path) => {
+        const episode = this.deps.repos.runtime.getEpisode(path.episodeId);
+        return episode?.status === "closed" &&
+          typeof episode.rTask === "number" && episode.rTask >= successThreshold;
+      });
+    if (activePaths.length < config.mining.minSupportEpisodes) return;
+    const at = new Date().toISOString();
+    const representations = await this.ensureLongTrajectoryRepresentations(activePaths, at);
+    const skeletalDocuments = activePaths.flatMap((path) => {
+      const representation = representations.get(path.id);
+      const episode = this.deps.repos.runtime.getEpisode(path.episodeId);
+      if (!representation || !episode) return [];
+      return [{
+        path: {
+          ...path.path,
+          ...(episode.rTask === undefined ? {} : { terminalReward: episode.rTask })
+        },
+        goalText: representation.goalText,
+        terminalResultText: representation.terminalResultText,
+        goalVector: representation.goalVector,
+        trajectoryText: representation.trajectoryText,
+        trajectoryVector: representation.trajectoryVector,
+        windows: []
+      } satisfies EpisodeTrajectoryDocumentV1];
+    });
+    const seed = skeletalDocuments.find((item) => item.path.id === pathRecord.id);
+    if (!seed) return;
+    const family = buildEpisodeTrajectoryFamily(seed, skeletalDocuments, config.mining);
+    if (!family) return;
+    const familyPaths = activePaths.filter((path) =>
+      family.memberEpisodeIds.includes(path.episodeId));
+    const documents: EpisodeTrajectoryDocumentV1[] = [];
+    for (const familyPath of familyPaths) {
+      const representation = representations.get(familyPath.id);
+      if (!representation) continue;
+      documents.push(await this.buildLongTrajectoryDocument(
+        familyPath,
+        representation,
+        config,
+        at
+      ));
+    }
+    const reference = documents.find((item) =>
+      item.path.episodeId === family.referenceEpisodeId);
+    if (!reference) return;
+    const linkedRows = await this.matchActiveLongTrajectoryCandidates({
+      pathRecord,
+      seedDocument: reference,
+      family,
+      documents,
+      activePaths,
+      representations,
+      config,
+      at
+    });
+    const projections = documents
+      .filter((item) => item.path.episodeId !== reference.path.episodeId)
+      .map((item) => projectEpisodeToReferenceSpans(
+        family.id,
+        reference,
+        item,
+        config.mining
+      ));
+    const maximal = selectMaximalLongCommonTrajectories(
+      mineLongCommonSpanSequences(family, documents, projections, config.mining)
+    );
+    const discoveredRows = maximal.flatMap((trajectory) => {
+      const skillInput = buildLongTrajectorySkillInput({
+        trajectory,
+        documents,
+        userId: pathRecord.userId,
+        sourceTraceIdsForSteps: (episodeId, steps) =>
+          this.sourceTraceIdsForLongTrajectorySteps(episodeId, steps)
+      });
+      if (!skillInput) return [];
+      return [{
+        trajectory,
+        skillInput,
+        candidateStructureKey: trajectory.candidateStructureKey,
+        evidenceSignature: longTrajectoryEvidenceSignature(trajectory),
+        quality: longTrajectoryQuality(trajectory)
+      } satisfies LongTrajectorySkillCandidateRow];
+    });
+    // Existing Candidate evolution wins when it completely covers a newly
+    // discovered path in the seed Episode. Partial overlaps remain visible;
+    // disjoint regions can independently become new Candidates.
+    const uncoveredDiscoveredRows = discoveredRows.filter((discovered) =>
+      !linkedRows.some((linked) => longTrajectoryRowContainsInEpisode(
+        linked,
+        discovered,
+        pathRecord.episodeId
+      )));
+    const rows = dedupeLongTrajectoryRows([
+      ...linkedRows,
+      ...uncoveredDiscoveredRows
+    ]).sort((left, right) =>
+      right.quality - left.quality || left.trajectory.id.localeCompare(right.trajectory.id))
+      .slice(0, Math.max(1, Math.floor(
+        this.deps.config.algorithm.longTrajectory.maxSkillCandidatesPerEpisode
+      )));
+
+    for (const row of rows) {
+      const linkedCandidate = row.candidateId
+        ? this.deps.repos.longTrajectory.getCandidate(row.candidateId)
+        : undefined;
+      const resolved = linkedCandidate
+        ? { record: linkedCandidate, created: false }
+        : this.deps.repos.longTrajectory.resolveCandidate({
+            userId: pathRecord.userId,
+            algorithmVersion: LONG_TRAJECTORY_MINING_VERSION,
+            configHash: config.miningConfigHash,
+            structureKey: row.candidateStructureKey,
+            createdAt: at
+          });
+      const previousVersion = resolved.record.activeVersionId
+        ? this.deps.repos.longTrajectory.getCandidateVersion(resolved.record.activeVersionId)
+        : undefined;
+      const previousSupportEpisodeIds = previousVersion?.supportEpisodeIds ?? [];
+      const currentEvidenceEpisodeIds = this.validLongTrajectorySupportEpisodeIds(
+        row.trajectory.supportEpisodeIds,
+        pathRecord.userId,
+        successThreshold
+      );
+      const retainedEpisodeIds = this.validLongTrajectorySupportEpisodeIds(
+        previousSupportEpisodeIds,
+        pathRecord.userId,
+        successThreshold
+      );
+      const supportEpisodeIds = unique([
+        ...retainedEpisodeIds,
+        ...currentEvidenceEpisodeIds
+      ]).sort();
+      const sourcePathIds = supportEpisodeIds.flatMap((episodeId) => {
+        const activePath = this.deps.repos.proceduralTrajectory.getActivePath(episodeId);
+        return activePath ? [activePath.id] : [];
+      });
+      const addedEpisodeIds = currentEvidenceEpisodeIds
+        .filter((episodeId) => !previousSupportEpisodeIds.includes(episodeId)).sort();
+      const removedEpisodeIds = previousSupportEpisodeIds
+        .filter((episodeId) => !retainedEpisodeIds.includes(episodeId)).sort();
+      const evidenceHash = stableHash({
+        version: "long-trajectory-candidate-evidence.v1",
+        currentEvidenceSignature: row.evidenceSignature,
+        skillEvidencePatternHash: row.skillInput.patternHash,
+        supportEpisodeIds,
+        sourcePathIds
+      });
+      const supportHash = stableHash(supportEpisodeIds.map((episodeId) => {
+        const episode = this.deps.repos.runtime.getEpisode(episodeId);
+        return [
+          episodeId,
+          episode?.rTask ?? null,
+          episode ? rewardHashForEpisode(episode) : "missing-episode"
+        ];
+      }));
+      const evidenceDelta = {
+        ...(previousVersion ? { previousCandidateVersionId: previousVersion.id } : {}),
+        addedEpisodeIds,
+        retainedEpisodeIds,
+        removedEpisodeIds,
+        currentEvidenceEpisodeIds
+      };
+      let versionResult;
+      try {
+        versionResult = this.deps.repos.longTrajectory.saveCandidateVersion({
+          candidateId: resolved.record.id,
+          expectedActiveVersionId: resolved.record.activeVersionId ?? null,
+          structureHash: row.trajectory.structureHash,
+          evidenceHash,
+          supportHash,
+          referenceEpisodeId: row.trajectory.referenceEpisodeId,
+          sourcePathIds,
+          supportEpisodeIds,
+          payload: {
+            candidateStructureKey: row.candidateStructureKey,
+            evidenceHash,
+            family,
+            trajectory: row.trajectory,
+            skillInput: {
+              ...row.skillInput,
+              supportEpisodeIds
+            },
+            evidenceDelta,
+            quality: row.quality,
+            miningConfigHash: config.miningConfigHash
+          },
+          createdAt: at
+        });
+      } catch (error) {
+        if (String(error).includes("long trajectory CAS conflict")) continue;
+        throw error;
+      }
+      const version = versionResult.record;
+      const activeSkillDecision = resolved.record.activeSkillVersionId
+        ? this.deps.repos.longTrajectory.getSkillVersion(resolved.record.activeSkillVersionId)
+        : undefined;
+      if (!versionResult.created && activeSkillDecision?.candidateVersionId === version.id) {
+        continue;
+      }
+      this.deps.enqueueJob({
+        jobType: "long_trajectory_skill_induction",
+        userId: pathRecord.userId,
+        sessionId: seedEpisode.sessionId,
+        episodeId: pathRecord.episodeId,
+        targetMemoryId: resolved.record.id,
+        payload: {
+          candidateId: resolved.record.id,
+          candidateVersionId: version.id,
+          inductionVersion: PROCEDURAL_LONG_TRAJECTORY_SKILL_PROMPT_VERSION
+        },
+        createdAt: at
+      });
+    }
+  }
+
+  async induceLongTrajectorySkill(job: EvolutionJobRecord): Promise<void> {
+    if (!this.deps.config.algorithm.longTrajectory.enabled) return;
+    const candidateId = payloadString(job, "candidateId") ?? job.targetMemoryId;
+    const candidateVersionId = payloadString(job, "candidateVersionId");
+    if (!candidateId || !candidateVersionId) {
+      throw new Error(
+        "long_trajectory_skill_induction requires candidateId and candidateVersionId"
+      );
+    }
+    const candidate = this.deps.repos.longTrajectory.getCandidate(candidateId);
+    const version = this.deps.repos.longTrajectory.getCandidateVersion(candidateVersionId);
+    if (!candidate || !version || candidate.userId !== job.userId ||
+        candidate.status !== "active" || candidate.activeVersionId !== version.id ||
+        version.candidateId !== candidate.id) return;
+    if (this.longTrajectorySkillGovernanceDisabled(candidate)) {
+      this.rejectLongTrajectorySkill(candidate, version.id, "governance-disabled", job);
+      return;
+    }
+    const storedInput = version.payload.skillInput;
+    if (!isRecord(storedInput)) {
+      this.recordLongTrajectorySkillRejection(
+        candidate,
+        version.id,
+        "invalid-stored-skill-input",
+        job
+      );
+      return;
+    }
+    const evidenceDelta = isRecord(version.payload.evidenceDelta)
+      ? version.payload.evidenceDelta
+      : undefined;
+    const existingSkillReadOnly = this.existingLongTrajectorySkillReadOnly(
+      candidate,
+      version.supportEpisodeIds,
+      stringArray(evidenceDelta?.removedEpisodeIds).length > 0
+    );
+    const input = {
+      ...storedInput,
+      patternVersionId: version.id,
+      clusterId: candidate.id,
+      clusterVersionId: version.id,
+      ...(existingSkillReadOnly ? { existingSkillReadOnly } : {}),
+      ...(evidenceDelta ? {
+        evidenceDeltaReadOnly: {
+          ...(typeof evidenceDelta.previousCandidateVersionId === "string"
+            ? { previousCandidateVersionId: evidenceDelta.previousCandidateVersionId }
+            : {}),
+          addedEpisodeIds: stringArray(evidenceDelta.addedEpisodeIds),
+          retainedEpisodeIds: stringArray(evidenceDelta.retainedEpisodeIds),
+          removedEpisodeIds: stringArray(evidenceDelta.removedEpisodeIds),
+          currentEvidenceEpisodeIds: stringArray(evidenceDelta.currentEvidenceEpisodeIds)
+        }
+      } : {})
+    } as unknown as ProceduralPatternSkillInput;
+    if (input.origin?.kind !== "long_trajectory" ||
+        !Array.isArray(input.evidence) || input.evidence.length < 2) {
+      this.recordLongTrajectorySkillRejection(
+        candidate,
+        version.id,
+        "invalid-stored-skill-input",
+        job
+      );
+      return;
+    }
+    const result = await this.skillMaterializer.compile(input);
+    if (!result.admitted) {
+      this.recordLongTrajectorySkillRejection(candidate, version.id, result.reason, job);
+      return;
+    }
+    // A panel archive/delete can happen while the Skill LLM is running. Check
+    // once before the write transaction for a fast no-op, then again inside
+    // the transaction to close the final check-to-upsert race.
+    if (this.longTrajectorySkillGovernanceDisabled(candidate)) {
+      this.rejectLongTrajectorySkill(candidate, version.id, "governance-disabled", job);
+      return;
+    }
+    const committedAt = new Date().toISOString();
+    this.deps.repos.transaction(() => {
+      const current = this.deps.repos.longTrajectory.getCandidate(candidate.id);
+      if (!current || current.status !== "active" || current.activeVersionId !== version.id) return;
+      if (this.longTrajectorySkillGovernanceDisabled(current)) {
+        this.rejectLongTrajectorySkillInTransaction(
+          current,
+          version.id,
+          "governance-disabled",
+          job,
+          committedAt
+        );
+        return;
+      }
+      const materialized = this.skillMaterializer.materializeDraft(result.draft, committedAt);
+      const upsert = this.deps.upsertEvolutionMemory(materialized.memory);
+      this.deps.repos.longTrajectory.saveSkillVersion({
+        candidateId: current.id,
+        candidateVersionId: version.id,
+        expectedActiveSkillVersionId: current.activeSkillVersionId ?? null,
+        skillKey: proceduralSkillKey(current.userId, current.id),
+        skillMemoryId: upsert.memory.id,
+        contentHash: materialized.contentHash,
+        payload: {
+          admitted: true,
+          candidateVersionId: version.id,
+          supportEpisodeIds: input.supportEpisodeIds,
+          sourceSpanOccurrenceIds: input.sourceSpanOccurrenceIds,
+          skillMemoryId: upsert.memory.id
+        },
+        createdAt: committedAt
+      });
+      for (const episodeId of materialized.sourceEpisodeIds) {
+        this.deps.repos.runtime.appendEpisodeDerivedMemory(
+          episodeId,
+          "Skill",
+          upsert.memory.id,
+          committedAt
+        );
+      }
+      this.deps.repos.runtime.appendChange({
+        memoryId: upsert.memory.id,
+        namespaceId: this.deps.namespaceIdFromMemory(upsert.memory),
+        kind: kindFromMemory(upsert.memory),
+        op: upsert.created ? "created" : "updated",
+        entityId: upsert.memory.id,
+        userId: input.userId,
+        changeType: upsert.created ? "create" : "update",
+        before: upsert.previous,
+        after: upsert.memory,
+        source: "worker.long_trajectory_induction.v1",
+        createdAt: committedAt
+      });
+      if (this.deps.config.algorithm.capture.embedAfterCapture) {
+        this.deps.enqueueJob({
+          jobType: "embedding",
+          userId: input.userId,
+          sessionId: materialized.scope.sessionId ?? job.sessionId,
+          episodeId: job.episodeId,
+          targetMemoryId: upsert.memory.id,
+          payload: {
+            reason: "procedural.long-trajectory.skill.upserted",
+            contentHash: upsert.memory.contentHash
+          },
+          createdAt: committedAt
+        });
+      }
+    });
+  }
+
+  private existingV2SkillReadOnly(
+    head: TrajectoryWindowClusterRecord
+  ): ProceduralPatternSkillInput["existingSkillReadOnly"] {
+    if (!head.activeSkillMemoryId) return undefined;
+    const memory = this.deps.repos.memories.get(head.activeSkillMemoryId);
+    if (!memory || memory.userId !== head.userId ||
+        memory.status === "archived" || memory.status === "deleted" ||
+        memory.properties.internal_info.plugin_algorithm !==
+          "procedural.pattern.skill.v1") {
+      return undefined;
+    }
+    const skill = skillMetaFromMemory(memory);
+    if (!skill || skill.status === "archived") return undefined;
+    const internal = memory.properties.internal_info;
+    const internalSkill = isRecord(internal.skill) ? internal.skill : {};
+    const procedureJson = isRecord(internal.procedure_json)
+      ? internal.procedure_json
+      : isRecord(internalSkill.procedure_json)
+        ? internalSkill.procedure_json
+        : {};
+    return {
+      memoryId: memory.id,
+      memoryVersion: memory.version,
+      name: skill.name,
+      invocationGuide: skill.invocationGuide,
+      procedureJson,
+      sourceEpisodeIds: stringArray(internal.source_episode_ids),
+      sourceTraceIds: stringArray(internal.source_trace_ids),
+      sourceSpanOccurrenceIds: stringArray(internal.source_span_occurrence_ids)
+    };
+  }
+
+  private existingLongTrajectorySkillReadOnly(
+    candidate: LongTrajectoryCandidateRecord,
+    supportEpisodeIds: readonly string[],
+    discardPriorOccurrenceIds: boolean
+  ): ProceduralPatternSkillInput["existingSkillReadOnly"] {
+    if (!candidate.activeSkillMemoryId) return undefined;
+    const memory = this.deps.repos.memories.get(candidate.activeSkillMemoryId);
+    if (!memory || memory.userId !== candidate.userId ||
+        memory.status === "archived" || memory.status === "deleted" ||
+        memory.properties.internal_info.plugin_algorithm !== LONG_TRAJECTORY_SKILL_ALGORITHM) {
+      return undefined;
+    }
+    const skill = skillMetaFromMemory(memory);
+    if (!skill) return undefined;
+    const internal = memory.properties.internal_info;
+    const internalSkill = isRecord(internal.skill) ? internal.skill : {};
+    const procedureJson = isRecord(internal.procedure_json)
+      ? internal.procedure_json
+      : isRecord(internalSkill.procedure_json)
+        ? internalSkill.procedure_json
+        : {};
+    const supportSet = new Set(supportEpisodeIds);
+    const sourceTraceIds = stringArray(internal.source_trace_ids).filter((traceId) => {
+      const trace = this.deps.traceMeta(this.deps.repos.memories.get(traceId));
+      return Boolean(trace?.episodeId && supportSet.has(trace.episodeId));
+    });
+    return {
+      memoryId: memory.id,
+      memoryVersion: memory.version,
+      name: skill.name,
+      invocationGuide: skill.invocationGuide,
+      procedureJson,
+      sourceEpisodeIds: stringArray(internal.source_episode_ids)
+        .filter((episodeId) => supportSet.has(episodeId)),
+      sourceTraceIds,
+      sourceSpanOccurrenceIds: discardPriorOccurrenceIds
+        ? []
+        : stringArray(internal.source_span_occurrence_ids)
+    };
+  }
+
+  private validLongTrajectorySupportEpisodeIds(
+    episodeIds: readonly string[],
+    userId: string,
+    successThreshold: number
+  ): string[] {
+    return unique([...episodeIds]).filter((episodeId) => {
+      const episode = this.deps.repos.runtime.getEpisode(episodeId);
+      const activePath = this.deps.repos.proceduralTrajectory.getActivePath(episodeId);
+      return episode?.userId === userId && episode.status === "closed" &&
+        typeof episode.rTask === "number" && episode.rTask >= successThreshold &&
+        Boolean(activePath);
+    }).sort();
+  }
+
+  private longTrajectoryConfig(): LongTrajectoryPipelineConfig {
+    const configured = this.deps.config.algorithm.longTrajectory;
+    const scales = [...configured.scales]
+      .sort((left, right) => left.length - right.length)
+      .map((item) => ({ ...item }));
+    const mining: LongTrajectoryMiningConfigV1 = {
+      episodeRecallLimit: Math.max(1, Math.floor(configured.episodeRecallLimit)),
+      minEpisodeSimilarity: configured.minEpisodeSimilarity,
+      minGoalSimilarity: configured.minGoalSimilarity,
+      goalWeight: configured.goalWeight,
+      trajectoryWeight: configured.trajectoryWeight,
+      windowTopK: Math.max(1, Math.floor(configured.windowTopK)),
+      coarseThresholds: Object.fromEntries(scales.map((item) => [
+        item.length,
+        item.coarseSimilarityThreshold
+      ])),
+      minSupportEpisodes: Math.max(2, Math.floor(configured.minSupportEpisodes)),
+      minSpanSequenceLength: Math.max(2, Math.floor(configured.minSpanSequenceLength)),
+      minTrajectorySpanSteps: Math.max(2, Math.floor(configured.minTrajectorySpanSteps)),
+      minEpisodeCoverage: configured.minEpisodeCoverage
+    };
+    const mechanicalWindowHash = stableHash({
+      version: "long-trajectory-window-basis.v1",
+      specs: scales.map(({ length, stride }) => ({ length, stride })),
+      stepRepresentationVersion: STEP_INTENT_REPRESENTATION_VERSION,
+      coarseRepresentationVersion: WINDOW_INTENT_SEQUENCE_REPRESENTATION_VERSION
+    });
+    const miningConfigHash = stableHash({
+      algorithmVersion: LONG_TRAJECTORY_MINING_VERSION,
+      representationVersion: LONG_TRAJECTORY_EPISODE_REPRESENTATION_VERSION,
+      mechanicalWindowHash,
+      mining
+    });
+    return {
+      mining,
+      specs: scales.map(({ length, stride }) => ({ length, stride })),
+      miningConfigHash,
+      mechanicalWindowHash
+    };
+  }
+
+  private enqueueLongTrajectoryMining(
+    sourceJob: EvolutionJobRecord,
+    path: EpisodeExecutionPathRecord,
+    previousPathId?: string
+  ): void {
+    if (!this.deps.config.algorithm.longTrajectory.enabled) return;
+    const episode = this.deps.repos.runtime.getEpisode(path.episodeId);
+    if (!episode) return;
+    const config = this.longTrajectoryConfig();
+    this.deps.enqueueJob({
+      jobType: "long_trajectory_mining",
+      userId: path.userId,
+      sessionId: episode.sessionId,
+      episodeId: path.episodeId,
+      targetMemoryId: path.id,
+      payload: {
+        pathId: path.id,
+        pathHash: path.pathHash,
+        miningConfigHash: config.miningConfigHash,
+        rewardSnapshotHash: payloadString(sourceJob, "rewardSnapshotHash") ??
+          rewardHashForEpisode(episode),
+        ...(previousPathId && previousPathId !== path.id ? { previousPathId } : {})
+      },
+      createdAt: new Date().toISOString()
+    });
+  }
+
+  private async ensureLongTrajectoryRepresentations(
+    paths: EpisodeExecutionPathRecord[],
+    at: string
+  ): Promise<Map<string, LongTrajectoryEpisodeRepresentationRecord>> {
+    const signature = this.embeddingSignature();
+    const prepared = paths.flatMap((path) => {
+      const episode = this.deps.repos.runtime.getEpisode(path.episodeId);
+      if (!episode) return [];
+      const rawTurns = this.deps.repos.runtime.listRawTurnsByEpisode(path.episodeId, 10_000)
+        .filter((turn) => !turn.deletedAt && !turn.redactedAt);
+      const firstUser = rawTurns.find((turn) => turn.userText?.trim())?.userText;
+      const lastAssistant = [...rawTurns].reverse()
+        .find((turn) => turn.assistantText?.trim())?.assistantText;
+      const goalText = [episode.title, episode.summary, firstUser]
+        .filter((item): item is string => Boolean(item?.trim())).join("\n") ||
+        `Episode ${episode.id}`;
+      const terminalResultText = lastAssistant?.trim() || episode.summary?.trim() ||
+        "Episode completed successfully.";
+      const trajectoryText = trajectoryIntentSequenceText(path.path);
+      return [{ path, episode, goalText, terminalResultText, trajectoryText }];
+    });
+    const missing = prepared.filter((item) => {
+      const existing = this.deps.repos.longTrajectory.getEpisodeRepresentation({
+        pathId: item.path.id,
+        representationVersion: LONG_TRAJECTORY_EPISODE_REPRESENTATION_VERSION,
+        embeddingSignature: signature
+      });
+      return !existing || existing.goalHash !== stableHash(item.goalText) ||
+        existing.trajectoryHash !== stableHash(item.trajectoryText);
+    });
+    const [goalVectors, trajectoryVectors] = missing.length > 0
+      ? await Promise.all([
+          this.deps.embedder.embed(missing.map((item) => item.goalText), "document"),
+          this.deps.embedder.embed(missing.map((item) => item.trajectoryText), "document")
+        ])
+      : [[], []];
+    if (goalVectors.length !== missing.length || trajectoryVectors.length !== missing.length) {
+      throw new Error("long trajectory Episode embedding response count mismatch");
+    }
+    for (const [index, item] of missing.entries()) {
+      this.deps.repos.longTrajectory.upsertEpisodeRepresentation({
+        pathId: item.path.id,
+        episodeId: item.episode.id,
+        userId: item.episode.userId,
+        representationVersion: LONG_TRAJECTORY_EPISODE_REPRESENTATION_VERSION,
+        embeddingSignature: signature,
+        goalText: item.goalText,
+        terminalResultText: item.terminalResultText,
+        goalHash: stableHash(item.goalText),
+        goalVector: unitVector(goalVectors[index] ?? []),
+        trajectoryText: item.trajectoryText,
+        trajectoryHash: stableHash(item.trajectoryText),
+        trajectoryVector: unitVector(trajectoryVectors[index] ?? []),
+        createdAt: at
+      });
+    }
+    return new Map(prepared.flatMap((item) => {
+      const record = this.deps.repos.longTrajectory.getEpisodeRepresentation({
+        pathId: item.path.id,
+        representationVersion: LONG_TRAJECTORY_EPISODE_REPRESENTATION_VERSION,
+        embeddingSignature: signature
+      });
+      return record ? [[item.path.id, record] as const] : [];
+    }));
+  }
+
+  /**
+   * Candidate-first V3 routing.
+   *
+   * Episode C uses both recalled-Episode reverse lookup and direct active
+   * Candidate lookup. C is projected onto each Candidate's retained reference
+   * Span sequence; a complete monotonic match evolves that Candidate in place.
+   * The caller still runs C-centred discovery for regions not fully covered by
+   * a matched Candidate.
+   */
+  private async matchActiveLongTrajectoryCandidates(input: {
+    pathRecord: EpisodeExecutionPathRecord;
+    seedDocument: EpisodeTrajectoryDocumentV1;
+    family: EpisodeTrajectoryFamilyV1;
+    documents: readonly EpisodeTrajectoryDocumentV1[];
+    activePaths: readonly EpisodeExecutionPathRecord[];
+    representations: ReadonlyMap<string, LongTrajectoryEpisodeRepresentationRecord>;
+    config: LongTrajectoryPipelineConfig;
+    at: string;
+  }): Promise<LongTrajectorySkillCandidateRow[]> {
+    const recalledEpisodeIds = input.family.memberEpisodeIds.filter((episodeId) =>
+      episodeId !== input.pathRecord.episodeId);
+    const linkedCandidates = this.deps.repos.longTrajectory.listActiveCandidatesLinkedToEpisodes({
+      userId: input.pathRecord.userId,
+      algorithmVersion: LONG_TRAJECTORY_MINING_VERSION,
+      configHash: input.config.miningConfigHash,
+      episodeIds: recalledEpisodeIds
+    });
+    const directlyRecalledCandidates = this.deps.repos.longTrajectory.listActiveCandidates({
+      userId: input.pathRecord.userId,
+      algorithmVersion: LONG_TRAJECTORY_MINING_VERSION,
+      configHash: input.config.miningConfigHash
+    });
+    const candidateById = new Map<string, LongTrajectoryCandidateRecord>();
+    for (const candidate of [...linkedCandidates, ...directlyRecalledCandidates]) {
+      if (!candidateById.has(candidate.id)) candidateById.set(candidate.id, candidate);
+    }
+    const candidates = [...candidateById.values()];
+    const pathByEpisodeId = new Map(input.activePaths.map((path) => [path.episodeId, path]));
+    const documentByEpisodeId = new Map(input.documents.map((document) => [
+      document.path.episodeId,
+      document
+    ]));
+    const rows: LongTrajectorySkillCandidateRow[] = [];
+    for (const candidate of candidates) {
+      if (!candidate.activeVersionId) continue;
+      const version = this.deps.repos.longTrajectory.getCandidateVersion(
+        candidate.activeVersionId
+      );
+      const trajectory = longCommonTrajectoryFromPayload(version?.payload.trajectory);
+      if (!version || !trajectory || trajectory.requiredSpans.length === 0) continue;
+      const referencePath = pathByEpisodeId.get(trajectory.referenceEpisodeId);
+      if (!referencePath) continue;
+      let referenceDocument = documentByEpisodeId.get(trajectory.referenceEpisodeId);
+      if (!referenceDocument) {
+        const representation = input.representations.get(referencePath.id);
+        if (!representation) continue;
+        referenceDocument = await this.buildLongTrajectoryDocument(
+          referencePath,
+          representation,
+          input.config,
+          input.at
+        );
+        documentByEpisodeId.set(referenceDocument.path.episodeId, referenceDocument);
+      }
+      const retainedSpanIds = new Set(trajectory.requiredSpans.map((span) =>
+        span.referenceSpanId));
+      const retainedReference = {
+        ...referenceDocument,
+        windows: referenceDocument.windows.filter((window) =>
+          retainedSpanIds.has(window.occurrence.id))
+      };
+      if (retainedReference.windows.length !== retainedSpanIds.size) continue;
+      const projection = projectEpisodeToReferenceSpans(
+        `candidate_projection_${candidate.id}`,
+        retainedReference,
+        input.seedDocument,
+        input.config.mining
+      );
+      const matchedReferenceIds = new Set(projection.matches.map((match) =>
+        match.referenceSpanId));
+      const matchedStepCount = projection.matches.reduce((sum, match) =>
+        sum + match.referenceEndStepIndex - match.referenceStartStepIndex + 1, 0);
+      const completeCandidateMatch = matchedReferenceIds.size === retainedSpanIds.size &&
+        [...retainedSpanIds].every((spanId) => matchedReferenceIds.has(spanId)) &&
+        projection.matches.length >= input.config.mining.minSpanSequenceLength &&
+        matchedStepCount >= input.config.mining.minTrajectorySpanSteps &&
+        projection.referenceCoverage + Number.EPSILON >=
+          input.config.mining.minEpisodeCoverage &&
+        projection.episodeCoverage + Number.EPSILON >=
+          input.config.mining.minEpisodeCoverage;
+      if (!completeCandidateMatch) continue;
+      const evolved = extendLongCommonTrajectoryWithProjection({
+        trajectory,
+        episode: input.seedDocument,
+        projection
+      });
+      const skillInputDocuments = uniqueDocuments([
+        ...documentByEpisodeId.values(),
+        retainedReference,
+        input.seedDocument
+      ]);
+      const skillInput = buildLongTrajectorySkillInput({
+        trajectory: evolved,
+        documents: skillInputDocuments,
+        userId: input.pathRecord.userId,
+        sourceTraceIdsForSteps: (episodeId, steps) =>
+          this.sourceTraceIdsForLongTrajectorySteps(episodeId, steps)
+      });
+      if (!skillInput) continue;
+      rows.push({
+        candidateId: candidate.id,
+        trajectory: evolved,
+        skillInput,
+        candidateStructureKey: candidate.structureKey,
+        evidenceSignature: longTrajectoryEvidenceSignature(evolved),
+        quality: longTrajectoryQuality(evolved)
+      });
+    }
+    return rows;
+  }
+
+  private async buildLongTrajectoryDocument(
+    path: EpisodeExecutionPathRecord,
+    representation: LongTrajectoryEpisodeRepresentationRecord,
+    config: LongTrajectoryPipelineConfig,
+    at: string
+  ): Promise<EpisodeTrajectoryDocumentV1> {
+    const episode = this.deps.repos.runtime.getEpisode(path.episodeId);
+    const rewardPath: EpisodeExecutionPathLiteV1 = {
+      ...path.path,
+      ...(episode?.rTask === undefined ? {} : { terminalReward: episode.rTask })
+    };
+    const stepVectorById = await this.ensureStepEmbeddings(path, at);
+    const occurrences = buildTrajectoryWindows([rewardPath], config.specs);
+    const windows = await this.persistAndEmbedWindows(
+      occurrences,
+      stepVectorById,
+      config.mechanicalWindowHash,
+      at,
+      false
+    );
+    const v2Scales = new Set(this.pipelineConfig().specs.map((item) => item.length));
+    const v3Only = occurrences.filter((item) => !v2Scales.has(item.scale));
+    if (v3Only.length > 0) {
+      await this.persistAndEmbedWindows(
+        v3Only,
+        stepVectorById,
+        config.mechanicalWindowHash,
+        at,
+        true
+      );
+    }
+    return {
+      path: rewardPath,
+      goalText: representation.goalText,
+      terminalResultText: representation.terminalResultText,
+      goalVector: representation.goalVector,
+      trajectoryText: representation.trajectoryText,
+      trajectoryVector: representation.trajectoryVector,
+      windows
+    };
+  }
+
+  private sourceTraceIdsForLongTrajectorySteps(
+    episodeId: string,
+    steps: readonly ExecutionStepLiteV1[]
+  ): string[] {
+    const episode = this.deps.repos.runtime.getEpisode(episodeId);
+    if (!episode) return [];
+    const rawTurnIds = new Set(steps.map((step) => step.rawTurnId));
+    return this.deps.repos.memories.getMany(episode.l1MemoryIds).flatMap((memory) => {
+      const trace = this.deps.traceMeta(memory);
+      return trace?.episodeId === episodeId && trace.rawTurnId && rawTurnIds.has(trace.rawTurnId)
+        ? [trace.id]
+        : [];
+    });
+  }
+
+  private retireLongTrajectoryCandidatesForPath(pathId: string, reason: string, at: string): void {
+    for (const candidateId of this.deps.repos.longTrajectory.listAffectedCandidateIdsForPath(pathId)) {
+      this.deps.repos.transaction(() => {
+        const candidate = this.deps.repos.longTrajectory.getCandidate(candidateId);
+        if (!candidate) return;
+        if (candidate.activeSkillMemoryId) {
+          this.archiveProceduralSkillMemory(candidate.activeSkillMemoryId, reason, at);
+        }
+        if (candidate.status === "retired") return;
+        this.deps.repos.longTrajectory.retireCandidate({
+          candidateId,
+          expectedActiveVersionId: candidate.activeVersionId ?? null,
+          retiredAt: at
+        });
+      });
+    }
+  }
+
+  private rejectLongTrajectorySkill(
+    candidate: LongTrajectoryCandidateRecord,
+    candidateVersionId: string,
+    reason: string,
+    job: EvolutionJobRecord
+  ): void {
+    const at = new Date().toISOString();
+    this.deps.repos.transaction(() => {
+      const current = this.deps.repos.longTrajectory.getCandidate(candidate.id);
+      if (!current || current.status !== "active" ||
+          current.activeVersionId !== candidateVersionId) return;
+      this.rejectLongTrajectorySkillInTransaction(
+        current,
+        candidateVersionId,
+        reason,
+        job,
+        at
+      );
+    });
+  }
+
+  private recordLongTrajectorySkillRejection(
+    candidate: LongTrajectoryCandidateRecord,
+    candidateVersionId: string,
+    reason: string,
+    job: EvolutionJobRecord
+  ): void {
+    const at = new Date().toISOString();
+    this.deps.repos.transaction(() => {
+      const current = this.deps.repos.longTrajectory.getCandidate(candidate.id);
+      if (!current || current.status !== "active" ||
+          current.activeVersionId !== candidateVersionId) return;
+      this.deps.repos.longTrajectory.recordRejectedSkillVersion({
+        candidateId: current.id,
+        candidateVersionId,
+        expectedActiveSkillVersionId: current.activeSkillVersionId ?? null,
+        skillKey: proceduralSkillKey(current.userId, current.id),
+        contentHash: stableHash({ candidateVersionId, admitted: false, reason }),
+        payload: {
+          admitted: false,
+          candidateVersionId,
+          reason,
+          jobId: job.id,
+          preservedActiveSkillVersionId: current.activeSkillVersionId ?? null,
+          preservedActiveSkillMemoryId: current.activeSkillMemoryId ?? null
+        },
+        createdAt: at
+      });
+    });
+  }
+
+  /** Caller must hold the repository write transaction. */
+  private rejectLongTrajectorySkillInTransaction(
+    candidate: LongTrajectoryCandidateRecord,
+    candidateVersionId: string,
+    reason: string,
+    job: EvolutionJobRecord,
+    at: string
+  ): void {
+    if (candidate.activeSkillMemoryId) {
+      this.archiveProceduralSkillMemory(candidate.activeSkillMemoryId, reason, at);
+    }
+    this.deps.repos.longTrajectory.saveSkillVersion({
+      candidateId: candidate.id,
+      candidateVersionId,
+      expectedActiveSkillVersionId: candidate.activeSkillVersionId ?? null,
+      skillKey: proceduralSkillKey(candidate.userId, candidate.id),
+      contentHash: stableHash({ candidateVersionId, admitted: false, reason }),
+      payload: { admitted: false, candidateVersionId, reason, jobId: job.id },
+      createdAt: at
     });
   }
 
@@ -785,8 +1822,9 @@ export class ProceduralTrajectoryPipeline {
   private async persistAndEmbedWindows(
     occurrences: TrajectoryWindowOccurrenceV1[],
     stepVectorById: Map<string, number[]>,
-    config: PipelineConfig,
-    at: string
+    windowConfigHash: string,
+    at: string,
+    refreshExistingEvidence: boolean
   ): Promise<EmbeddedTrajectoryWindowV1[]> {
     const signature = this.embeddingSignature();
     const missing = occurrences.filter((occurrence) =>
@@ -803,11 +1841,12 @@ export class ProceduralTrajectoryPipeline {
     ]));
     for (const occurrence of occurrences) {
       const existing = this.deps.repos.proceduralTrajectory.getWindow(occurrence.id);
+      if (existing && !refreshExistingEvidence) continue;
       const coarseVector = existing?.coarseVector ??
         newVectorByOccurrenceId.get(occurrence.id) ?? [];
       this.deps.repos.proceduralTrajectory.insertWindow({
         occurrence,
-        windowConfigHash: config.mechanicalWindowHash,
+        windowConfigHash,
         coarseRepresentationVersion: WINDOW_INTENT_SEQUENCE_REPRESENTATION_VERSION,
         embeddingSignature: signature,
         coarseVector,
@@ -1269,30 +2308,35 @@ export class ProceduralTrajectoryPipeline {
     return [...ids].sort();
   }
 
-  private maximalQualifiedClusters(
+  private maximalQualifiedClustersForAffected(
     userId: string,
+    affectedClusterIds: Set<string>,
     config: PipelineConfig
   ): ClusterSnapshot[] {
-    const qualified = config.specs.flatMap((spec) =>
-      this.deps.repos.proceduralTrajectory.listActiveClusterHeads({
-        userId,
-        scale: spec.length,
-        algorithmVersion: config.algorithmVersion,
-        configHash: config.clusteringConfigHash
-      }).flatMap((head) => {
-        const snapshot = this.loadClusterSnapshot(head, config);
-        return snapshot?.core &&
-          snapshot.version.supportEpisodeCount >= config.minSupportEpisodes
-          ? [snapshot]
-          : [];
-      }));
+    const scope = this.deps.repos.proceduralTrajectory.listMaximalityScope({
+      userId,
+      algorithmVersion: config.algorithmVersion,
+      configHash: config.clusteringConfigHash,
+      affectedClusterIds: [...affectedClusterIds]
+    });
+    const targetIds = new Set(scope.targetClusterIds);
+    const qualified = scope.contextClusterIds.flatMap((clusterId) => {
+      const head = this.deps.repos.proceduralTrajectory.getClusterHead(clusterId);
+      if (!head || head.status !== "active") return [];
+      const snapshot = this.loadClusterSnapshot(head, config);
+      return snapshot?.core &&
+        snapshot.version.supportEpisodeCount >= config.minSupportEpisodes
+        ? [snapshot]
+        : [];
+    });
     const selectedById = new Map(selectMaximalWindowClusters(
       qualified.map((snapshot) => snapshot.domain)
     ).map((domain) => [domain.id, domain]));
-    return qualified.map((snapshot) => ({
-      ...snapshot,
-      domain: selectedById.get(snapshot.domain.id) ?? snapshot.domain
-    }));
+    return qualified.filter((snapshot) => targetIds.has(snapshot.head.id))
+      .map((snapshot) => ({
+        ...snapshot,
+        domain: selectedById.get(snapshot.domain.id) ?? snapshot.domain
+      }));
   }
 
   private reconcileSkillEligibility(
@@ -1301,7 +2345,11 @@ export class ProceduralTrajectoryPipeline {
     config: PipelineConfig,
     at: string
   ): void {
-    const maximal = this.maximalQualifiedClusters(userId, config);
+    const maximal = this.maximalQualifiedClustersForAffected(
+      userId,
+      affectedClusterIds,
+      config
+    );
     const maximalIds = new Set(maximal.filter((snapshot) =>
       !snapshot.domain.suppressedByClusterId).map((snapshot) => snapshot.head.id));
     const qualifiedIds = new Set(maximal.map((snapshot) => snapshot.head.id));
@@ -1580,27 +2628,11 @@ export class ProceduralTrajectoryPipeline {
     if (!completionOverlay) return undefined;
     const completionActivated = completionOverlay.sharedPrefix.length > 0 ||
       completionOverlay.sharedSuffix.length > 0;
-    const effectiveCompletionOverlay = completionActivated
-      ? completionOverlay
-      : {
-          ...completionOverlay,
-          id: `anchored_completion_${stableHash({
-            version: ANCHORED_COMPLETION_SCHEMA_VERSION,
-            mode: "core_only",
-            commonCoreId: core.id,
-            referenceOccurrenceId: completionOverlay.referenceOccurrenceId
-          }).slice(0, 24)}`,
-          maxPrefixSteps: 0,
-          maxSuffixSteps: 0,
-          sharedPrefix: [],
-          sharedSuffix: [],
-          projections: completionOverlay.projections.map((item) => ({
-            occurrenceId: item.occurrenceId,
-            prefix: [],
-            suffix: []
-          })),
-          extensionAgreement: 0
-        };
+    // Keep bounded occurrence-local outward Steps in the Skill input even when
+    // no extension is repeated across two Episodes. They remain local_context
+    // and may only become provisional conditional guidance; mandatory
+    // procedure/verification evidence still requires shared_extension.
+    const effectiveCompletionOverlay = completionOverlay;
     const projectionByOccurrenceId = new Map(
       effectiveCompletionOverlay.projections.map((item) => [
       item.occurrenceId,
@@ -1608,8 +2640,8 @@ export class ProceduralTrajectoryPipeline {
     ]));
     const evidence: ProceduralSkillEvidenceOccurrence[] = drafts.flatMap((draft) => {
       const projection = projectionByOccurrenceId.get(draft.span.id);
-      const effectivePrefixSteps = completionActivated ? draft.prefixSteps : [];
-      const effectiveSuffixSteps = completionActivated ? draft.suffixSteps : [];
+      const effectivePrefixSteps = draft.prefixSteps;
+      const effectiveSuffixSteps = draft.suffixSteps;
       if (!projection || projection.prefix.length !== effectivePrefixSteps.length ||
           projection.suffix.length !== effectiveSuffixSteps.length) return [];
       const expansionSteps = (
@@ -1638,9 +2670,7 @@ export class ProceduralTrajectoryPipeline {
         alignmentScore: draft.span.averageMatchSimilarity,
         sourceTraceIds: this.sourceTraceIdsForSteps(
           draft.span.episodeId,
-          completionActivated
-            ? [...draft.prefixSteps, ...draft.coreTraceSteps, ...draft.suffixSteps]
-            : draft.coreTraceSteps
+          [...draft.prefixSteps, ...draft.coreTraceSteps, ...draft.suffixSteps]
         ),
         prefixExpansion: expansionSteps(
           effectivePrefixSteps,
@@ -1654,19 +2684,11 @@ export class ProceduralTrajectoryPipeline {
           "suffix"
         ),
         boundaryContextReadOnly: {
-          ...((completionActivated
-            ? draft.expandedPreviousStep
-            : draft.corePreviousStep)
-            ? { previousStep: skillEvidenceStep((completionActivated
-                ? draft.expandedPreviousStep
-                : draft.corePreviousStep)!) }
+          ...(draft.expandedPreviousStep
+            ? { previousStep: skillEvidenceStep(draft.expandedPreviousStep) }
             : {}),
-          ...((completionActivated
-            ? draft.expandedNextStep
-            : draft.coreNextStep)
-            ? { nextStep: skillEvidenceStep((completionActivated
-                ? draft.expandedNextStep
-                : draft.coreNextStep)!) }
+          ...(draft.expandedNextStep
+            ? { nextStep: skillEvidenceStep(draft.expandedNextStep) }
             : {})
         }
       }];
@@ -1713,6 +2735,65 @@ export class ProceduralTrajectoryPipeline {
     };
   }
 
+  private async retrieveV2ComparisonSkills(
+    draft: ProceduralPatternSkillDraft
+  ): Promise<ProceduralSkillComparisonCandidate[]> {
+    const input = draft.input;
+    const eligible = this.deps.repos.memories
+      .list({
+        userId: input.userId,
+        memoryLayer: "Skill",
+        status: ["activated", "resolving"]
+      }, 1_000)
+      .flatMap((memory) => {
+        const route = proceduralSkillComparisonRoute(memory);
+        const skill = skillMetaFromMemory(memory);
+        if (!route || !skill || skill.status === "archived") return [];
+        return [{ memory, route, skill }];
+      });
+    if (eligible.length === 0) return [];
+
+    const queryText = [
+      draft.parsed.triggerContext,
+      draft.parsed.summary,
+      ...draft.parsed.procedureSteps.flatMap((step) => [step.title, step.body]),
+      ...draft.parsed.verificationSteps.flatMap((step) => [step.check, step.successSignal])
+    ].filter(Boolean).join("\n");
+    let queryVector: number[] | undefined;
+    try {
+      if (queryText.trim() && this.deps.embedder.status().configured) {
+        queryVector = unitVector(await this.deps.embedder.embedOne(queryText, "query"));
+      }
+    } catch {
+      // Retrieval must degrade to local lexical ranking rather than fail the
+      // durable Skill induction job when the embedding endpoint is transiently unavailable.
+      queryVector = undefined;
+    }
+    const ranked = eligible
+      .map(({ memory, route, skill }) => {
+        const vectorScore = queryVector && skill.vec?.length === queryVector.length
+          ? cosineSimilarity(queryVector, skill.vec)
+          : 0;
+        const lexicalScore = lexicalSkillSimilarity(queryText, skill.invocationGuide);
+        return {
+          candidate: proceduralSkillComparisonCandidate(memory, route),
+          score: Math.max(vectorScore, lexicalScore)
+        };
+      })
+      .sort((left, right) => right.score - left.score ||
+        left.candidate.memoryId.localeCompare(right.candidate.memoryId));
+    const oldAndV3 = ranked
+      .filter((item) => item.candidate.route === "OLD" || item.candidate.route === "V3")
+      .slice(0, V2_SKILL_COMPARISON_LIMIT_PER_PHASE);
+    const v2 = ranked
+      .filter((item) => item.candidate.route === "V2")
+      .slice(0, V2_SKILL_COMPARISON_LIMIT_PER_PHASE);
+    // Keep the phases physically ordered as well as explicitly separated in
+    // the prompt. A dense V2 neighborhood cannot crowd OLD/V3 containment out,
+    // and serialized V2 jobs expose earlier same-batch materializations here.
+    return [...oldAndV3, ...v2].map((item) => item.candidate);
+  }
+
   private sourceTraceIdsForSteps(episodeId: string, steps: ExecutionStepLiteV1[]): string[] {
     const episode = this.deps.repos.runtime.getEpisode(episodeId);
     if (!episode) return [];
@@ -1745,23 +2826,82 @@ export class ProceduralTrajectoryPipeline {
     clusterVersionId: string,
     config: PipelineConfig
   ): boolean {
-    if (!head.activeSkillVersionId) return false;
-    const version = this.deps.repos.proceduralTrajectory.getSkillVersion(
-      head.activeSkillVersionId
-    );
-    if (!version || version.clusterVersionId !== clusterVersionId) return false;
-    if (version.payload.inductionVersion !== this.skillInductionVersion(config)) {
-      return false;
+    const inductionVersion = this.skillInductionVersion(config);
+    const activeVersion = head.activeSkillVersionId
+      ? this.deps.repos.proceduralTrajectory.getSkillVersion(head.activeSkillVersionId)
+      : undefined;
+    if (activeVersion?.clusterVersionId === clusterVersionId &&
+        activeVersion.payload.inductionVersion === inductionVersion) {
+      if (activeVersion.skillMemoryId) return this.activeSkillMatchesClusterVersion(
+        head,
+        clusterVersionId
+      );
+      const reason = typeof activeVersion.payload.reason === "string"
+        ? activeVersion.payload.reason
+        : "";
+      return !reason.startsWith("maximal-suppressed-by:") &&
+        reason !== "not-maximal-qualified";
     }
-    if (version.skillMemoryId) return this.activeSkillMatchesClusterVersion(
-      head,
-      clusterVersionId
-    );
+    const version = this.deps.repos.proceduralTrajectory.listSkillVersions(head.id)
+      .find((candidate) => candidate.clusterVersionId === clusterVersionId &&
+        !candidate.skillMemoryId && candidate.payload.admitted === false &&
+        candidate.payload.inductionVersion === inductionVersion);
+    if (!version) return false;
     const reason = typeof version.payload.reason === "string" ? version.payload.reason : "";
     // A previously suppressed shorter Skill must be reconsidered when the
     // covering longer cluster disappears. Other decisions are current for this
     // immutable membership version.
     return !reason.startsWith("maximal-suppressed-by:") && reason !== "not-maximal-qualified";
+  }
+
+  private recordProceduralSkillRejection(
+    head: TrajectoryWindowClusterRecord,
+    version: TrajectoryWindowClusterVersionRecord | undefined,
+    reason: string,
+    at: string,
+    coverageDecision?: {
+      decision: "covered";
+      relation: "equivalent" | "subset";
+      reason: string;
+      targetSkillId: string;
+      targetRoute: "OLD" | "V2" | "V3";
+    },
+    rawCoverageDecision?: Record<string, unknown>
+  ): void {
+    if (!version || head.status !== "active" || head.activeVersionId !== version.id) return;
+    const inductionVersion = this.skillInductionVersion(this.pipelineConfig());
+    this.deps.repos.transaction(() => {
+      const current = this.deps.repos.proceduralTrajectory.getClusterHead(head.id);
+      if (!current || current.status !== "active" || current.activeVersionId !== version.id) return;
+      this.deps.repos.proceduralTrajectory.recordRejectedSkillVersion({
+        clusterId: current.id,
+        clusterVersionId: version.id,
+        expectedActiveSkillVersionId: current.activeSkillVersionId ?? null,
+        skillKey: proceduralSkillKey(current.userId, current.id),
+        payload: {
+          admitted: false,
+          inductionVersion,
+          reason,
+          clusterVersionId: version.id,
+          supportEpisodeCount: version.supportEpisodeCount,
+          preservedActiveSkillVersionId: current.activeSkillVersionId ?? null,
+          preservedActiveSkillMemoryId: current.activeSkillMemoryId ?? null,
+          ...(coverageDecision ? {
+            coverageDecision,
+            suppressedBySkillId: coverageDecision.targetSkillId,
+            suppressedByRoute: coverageDecision.targetRoute
+          } : {}),
+          ...(rawCoverageDecision ? { rawCoverageDecision } : {})
+        },
+        contentHash: stableHash({
+          admitted: false,
+          clusterVersionId: version.id,
+          inductionVersion,
+          reason
+        }),
+        createdAt: at
+      });
+    });
   }
 
   private clusterHadFormalSkill(clusterId: string): boolean {
@@ -1800,7 +2940,14 @@ export class ProceduralTrajectoryPipeline {
       // Archive first and advance the rejection head second, but keep both in
       // one SQLite transaction. A CAS failure or process error rolls the
       // archive back, so the head can never forget a still-retrievable Skill.
-      if (oldMemoryId) this.archiveProceduralSkillMemory(oldMemoryId, reason, at);
+      const otherActiveOwners = oldMemoryId
+        ? this.deps.repos.proceduralTrajectory
+          .listActiveClusterHeadsBySkillMemoryId(oldMemoryId)
+          .filter((candidate) => candidate.id !== current.id)
+        : [];
+      if (oldMemoryId && otherActiveOwners.length === 0) {
+        this.archiveProceduralSkillMemory(oldMemoryId, reason, at);
+      }
       this.deps.repos.proceduralTrajectory.saveSkillVersion({
         clusterId: current.id,
         clusterVersionId: version.id,
@@ -1828,7 +2975,7 @@ export class ProceduralTrajectoryPipeline {
     const memory = this.deps.repos.memories.get(memoryId);
     if (!memory || memory.status === "archived") return;
     const internal = memory.properties.internal_info;
-    if (internal.plugin_algorithm !== "procedural.pattern.skill.v1") return;
+    if (!isProceduralSkillAlgorithm(internal.plugin_algorithm)) return;
     const internalSkill = isRecord(internal.skill) ? internal.skill : {};
     const archived = this.deps.repos.memories.update({
       ...memory,
@@ -1864,7 +3011,9 @@ export class ProceduralTrajectoryPipeline {
       changeType: "procedural_skill_cluster_retired",
       before: memory,
       after: archived,
-      source: "worker.procedural_skill_induction.lifecycle.v1",
+      source: internal.plugin_algorithm === LONG_TRAJECTORY_SKILL_ALGORITHM
+        ? "worker.long_trajectory_induction.lifecycle.v1"
+        : "worker.procedural_skill_induction.lifecycle.v1",
       createdAt: at
     });
   }
@@ -2012,12 +3161,33 @@ export class ProceduralTrajectoryPipeline {
   private proceduralSkillGovernanceDisabled(
     head: TrajectoryWindowClusterRecord
   ): boolean {
-    const memory = this.deps.repos.memories.getByKeyIncludingDeleted(
+    const linkedMemory = head.activeSkillMemoryId
+      ? this.deps.repos.memories.getIncludingDeleted(head.activeSkillMemoryId)
+      : undefined;
+    const ownedMemory = this.deps.repos.memories.getByKeyIncludingDeleted(
       "Skill",
       proceduralSkillKey(head.userId, head.id)
     );
-    if (!memory || memory.userId !== head.userId ||
-        memory.properties.internal_info.plugin_algorithm !== "procedural.pattern.skill.v1") {
+    for (const memory of unique([linkedMemory, ownedMemory].filter(isDefined))) {
+      if (memory.userId !== head.userId ||
+          memory.properties.internal_info.plugin_algorithm !==
+            PROCEDURAL_PATTERN_SKILL_ALGORITHM) continue;
+      const governance = memory.properties.internal_info.procedural_governance;
+      if (isRecord(governance) && governance.disabled === true) return true;
+    }
+    return false;
+  }
+
+  private longTrajectorySkillGovernanceDisabled(
+    candidate: LongTrajectoryCandidateRecord
+  ): boolean {
+    const memory = this.deps.repos.memories.getByKeyIncludingDeleted(
+      "Skill",
+      proceduralSkillKey(candidate.userId, candidate.id)
+    );
+    if (!memory || memory.userId !== candidate.userId ||
+        memory.properties.internal_info.plugin_algorithm !==
+          LONG_TRAJECTORY_SKILL_ALGORITHM) {
       return false;
     }
     const governance = memory.properties.internal_info.procedural_governance;
@@ -2080,6 +3250,85 @@ function skillEvidenceStep(step: ExecutionStepLiteV1): ProceduralSkillEvidenceSt
   };
 }
 
+function longTrajectoryEvidenceSignature(trajectory: LongCommonTrajectoryV1): string {
+  return stableHash({
+    version: "long-trajectory-evidence-signature.v1",
+    supportEpisodeIds: [...trajectory.supportEpisodeIds].sort(),
+    occurrences: trajectory.occurrences.map((occurrence) => ({
+      episodeId: occurrence.episodeId,
+      episodeSpanIds: occurrence.matches.map((match) => match.episodeSpanId)
+    })).sort((left, right) => left.episodeId.localeCompare(right.episodeId))
+  });
+}
+
+function longTrajectoryQuality(trajectory: LongCommonTrajectoryV1): number {
+  const coveredSpanSteps = trajectory.requiredSpans.reduce(
+    (sum, span) => sum + span.scale,
+    0
+  );
+  return trajectory.supportEpisodeIds.length * coveredSpanSteps *
+    trajectory.averageEpisodeCoverage * trajectory.averageCoarseSimilarity;
+}
+
+function longCommonTrajectoryFromPayload(value: unknown): LongCommonTrajectoryV1 | undefined {
+  if (!isRecord(value) ||
+      value.schemaVersion !== "long-common-span-sequence.v1" ||
+      typeof value.id !== "string" ||
+      typeof value.familyId !== "string" ||
+      typeof value.referenceEpisodeId !== "string" ||
+      typeof value.candidateStructureKey !== "string" ||
+      typeof value.structureHash !== "string" ||
+      !Array.isArray(value.requiredSpans) ||
+      !Array.isArray(value.supportEpisodeIds) ||
+      !Array.isArray(value.occurrences)) return undefined;
+  return value as unknown as LongCommonTrajectoryV1;
+}
+
+function uniqueDocuments(
+  documents: readonly EpisodeTrajectoryDocumentV1[]
+): EpisodeTrajectoryDocumentV1[] {
+  const byEpisodeId = new Map<string, EpisodeTrajectoryDocumentV1>();
+  for (const document of documents) byEpisodeId.set(document.path.episodeId, document);
+  return [...byEpisodeId.values()].sort((left, right) =>
+    left.path.episodeId.localeCompare(right.path.episodeId));
+}
+
+function longTrajectoryRowContainsInEpisode(
+  container: LongTrajectorySkillCandidateRow,
+  candidate: LongTrajectorySkillCandidateRow,
+  episodeId: string
+): boolean {
+  const containerOccurrence = container.trajectory.occurrences.find((item) =>
+    item.episodeId === episodeId);
+  const candidateOccurrence = candidate.trajectory.occurrences.find((item) =>
+    item.episodeId === episodeId);
+  if (!containerOccurrence || !candidateOccurrence) return false;
+  const coveredSteps = new Set(containerOccurrence.matches.flatMap((match) =>
+    integerRange(match.episodeStartStepIndex, match.episodeEndStepIndex)));
+  const candidateSteps = new Set(candidateOccurrence.matches.flatMap((match) =>
+    integerRange(match.episodeStartStepIndex, match.episodeEndStepIndex)));
+  return candidateSteps.size > 0 && [...candidateSteps].every((step) => coveredSteps.has(step));
+}
+
+function dedupeLongTrajectoryRows(
+  rows: readonly LongTrajectorySkillCandidateRow[]
+): LongTrajectorySkillCandidateRow[] {
+  const byStructure = new Map<string, LongTrajectorySkillCandidateRow>();
+  for (const row of rows) {
+    const current = byStructure.get(row.candidateStructureKey);
+    if (!current || row.quality > current.quality ||
+        (row.quality === current.quality &&
+          row.trajectory.id.localeCompare(current.trajectory.id) < 0)) {
+      byStructure.set(row.candidateStructureKey, row);
+    }
+  }
+  return [...byStructure.values()];
+}
+
+function integerRange(start: number, end: number): number[] {
+  return Array.from({ length: Math.max(0, end - start + 1) }, (_, index) => start + index);
+}
+
 function rewardHashForEpisode(episode: {
   id: string;
   rTask?: number;
@@ -2121,6 +3370,64 @@ function orderedWindowsForIngestion(
     left.occurrence.id.localeCompare(right.occurrence.id));
 }
 
+function proceduralSkillComparisonRoute(
+  memory: MemoryRow
+): ProceduralSkillComparisonCandidate["route"] | undefined {
+  const algorithm = memory.properties.internal_info.plugin_algorithm;
+  if (algorithm === LEGACY_SKILL_ALGORITHM) return "OLD";
+  if (algorithm === PROCEDURAL_PATTERN_SKILL_ALGORITHM) return "V2";
+  if (algorithm === LONG_TRAJECTORY_SKILL_ALGORITHM) return "V3";
+  return undefined;
+}
+
+function proceduralSkillComparisonCandidate(
+  memory: MemoryRow,
+  route: ProceduralSkillComparisonCandidate["route"]
+): ProceduralSkillComparisonCandidate {
+  const meta = skillMetaFromMemory(memory);
+  const internal = memory.properties.internal_info;
+  const internalSkill = isRecord(internal.skill) ? internal.skill : {};
+  const procedure = isRecord(internal.procedure_json)
+    ? internal.procedure_json
+    : isRecord(internalSkill.procedure_json)
+      ? internalSkill.procedure_json
+      : {};
+  const steps = Array.isArray(procedure.steps)
+    ? procedure.steps.filter(isRecord).map((step) => ({
+        title: typeof step.title === "string" ? step.title : "",
+        body: typeof step.body === "string" ? step.body : "",
+        verification: step.kind === "verification" ||
+          (typeof step.title === "string" && /^verify\s*:/i.test(step.title))
+      })).filter((step) => step.title || step.body)
+    : [];
+  return {
+    memoryId: memory.id,
+    route,
+    name: meta?.name ?? memory.memoryKey ?? memory.id,
+    invocationGuide: meta?.invocationGuide ?? memory.memoryValue,
+    triggerContext: meta?.triggerContext ??
+      (typeof procedure.triggerContext === "string" ? procedure.triggerContext : ""),
+    summary: typeof procedure.summary === "string" ? procedure.summary : "",
+    procedureSteps: steps.filter((step) => !step.verification)
+      .map(({ title, body }) => ({ title, body })),
+    verificationSteps: steps.filter((step) => step.verification)
+      .map(({ title, body }) => ({ title, body }))
+  };
+}
+
+function lexicalSkillSimilarity(left: string, right: string): number {
+  const tokens = (value: string): Set<string> => new Set([
+    ...(value.toLowerCase().match(/[a-z0-9_][a-z0-9_./-]{2,}/g) ?? []),
+    ...(value.match(/[\p{Script=Han}]{2,}/gu) ?? [])
+  ]);
+  const leftTokens = tokens(left);
+  const rightTokens = tokens(right);
+  if (leftTokens.size === 0 || rightTokens.size === 0) return 0;
+  let overlap = 0;
+  for (const token of leftTokens) if (rightTokens.has(token)) overlap += 1;
+  return overlap / Math.sqrt(leftTokens.size * rightTokens.size);
+}
+
 function payloadString(job: EvolutionJobRecord, key: string): string | undefined {
   const value = job.payload[key];
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -2138,6 +3445,12 @@ function average(values: number[]): number {
 
 function unique<T>(values: T[]): T[] {
   return [...new Set(values)];
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? unique(value.filter((item): item is string => typeof item === "string" && item.length > 0))
+    : [];
 }
 
 function isDefined<T>(value: T | undefined): value is T {

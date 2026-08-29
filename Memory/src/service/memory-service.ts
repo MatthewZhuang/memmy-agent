@@ -309,7 +309,9 @@ export class MemoryService {
           splitBigTurn: (job) => this.evolutionJobs.splitBigTurn(job),
           compileEpisodePath: (job) => this.evolutionJobs.compileEpisodePath(job),
           ingestTrajectoryWindows: (job) => this.evolutionJobs.ingestTrajectoryWindows(job),
-          induceProceduralSkill: (job) => this.evolutionJobs.induceProceduralSkill(job)
+          induceProceduralSkill: (job) => this.evolutionJobs.induceProceduralSkill(job),
+          mineLongTrajectories: (job) => this.evolutionJobs.mineLongTrajectories(job),
+          induceLongTrajectorySkill: (job) => this.evolutionJobs.induceLongTrajectorySkill(job)
         },
         feedback: {
           applyReward: (job) => this.evolutionJobs.applyReward(job),

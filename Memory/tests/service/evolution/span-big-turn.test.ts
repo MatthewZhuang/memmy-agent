@@ -97,6 +97,23 @@ function createSpanBigTurnLlm(
           reason: "复杂开发任务已完成"
         } as unknown as T;
       }
+      if (options.operation.startsWith("procedural.step_semantics.")) {
+        const payload = JSON.parse(messages.at(-1)?.content ?? "{}") as {
+          stepCandidates?: Array<{
+            candidateId: string;
+            kind?: "tool_action" | "response_generation";
+            toolName?: string;
+          }>;
+        };
+        return {
+          steps: (payload.stepCandidates ?? []).map((candidate) => ({
+            candidate_id: candidate.candidateId,
+            include: candidate.kind !== "response_generation",
+            intent: `Execute reusable ${candidate.toolName ?? "task"} stage`,
+            summary: `${candidate.toolName ?? "task"} stage completed`
+          }))
+        } as unknown as T;
+      }
       if (options.operation === "span.big_turn.v1") {
         const selected = Array.isArray(spanResult)
           ? spanResult[Math.min(spanCallIndex, spanResult.length - 1)] ?? {}

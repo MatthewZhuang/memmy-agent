@@ -23,6 +23,7 @@
     "serve:dev": "tsx src/server/index.ts",
     "worker:run": "node dist/src/cli/index.js raw POST /worker/run",
     "kw-dual-skill:replay": "node --import tsx scripts/kw-dual-skill-replay.ts",
+    "kw-long-trajectory-v3:replay": "node --import tsx scripts/kw-long-trajectory-v3-replay.ts",
     "test": "vitest run --dir tests",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "package:npm": "node src/cli/npm/build-package.mjs",

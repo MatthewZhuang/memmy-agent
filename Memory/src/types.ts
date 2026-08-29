@@ -77,6 +77,8 @@ export type JobType =
   | "episode_path_compile"
   | "trajectory_window_ingest"
   | "procedural_skill_induction"
+  | "long_trajectory_mining"
+  | "long_trajectory_skill_induction"
   | "negative_experience"
   | "l2_association"
   | "l2_induction"

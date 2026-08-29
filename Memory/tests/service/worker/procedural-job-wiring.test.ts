@@ -83,9 +83,12 @@ describe("procedural trajectory Job wiring", () => {
     expect(thresholdChange).toContain("window-v1:cluster-v2");
   });
 
-  it("runs independent procedural Skill compilations with bounded worker concurrency", () => {
+  it("serializes V2 Skill compilations so same-batch reuse sees prior materialization", () => {
     expect(workerJobCanRunInParallel({
       jobType: "procedural_skill_induction"
+    } as Parameters<typeof workerJobCanRunInParallel>[0])).toBe(false);
+    expect(workerJobCanRunInParallel({
+      jobType: "long_trajectory_skill_induction"
     } as Parameters<typeof workerJobCanRunInParallel>[0])).toBe(true);
   });
 });

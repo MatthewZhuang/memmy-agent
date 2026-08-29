@@ -22,7 +22,10 @@ import { PROCEDURAL_STEP_EMBEDDING_SCHEMA_VERSION } from
   "../src/storage/procedural-trajectory-repository.js";
 import { buildTrajectoryWindows } from
   "../src/service/evolution/procedural-window-model.js";
-import { PROCEDURAL_PATTERN_SKILL_PROMPT_VERSION } from
+import {
+  PROCEDURAL_PATTERN_SKILL_PROMPT_VERSION,
+  PROCEDURAL_SKILL_COVERAGE_PROMPT_VERSION
+} from
   "../src/service/evolution/procedural-pattern-skill.js";
 import {
   evolutionJobDedupeKey,
@@ -64,6 +67,7 @@ interface CleanupResult {
 
 interface GuardStats {
   embeddingCalls: number;
+  comparisonQueryEmbeddingCalls: number;
   llmCalls: number;
   llmOperations: string[];
 }
@@ -95,7 +99,10 @@ interface ThresholdOverrides {
 }
 
 const PROCEDURAL_SKILL_ALGORITHM = "procedural.pattern.skill.v1";
-const ALLOWED_SKILL_OPERATION = `procedural.${PROCEDURAL_PATTERN_SKILL_PROMPT_VERSION}`;
+const ALLOWED_SKILL_OPERATIONS = new Set([
+  `procedural.${PROCEDURAL_PATTERN_SKILL_PROMPT_VERSION}`,
+  `procedural.${PROCEDURAL_SKILL_COVERAGE_PROMPT_VERSION}`
+]);
 const ALLOWED_JOB_TYPES = new Set([
   "trajectory_window_ingest",
   "procedural_skill_induction"
@@ -158,7 +165,12 @@ async function main(): Promise<void> {
       : cleanupDerivedState(targetDb.db, repos);
 
     const baseEmbedder = createEmbedder(config.embedding);
-    const guardStats: GuardStats = { embeddingCalls: 0, llmCalls: 0, llmOperations: [] };
+    const guardStats: GuardStats = {
+      embeddingCalls: 0,
+      comparisonQueryEmbeddingCalls: 0,
+      llmCalls: 0,
+      llmOperations: []
+    };
     const embedder = guardedEmbedder(baseEmbedder, guardStats);
     const embeddingSignature = proceduralEmbeddingSignature(embedder);
     const preflight = preflightPreservedEvidence(
@@ -342,20 +354,29 @@ function cleanupDerivedState(db: Database.Database, repos: Repositories): Cleanu
 
 function collectSkillReplaySeeds(db: Database.Database): SkillReplaySeed[] {
   const rows = db.prepare(
-    `SELECT clusters.id AS clusterId,
-            clusters.active_version_id AS clusterVersionId,
-            versions.version_no AS membershipVersion,
-            clusters.user_id AS userId,
-            skills.payload_json AS payloadJson
-     FROM trajectory_window_clusters AS clusters
-     JOIN trajectory_window_cluster_versions AS versions
-       ON versions.id = clusters.active_version_id
-     JOIN trajectory_skill_versions AS skills
-       ON skills.id = clusters.active_skill_version_id
-     WHERE clusters.status = 'active'
-       AND clusters.active_version_id IS NOT NULL
-       AND skills.status = 'active'
-     ORDER BY clusters.id`
+    `WITH ranked AS (
+       SELECT clusters.id AS clusterId,
+              clusters.active_version_id AS clusterVersionId,
+              versions.version_no AS membershipVersion,
+              clusters.user_id AS userId,
+              skills.payload_json AS payloadJson,
+              ROW_NUMBER() OVER (
+                PARTITION BY clusters.id
+                ORDER BY skills.created_at DESC, skills.id DESC
+              ) AS replayRank
+       FROM trajectory_window_clusters AS clusters
+       JOIN trajectory_window_cluster_versions AS versions
+         ON versions.id = clusters.active_version_id
+       JOIN trajectory_skill_versions AS skills
+         ON skills.cluster_id = clusters.id
+        AND skills.cluster_version_id = clusters.active_version_id
+       WHERE clusters.status = 'active'
+         AND clusters.active_version_id IS NOT NULL
+     )
+     SELECT clusterId, clusterVersionId, membershipVersion, userId, payloadJson
+     FROM ranked
+     WHERE replayRank = 1
+     ORDER BY clusterId`
   ).all() as Array<{
     clusterId: string;
     clusterVersionId: string;
@@ -485,6 +506,7 @@ function preflightPreservedEvidence(
     length: scale.length,
     stride: scale.stride
   }));
+  const proceduralScales = new Set(specs.map((spec) => spec.length));
   for (const row of rows) {
     const path = repos.proceduralTrajectory.getPath(row.id);
     if (!path || path.status !== "active") throw new Error(`Active Path not readable: ${row.id}`);
@@ -506,7 +528,10 @@ function preflightPreservedEvidence(
       ...path.path,
       ...(episode.rTask === undefined ? {} : { terminalReward: episode.rTask })
     }], specs);
-    const stored = repos.proceduralTrajectory.listWindowsForPath(path.id);
+    // A three-route source DB may also contain V3 Span-15 Windows. They are
+    // preserved by the backup but are outside this V2 5/10 replay basis.
+    const stored = repos.proceduralTrajectory.listWindowsForPath(path.id)
+      .filter((window) => proceduralScales.has(window.scale));
     const storedById = new Map(stored.map((window) => [window.id, window]));
     for (const occurrence of expected) {
       const existing = storedById.get(occurrence.id);
@@ -630,7 +655,11 @@ function guardedEmbedder(base: Embedder, stats: GuardStats): Embedder {
     isRemote: () => base.isRemote(),
     status: () => base.status(),
     embed: async () => reject("embed"),
-    embedOne: async () => reject("embedOne")
+    embedOne: async (text, mode) => {
+      if (mode !== "query") return reject(`embedOne:${mode}`);
+      stats.comparisonQueryEmbeddingCalls += 1;
+      return base.embedOne(text, mode);
+    }
   };
 }
 
@@ -638,7 +667,7 @@ function guardedSkillLlm(base: LlmClient, stats: GuardStats): LlmClient {
   const record = (options: LlmCompletionOptions): void => {
     stats.llmCalls += 1;
     stats.llmOperations.push(options.operation);
-    if (options.operation !== ALLOWED_SKILL_OPERATION) {
+    if (!ALLOWED_SKILL_OPERATIONS.has(options.operation)) {
       throw new Error(
         `Threshold-only replay blocked non-Skill LLM operation: ${options.operation}`
       );
@@ -754,7 +783,7 @@ function assertReplayGuards(db: Database.Database, stats: GuardStats): void {
   if (unexpected.length > 0) {
     throw new Error(`Replay created forbidden job types: ${unexpected.join(", ")}`);
   }
-  if (stats.llmOperations.some((operation) => operation !== ALLOWED_SKILL_OPERATION)) {
+  if (stats.llmOperations.some((operation) => !ALLOWED_SKILL_OPERATIONS.has(operation))) {
     throw new Error("Replay invoked a non-Skill LLM operation");
   }
 }

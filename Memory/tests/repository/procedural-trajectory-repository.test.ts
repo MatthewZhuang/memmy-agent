@@ -254,6 +254,178 @@ describe("procedural trajectory repository", () => {
     });
   });
 
+  it("versions and bundle-roundtrips V3 long-trajectory candidates", () => {
+    withRepositories(({ repos }) => {
+      const episodeId = "episode_long_repository";
+      const userId = "long-repository-user";
+      const rawTurnIds = ["raw_long_repository_1", "raw_long_repository_2"];
+      seedEpisode(repos, {
+        episodeId,
+        sessionId: "session_long_repository",
+        userId,
+        source: "codex",
+        rawTurnIds
+      });
+      const path = repos.proceduralTrajectory.savePathVersion({
+        path: testExecutionPath(
+          episodeId,
+          userId,
+          rawTurnIds,
+          "snapshot-long-repository"
+        ),
+        createdAt: AT
+      }).record;
+      const representation = repos.longTrajectory.upsertEpisodeRepresentation({
+        pathId: path.id,
+        episodeId,
+        userId,
+        representationVersion: "long-trajectory-episode-representation.v1",
+        embeddingSignature: "embed/model-a:3",
+        goalText: "Generate and validate a document",
+        terminalResultText: "The document passed validation",
+        goalHash: "goal-hash",
+        goalVector: [1, 0, 0],
+        trajectoryText: "write -> execute -> verify",
+        trajectoryHash: "trajectory-hash",
+        trajectoryVector: [0.9, 0.1, 0],
+        createdAt: AT
+      });
+      expect(representation.pathId).toBe(path.id);
+
+      const candidate = repos.longTrajectory.resolveCandidate({
+        userId,
+        algorithmVersion: "reference-span-sequence-mining.v1",
+        configHash: "long-config-v1",
+        structureKey: "long-structure-key",
+        createdAt: AT
+      }).record;
+      const candidateVersion = repos.longTrajectory.saveCandidateVersion({
+        candidateId: candidate.id,
+        expectedActiveVersionId: null,
+        structureHash: "long-structure-v1",
+        evidenceHash: "long-evidence-v1",
+        supportHash: "long-support-v1",
+        referenceEpisodeId: episodeId,
+        sourcePathIds: [path.id],
+        supportEpisodeIds: [episodeId],
+        payload: { skillInput: { origin: { kind: "long_trajectory" } } },
+        createdAt: AT
+      }).record;
+      repos.memories.insert(skillMemory("skill_long_repository", userId));
+      const admittedDecision = repos.longTrajectory.saveSkillVersion({
+        candidateId: candidate.id,
+        candidateVersionId: candidateVersion.id,
+        expectedActiveSkillVersionId: null,
+        skillKey: "skill:procedural:long-repository",
+        skillMemoryId: "skill_long_repository",
+        contentHash: "long-admitted-content-v1",
+        payload: { admitted: true, name: "last-known-good-v1" },
+        createdAt: AT
+      }).record;
+      expect(repos.longTrajectory.getCandidate(candidate.id)).toMatchObject({
+        activeVersionId: candidateVersion.id,
+        activeSkillVersionId: admittedDecision.id,
+        activeSkillMemoryId: "skill_long_repository"
+      });
+      expect(repos.longTrajectory.listAffectedCandidateIdsForPath(path.id))
+        .toEqual([candidate.id]);
+      expect(repos.longTrajectory.listActiveCandidatesLinkedToEpisodes({
+        userId,
+        algorithmVersion: "reference-span-sequence-mining.v1",
+        configHash: "long-config-v1",
+        episodeIds: [episodeId, "episode-unrelated"]
+      }).map((item) => item.id)).toEqual([candidate.id]);
+      expect(repos.longTrajectory.listActiveCandidates({
+        userId,
+        algorithmVersion: "reference-span-sequence-mining.v1",
+        configHash: "long-config-v1"
+      }).map((item) => item.id)).toEqual([candidate.id]);
+      expect(repos.longTrajectory.listActiveCandidates({
+        userId: "another-user",
+        algorithmVersion: "reference-span-sequence-mining.v1",
+        configHash: "long-config-v1"
+      })).toEqual([]);
+
+      const sameCandidate = repos.longTrajectory.resolveCandidate({
+        userId,
+        algorithmVersion: "reference-span-sequence-mining.v1",
+        configHash: "long-config-v1",
+        structureKey: "long-structure-key",
+        createdAt: "2026-08-27T08:25:00.000Z"
+      }).record;
+      expect(sameCandidate.id).toBe(candidate.id);
+      const expandedVersion = repos.longTrajectory.saveCandidateVersion({
+        candidateId: candidate.id,
+        expectedActiveVersionId: candidateVersion.id,
+        structureHash: "long-structure-v2",
+        evidenceHash: "long-evidence-v2",
+        supportHash: "long-support-v2",
+        referenceEpisodeId: episodeId,
+        sourcePathIds: [path.id],
+        supportEpisodeIds: [episodeId, "episode_additional_support"],
+        payload: {
+          evidenceDelta: {
+            previousCandidateVersionId: candidateVersion.id,
+            addedEpisodeIds: ["episode_additional_support"]
+          }
+        },
+        createdAt: "2026-08-27T08:25:00.000Z"
+      }).record;
+      expect(expandedVersion).toMatchObject({
+        candidateId: candidate.id,
+        versionNo: 2,
+        supersedesVersionId: candidateVersion.id,
+        evidenceHash: "long-evidence-v2"
+      });
+      expect(repos.longTrajectory.getCandidateVersion(candidateVersion.id)?.status)
+        .toBe("superseded");
+
+      const rejectedReplacement = repos.longTrajectory.recordRejectedSkillVersion({
+        candidateId: candidate.id,
+        candidateVersionId: expandedVersion.id,
+        expectedActiveSkillVersionId: admittedDecision.id,
+        skillKey: "skill:procedural:long-repository",
+        contentHash: "long-rejected-content-v2",
+        payload: {
+          admitted: false,
+          reason: "invalid-evidence-citation",
+          preservedActiveSkillVersionId: admittedDecision.id,
+          preservedActiveSkillMemoryId: "skill_long_repository"
+        },
+        createdAt: "2026-08-27T08:26:00.000Z"
+      }).record;
+      expect(rejectedReplacement).toMatchObject({
+        candidateVersionId: expandedVersion.id,
+        status: "superseded",
+        supersedesVersionId: admittedDecision.id
+      });
+      expect(rejectedReplacement.skillMemoryId).toBeUndefined();
+      expect(repos.longTrajectory.getCandidate(candidate.id)).toMatchObject({
+        activeVersionId: expandedVersion.id,
+        activeSkillVersionId: admittedDecision.id,
+        activeSkillMemoryId: "skill_long_repository"
+      });
+      expect(repos.longTrajectory.getSkillVersion(admittedDecision.id)?.status).toBe("active");
+      expect(repos.memories.get("skill_long_repository")?.status).toBe("activated");
+
+      const bundle = repos.runtime.exportBundleTables(true);
+      withRepositories(({ repos: imported }) => {
+        const result = imported.runtime.importBundleTables(bundle);
+        expect(result.inserted.long_trajectory_episode_representations).toBe(1);
+        expect(result.inserted.long_trajectory_candidates).toBe(1);
+        expect(result.inserted.long_trajectory_candidate_versions).toBe(2);
+        expect(result.inserted.long_trajectory_skill_versions).toBe(2);
+        expect(imported.longTrajectory.getCandidate(candidate.id)).toMatchObject({
+          activeVersionId: expandedVersion.id,
+          activeSkillVersionId: admittedDecision.id,
+          activeSkillMemoryId: "skill_long_repository"
+        });
+        expect(imported.longTrajectory.getSkillVersion(rejectedReplacement.id)?.status)
+          .toBe("superseded");
+      });
+    });
+  });
+
   it("versions overlapping Families and canonicalizes identical Fine evidence once", () => {
     withRepositories(({ repos, db }) => {
       const userId = "family-canonical-user";
@@ -620,6 +792,64 @@ describe("procedural trajectory repository", () => {
         v1.record.id,
         "2026-08-27T08:06:00.000Z"
       )).toMatchObject({ status: "retired", activeVersionId: v1.record.id });
+    });
+  });
+
+  it("resolves maximal admission from the affected Episode neighborhood only", () => {
+    withRepositories(({ repos }) => {
+      const userId = "maximality-scope-user";
+      const windows = ["a", "b", "c", "d", "e"].map((suffix, index) =>
+        seedWindow(repos, {
+          userId,
+          source: "codex",
+          suffix: `maximality-${suffix}`,
+          vector: [1, index / 100, 0]
+        }));
+      const createCluster = (
+        id: string,
+        members: [typeof windows[number], typeof windows[number]]
+      ) => {
+        const head = repos.proceduralTrajectory.createClusterHead({
+          id,
+          userId,
+          scale: 5,
+          algorithmVersion: "multi-scale-window.v2",
+          configHash: "maximality-config",
+          seedOccurrenceId: members[0].id,
+          createdAt: AT
+        }).record;
+        repos.proceduralTrajectory.commitClusterVersion({
+          clusterId: head.id,
+          expectedActiveVersionId: null,
+          medoidOccurrenceId: members[0].id,
+          members: members.map((member) => supportMember(
+            member.id,
+            `reward-${id}-${member.episodeId}`
+          )),
+          createdAt: AT
+        });
+        return head;
+      };
+      const affected = createCluster("cluster-maximality-affected", [windows[0]!, windows[1]!]);
+      const targetNeighbor = createCluster(
+        "cluster-maximality-target-neighbor",
+        [windows[0]!, windows[2]!]
+      );
+      const coveringContext = createCluster(
+        "cluster-maximality-cover-context",
+        [windows[2]!, windows[3]!]
+      );
+      createCluster("cluster-maximality-unrelated", [windows[3]!, windows[4]!]);
+
+      expect(repos.proceduralTrajectory.listMaximalityScope({
+        userId,
+        algorithmVersion: "multi-scale-window.v2",
+        configHash: "maximality-config",
+        affectedClusterIds: [affected.id]
+      })).toEqual({
+        targetClusterIds: [affected.id, targetNeighbor.id].sort(),
+        contextClusterIds: [affected.id, targetNeighbor.id, coveringContext.id].sort()
+      });
     });
   });
 
@@ -1006,6 +1236,39 @@ describe("procedural trajectory repository", () => {
       });
       expect(retry).toMatchObject({ created: false, reactivated: false, record: { id: v1.record.id } });
 
+      const rejected = repos.proceduralTrajectory.recordRejectedSkillVersion({
+        clusterId: head.id,
+        clusterVersionId: clusterVersion.id,
+        expectedActiveSkillVersionId: v1.record.id,
+        skillKey: "skill:trajectory:skill-user:cluster-a",
+        contentHash: "trajectory-skill-rejected-v2",
+        payload: {
+          admitted: false,
+          reason: "invalid-evidence-citation",
+          preservedActiveSkillVersionId: v1.record.id,
+          preservedActiveSkillMemoryId: "skill_trajectory_user"
+        },
+        createdAt: "2026-08-27T08:05:00.000Z"
+      });
+      expect(rejected).toMatchObject({
+        created: true,
+        record: { status: "superseded" }
+      });
+      expect(rejected.record.skillMemoryId).toBeUndefined();
+      expect(repos.proceduralTrajectory.getClusterHead(head.id)).toMatchObject({
+        activeSkillVersionId: v1.record.id,
+        activeSkillMemoryId: "skill_trajectory_user"
+      });
+      expect(repos.proceduralTrajectory.recordRejectedSkillVersion({
+        clusterId: head.id,
+        clusterVersionId: clusterVersion.id,
+        expectedActiveSkillVersionId: v1.record.id,
+        skillKey: "skill:trajectory:skill-user:cluster-a",
+        contentHash: "trajectory-skill-rejected-v2",
+        payload: { admitted: false, reason: "invalid-evidence-citation" },
+        createdAt: "2026-08-27T08:05:30.000Z"
+      })).toMatchObject({ created: false, record: { id: rejected.record.id } });
+
       const v2 = repos.proceduralTrajectory.saveSkillVersion({
         clusterId: head.id,
         clusterVersionId: clusterVersion.id,
@@ -1015,7 +1278,7 @@ describe("procedural trajectory repository", () => {
         payload: upstreamSkillSnapshot("Trajectory Skill v2"),
         createdAt: "2026-08-27T08:06:00.000Z"
       });
-      expect(v2.record).toMatchObject({ versionNo: 2, status: "active" });
+      expect(v2.record).toMatchObject({ versionNo: 3, status: "active" });
       expect(repos.proceduralTrajectory.getSkillVersion(v1.record.id)?.status)
         .toBe("superseded");
 
@@ -1040,7 +1303,7 @@ describe("procedural trajectory repository", () => {
           activeVersionId: clusterVersion.id,
           activeSkillVersionId: v1.record.id
         });
-        expect(imported.proceduralTrajectory.listSkillVersions(head.id)).toHaveLength(2);
+        expect(imported.proceduralTrajectory.listSkillVersions(head.id)).toHaveLength(3);
       });
     });
   });

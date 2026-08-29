@@ -225,6 +225,14 @@ export class EvolutionJobProcessor {
     return this.proceduralTrajectory.induceProceduralSkill(job);
   }
 
+  mineLongTrajectories(job: EvolutionJobRecord): Promise<void> {
+    return this.proceduralTrajectory.mineLongTrajectories(job);
+  }
+
+  induceLongTrajectorySkill(job: EvolutionJobRecord): Promise<void> {
+    return this.proceduralTrajectory.induceLongTrajectorySkill(job);
+  }
+
   invalidateProceduralEpisodeSources(input: {
     episodeId: string;
     reason: string;

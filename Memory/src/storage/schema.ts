@@ -1,7 +1,8 @@
 import type Database from "better-sqlite3";
+import { stableHash } from "../utils/id.js";
 
-export const SCHEMA_VERSION = 8;
-export const SCHEMA_MIGRATION_ID = "008_procedural_coarse_families";
+export const SCHEMA_VERSION = 11;
+export const SCHEMA_MIGRATION_ID = "011_procedural_maximality_scope_index";
 const API_LOG_SOURCE_AGENT_MIGRATION_FROM_VERSION = 2;
 const PROCESSING_TAGS = new Set([
   "摘要排队中",
@@ -414,6 +415,10 @@ const statements = [
     ON trajectory_window_cluster_members (cluster_version_id, evidence_role, episode_id)`,
   `CREATE INDEX IF NOT EXISTS idx_trajectory_window_cluster_members_occurrence
     ON trajectory_window_cluster_members (occurrence_id, cluster_version_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_trajectory_window_cluster_members_user_role_episode
+    ON trajectory_window_cluster_members (
+      user_id, evidence_role, episode_id, cluster_version_id
+    )`,
 
   `CREATE TABLE IF NOT EXISTS trajectory_window_cluster_canonical_keys (
     id TEXT PRIMARY KEY,
@@ -472,6 +477,100 @@ const statements = [
     ON trajectory_skill_versions (skill_memory_id, status, created_at DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_trajectory_skill_versions_cluster
     ON trajectory_skill_versions (cluster_id, created_at DESC, id DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS long_trajectory_episode_representations (
+    id TEXT PRIMARY KEY,
+    path_id TEXT NOT NULL REFERENCES episode_execution_paths(id) ON DELETE CASCADE,
+    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL,
+    representation_version TEXT NOT NULL,
+    embedding_signature TEXT NOT NULL,
+    goal_text TEXT NOT NULL,
+    terminal_result_text TEXT NOT NULL,
+    goal_hash TEXT NOT NULL,
+    goal_vector_json TEXT NOT NULL CHECK (json_valid(goal_vector_json)),
+    trajectory_text TEXT NOT NULL,
+    trajectory_hash TEXT NOT NULL,
+    trajectory_vector_json TEXT NOT NULL CHECK (json_valid(trajectory_vector_json)),
+    embedding_dim INTEGER NOT NULL CHECK (embedding_dim > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (path_id, representation_version, embedding_signature)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_long_trajectory_representations_scope
+    ON long_trajectory_episode_representations (
+      user_id, representation_version, embedding_signature, episode_id
+    )`,
+
+  `CREATE TABLE IF NOT EXISTS long_trajectory_candidates (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    structure_key TEXT NOT NULL,
+    evidence_signature TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retired')),
+    active_version_id TEXT,
+    active_skill_version_id TEXT,
+    active_skill_memory_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (user_id, algorithm_version, config_hash, structure_key)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_long_trajectory_candidates_structure
+    ON long_trajectory_candidates (
+      user_id, algorithm_version, config_hash, structure_key
+    )`,
+  `CREATE INDEX IF NOT EXISTS idx_long_trajectory_candidates_scope
+    ON long_trajectory_candidates (
+      user_id, algorithm_version, config_hash, status, updated_at DESC
+    )`,
+
+  `CREATE TABLE IF NOT EXISTS long_trajectory_candidate_versions (
+    id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL REFERENCES long_trajectory_candidates(id) ON DELETE CASCADE,
+    version_no INTEGER NOT NULL CHECK (version_no >= 1),
+    structure_hash TEXT NOT NULL,
+    evidence_hash TEXT NOT NULL,
+    support_hash TEXT NOT NULL,
+    reference_episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    source_path_ids_json TEXT NOT NULL CHECK (json_valid(source_path_ids_json)),
+    support_episode_ids_json TEXT NOT NULL CHECK (json_valid(support_episode_ids_json)),
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded')),
+    supersedes_version_id TEXT,
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    deactivated_at TEXT,
+    UNIQUE (candidate_id, version_no),
+    UNIQUE (candidate_id, structure_hash, evidence_hash, support_hash)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_long_trajectory_candidate_versions_active
+    ON long_trajectory_candidate_versions (candidate_id) WHERE status = 'active'`,
+  `CREATE INDEX IF NOT EXISTS idx_long_trajectory_candidate_versions_reference
+    ON long_trajectory_candidate_versions (reference_episode_id, status, created_at DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS long_trajectory_skill_versions (
+    id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL REFERENCES long_trajectory_candidates(id) ON DELETE CASCADE,
+    candidate_version_id TEXT NOT NULL REFERENCES long_trajectory_candidate_versions(id) ON DELETE CASCADE,
+    version_no INTEGER NOT NULL CHECK (version_no >= 1),
+    skill_key TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    skill_memory_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded')),
+    supersedes_version_id TEXT,
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    deactivated_at TEXT,
+    UNIQUE (candidate_id, version_no),
+    UNIQUE (candidate_version_id, content_hash)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_long_trajectory_skill_versions_active
+    ON long_trajectory_skill_versions (candidate_id) WHERE status = 'active'`,
+  `CREATE INDEX IF NOT EXISTS idx_long_trajectory_skill_versions_memory
+    ON long_trajectory_skill_versions (skill_memory_id, status, created_at DESC)`,
 
   `CREATE TABLE IF NOT EXISTS l3_world_model_input_traces (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -859,7 +958,7 @@ export function migrate(db: Database.Database): void {
   const hasMemories = tableExists(db, "memories");
   const version = currentSchemaVersion(db);
 
-  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7) {
+  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10) {
     throw new Error(
       `Unsupported memory database schema version ${version}; the database was left unchanged`
     );
@@ -880,6 +979,16 @@ export function migrate(db: Database.Database): void {
       if (version > 0 && version < 6) {
         addColumnIfMissing(db, "evolution_jobs", "scope_key", "TEXT");
         addColumnIfMissing(db, "evolution_jobs", "scope_seq", "INTEGER");
+      }
+      if (version === 9) {
+        addColumnIfMissing(db, "long_trajectory_candidates", "structure_key", "TEXT");
+        addColumnIfMissing(db, "long_trajectory_candidate_versions", "evidence_hash", "TEXT");
+        backfillLongTrajectoryCandidateStructureKeys(db);
+        db.prepare(
+          `UPDATE long_trajectory_candidate_versions
+           SET evidence_hash = support_hash
+           WHERE evidence_hash IS NULL OR trim(evidence_hash) = ''`
+        ).run();
       }
       for (const statement of statements) {
         db.prepare(statement).run();
@@ -982,6 +1091,82 @@ function addColumnIfMissing(
   if (!columnExists(db, table, column)) {
     db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
   }
+}
+
+function backfillLongTrajectoryCandidateStructureKeys(db: Database.Database): void {
+  if (!tableExists(db, "long_trajectory_candidates")) return;
+  const rows = db.prepare(
+    `SELECT candidates.id, candidates.user_id, candidates.algorithm_version,
+            candidates.config_hash, candidates.evidence_signature,
+            candidates.active_skill_memory_id, candidates.updated_at,
+            versions.payload_json
+     FROM long_trajectory_candidates AS candidates
+     LEFT JOIN long_trajectory_candidate_versions AS versions
+       ON versions.id = candidates.active_version_id`
+  ).all() as Array<{
+    id: string;
+    user_id: string;
+    algorithm_version: string;
+    config_hash: string;
+    evidence_signature: string;
+    active_skill_memory_id: string | null;
+    updated_at: string;
+    payload_json: string | null;
+  }>;
+  const grouped = new Map<string, Array<typeof rows[number] & { baseKey: string }>>();
+  for (const row of rows) {
+    const baseKey = longTrajectoryStructureKeyFromLegacyPayload(row.payload_json) ??
+      row.evidence_signature;
+    const scopeKey = [row.user_id, row.algorithm_version, row.config_hash, baseKey].join("\u0000");
+    const group = grouped.get(scopeKey) ?? [];
+    group.push({ ...row, baseKey });
+    grouped.set(scopeKey, group);
+  }
+  const update = db.prepare(
+    `UPDATE long_trajectory_candidates SET structure_key = ? WHERE id = ?`
+  );
+  for (const group of grouped.values()) {
+    group.sort((left, right) =>
+      Number(Boolean(right.active_skill_memory_id)) - Number(Boolean(left.active_skill_memory_id)) ||
+      right.updated_at.localeCompare(left.updated_at) ||
+      left.id.localeCompare(right.id));
+    for (const [index, row] of group.entries()) {
+      update.run(index === 0
+        ? row.baseKey
+        : `${row.baseKey}:legacy-duplicate:${row.id}`, row.id);
+    }
+  }
+}
+
+function longTrajectoryStructureKeyFromLegacyPayload(payloadJson: string | null): string | undefined {
+  if (!payloadJson) return undefined;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(payloadJson);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(payload) || !isRecord(payload.trajectory)) return undefined;
+  if (typeof payload.trajectory.candidateStructureKey === "string" &&
+      payload.trajectory.candidateStructureKey.trim()) {
+    return payload.trajectory.candidateStructureKey;
+  }
+  const requiredSpans = payload.trajectory.requiredSpans;
+  if (!Array.isArray(requiredSpans) || requiredSpans.length === 0) return undefined;
+  const semanticSequence = requiredSpans.flatMap((value) => {
+    if (!isRecord(value) || typeof value.semanticText !== "string") return [];
+    return value.semanticText.split(/\r?\n/u).map((line) => line
+        .toLowerCase()
+        .replace(/^\s*\d+[.)]\s*/u, "")
+        .replace(/[\p{P}\p{S}]+/gu, " ")
+        .replace(/\s+/gu, " ")
+        .trim()).filter(Boolean);
+  });
+  if (semanticSequence.length === 0) return undefined;
+  return stableHash({
+    version: "long-trajectory-candidate-structure.v1",
+    semanticSequence
+  });
 }
 
 function currentSchemaVersion(db: Database.Database): number {

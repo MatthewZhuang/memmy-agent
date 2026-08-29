@@ -281,6 +281,13 @@ export interface ActiveTrajectoryClusterMedoid {
   occurrence: TrajectoryWindowOccurrenceRecord;
 }
 
+export interface TrajectoryMaximalityScope {
+  /** Clusters whose maximal/suppressed decision may have changed. */
+  targetClusterIds: string[];
+  /** Targets plus every active longer-cover candidate needed for an exact decision. */
+  contextClusterIds: string[];
+}
+
 export interface TrajectoryWindowClusterCanonicalKeyRecord {
   id: string;
   userId: string;
@@ -355,6 +362,16 @@ export interface SaveTrajectorySkillVersionResult {
   created: boolean;
   reactivated: boolean;
   previousActive?: TrajectorySkillVersionRecord;
+}
+
+export interface RecordRejectedTrajectorySkillVersionInput {
+  clusterId: string;
+  clusterVersionId: string;
+  expectedActiveSkillVersionId: string | null;
+  skillKey: string;
+  payload: Record<string, unknown>;
+  contentHash: string;
+  createdAt: string;
 }
 
 export class ProceduralTrajectoryCasError extends Error {
@@ -697,6 +714,17 @@ export class ProceduralTrajectoryRepository {
       `SELECT * FROM episode_execution_paths
        WHERE episode_id = ? ORDER BY created_at DESC, id DESC`
     ).all(episodeId) as PathSqlRow[]).map(pathFromSql);
+  }
+
+  listActivePathsForUser(userId: string): EpisodeExecutionPathRecord[] {
+    return (this.db.prepare(
+      `SELECT paths.*
+       FROM episode_execution_paths AS paths
+       JOIN episodes ON episodes.id = paths.episode_id
+       WHERE paths.user_id = ? AND paths.status = 'active'
+         AND episodes.status = 'closed'
+       ORDER BY paths.episode_id ASC, paths.id ASC`
+    ).all(userId) as PathSqlRow[]).map(pathFromSql);
   }
 
   activatePathVersion(pathId: string, at: string): {
@@ -1364,6 +1392,106 @@ export class ProceduralTrajectoryRepository {
     ) as ClusterSqlRow[]).map(clusterFromSql);
   }
 
+  listActiveClusterHeadsBySkillMemoryId(
+    skillMemoryId: string
+  ): TrajectoryWindowClusterRecord[] {
+    return (this.db.prepare(
+      `SELECT * FROM trajectory_window_clusters
+       WHERE active_skill_memory_id = ? AND status = 'active'
+       ORDER BY created_at ASC, id ASC`
+    ).all(skillMemoryId) as ClusterSqlRow[]).map(clusterFromSql);
+  }
+
+  /**
+   * Resolves the local dependency scope for maximal sequence admission.
+   * Historical support Episodes keep previously suppressed shorter clusters
+   * visible when an affected longer cluster loses members. Current support
+   * Episodes then add every possible covering cluster as read-only context.
+   */
+  listMaximalityScope(input: {
+    userId: string;
+    algorithmVersion: string;
+    configHash: string;
+    affectedClusterIds: readonly string[];
+  }): TrajectoryMaximalityScope {
+    const affected = [...new Set(input.affectedClusterIds)].filter((id) => {
+      const cluster = this.getClusterHead(id);
+      return cluster?.userId === input.userId &&
+        cluster.algorithmVersion === input.algorithmVersion &&
+        cluster.configHash === input.configHash;
+    }).sort();
+    if (affected.length === 0) {
+      return { targetClusterIds: [], contextClusterIds: [] };
+    }
+    const supportEpisodesForClusters = (
+      clusterIds: readonly string[],
+      activeOnly: boolean
+    ): string[] => {
+      const episodeIds = new Set<string>();
+      for (const ids of chunked(clusterIds, 400)) {
+        const placeholders = ids.map(() => "?").join(", ");
+        const activeJoin = activeOnly
+          ? `JOIN trajectory_window_clusters AS clusters
+               ON clusters.id = versions.cluster_id
+              AND clusters.active_version_id = versions.id
+              AND clusters.status = 'active'`
+          : "";
+        const rows = this.db.prepare(
+          `SELECT DISTINCT members.episode_id AS episode_id
+           FROM trajectory_window_cluster_members AS members
+           JOIN trajectory_window_cluster_versions AS versions
+             ON versions.id = members.cluster_version_id
+           ${activeJoin}
+           WHERE versions.cluster_id IN (${placeholders})
+             AND members.evidence_role = 'support'`
+        ).all(...ids) as Array<{ episode_id: string }>;
+        for (const row of rows) episodeIds.add(row.episode_id);
+      }
+      return [...episodeIds].sort();
+    };
+    const activeClustersForEpisodes = (episodeIds: readonly string[]): string[] => {
+      const clusterIds = new Set<string>();
+      for (const ids of chunked(episodeIds, 400)) {
+        const placeholders = ids.map(() => "?").join(", ");
+        const rows = this.db.prepare(
+          `SELECT DISTINCT clusters.id AS id
+           FROM trajectory_window_cluster_members AS members
+           JOIN trajectory_window_cluster_versions AS versions
+             ON versions.id = members.cluster_version_id
+           JOIN trajectory_window_clusters AS clusters
+             ON clusters.active_version_id = versions.id
+           WHERE members.user_id = ? AND members.evidence_role = 'support'
+             AND members.episode_id IN (${placeholders})
+             AND clusters.user_id = ? AND clusters.algorithm_version = ?
+             AND clusters.config_hash = ? AND clusters.status = 'active'`
+        ).all(
+          input.userId,
+          ...ids,
+          input.userId,
+          input.algorithmVersion,
+          input.configHash
+        ) as Array<{ id: string }>;
+        for (const row of rows) clusterIds.add(row.id);
+      }
+      return [...clusterIds].sort();
+    };
+
+    const historicalEpisodes = supportEpisodesForClusters(affected, false);
+    const targetIds = new Set<string>([
+      ...affected.filter((id) => this.getClusterHead(id)?.status === "active"),
+      ...activeClustersForEpisodes(historicalEpisodes)
+    ]);
+    const currentTargetEpisodes = supportEpisodesForClusters([...targetIds], true);
+    const contextIds = new Set<string>([
+      ...targetIds,
+      ...activeClustersForEpisodes(currentTargetEpisodes)
+    ]);
+    return {
+      targetClusterIds: [...targetIds].sort(),
+      contextClusterIds: [...contextIds].sort()
+    };
+  }
+
   listActiveClusterMedoids(input: {
     userId: string;
     scale: number;
@@ -1898,6 +2026,63 @@ export class ProceduralTrajectoryRepository {
         reactivated: false,
         ...(previousActive ? { previousActive } : {})
       };
+    })();
+  }
+
+  /**
+   * Records a failed replacement attempt without changing the last-known-good
+   * public Skill or the cluster's active Skill head.
+   */
+  recordRejectedSkillVersion(
+    input: RecordRejectedTrajectorySkillVersionInput
+  ): { record: TrajectorySkillVersionRecord; created: boolean } {
+    return this.db.transaction(() => {
+      const cluster = this.requireCluster(input.clusterId);
+      if (cluster.status !== "active" || cluster.activeVersionId !== input.clusterVersionId) {
+        throw new Error("trajectory Skill rejection must use the active cluster version");
+      }
+      assertCas(
+        `${cluster.id}:skill`,
+        input.expectedActiveSkillVersionId,
+        cluster.activeSkillVersionId ?? null
+      );
+      const clusterVersion = this.requireClusterVersion(input.clusterVersionId);
+      if (clusterVersion.clusterId !== cluster.id) {
+        throw new Error("trajectory Skill cluster version does not belong to cluster");
+      }
+      const existing = this.getSkillVersionByContentHash(
+        clusterVersion.id,
+        input.contentHash
+      );
+      if (existing) return { record: existing, created: false };
+      const versionNo = this.nextSkillVersionNo(cluster.id);
+      const id = `trajectory_skill_version_${stableHash({
+        clusterId: cluster.id,
+        clusterVersionId: clusterVersion.id,
+        contentHash: input.contentHash
+      }).slice(0, 24)}`;
+      this.db.prepare(
+        `INSERT INTO trajectory_skill_versions (
+          id, cluster_id, cluster_version_id, version_no, skill_key,
+          membership_hash, support_hash, content_hash, skill_memory_id, status,
+          payload_json, supersedes_version_id, created_at, activated_at,
+          deactivated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'superseded', ?, ?, ?, NULL, ?)`
+      ).run(
+        id,
+        cluster.id,
+        clusterVersion.id,
+        versionNo,
+        input.skillKey,
+        clusterVersion.membershipHash,
+        clusterVersion.supportHash,
+        input.contentHash,
+        toJson(input.payload),
+        cluster.activeSkillVersionId ?? null,
+        input.createdAt,
+        input.createdAt
+      );
+      return { record: this.getSkillVersion(id)!, created: true };
     })();
   }
 
@@ -2554,4 +2739,12 @@ function skillVersionFromSql(row: SkillVersionSqlRow): TrajectorySkillVersionRec
     activatedAt: row.activated_at,
     deactivatedAt: row.deactivated_at
   };
+}
+
+function chunked<T>(values: readonly T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
 }

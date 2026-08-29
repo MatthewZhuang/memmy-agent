@@ -67,7 +67,8 @@ interface DrainResult {
   remainingByStatus: Record<string, number>;
 }
 
-const PROCEDURAL_SKILL_ALGORITHM = "procedural.pattern.skill.v1";
+const PROCEDURAL_V2_SKILL_ALGORITHM = "procedural.pattern.skill.v1";
+const PROCEDURAL_V3_SKILL_ALGORITHM = "procedural.long-trajectory.skill.v1";
 const UPSTREAM_SKILL_ALGORITHM = "skill.crystallization.v7";
 const CAPTURE_L1_ALGORITHM = "capture.v7";
 
@@ -165,7 +166,8 @@ async function main(): Promise<void> {
       cohortSource: cohortSourcePath ?? "explicit/default-all-closed",
       episodes: imported.episodes.length,
       oldSkills: artifact.skills.old.total,
-      newSkills: artifact.skills.new.total,
+      v2Skills: artifact.skills.v2.total,
+      v3Skills: artifact.skills.v3.total,
       drain
     }, null, 2)}\n`);
     if (!drain.drained) process.exitCode = 2;
@@ -419,10 +421,14 @@ function buildArtifact(input: {
       sourcePolicyIds: meta?.sourcePolicyIds ?? []
     };
   });
-  const newSkills = skills.filter((skill) => skill.pluginAlgorithm === PROCEDURAL_SKILL_ALGORITHM);
+  const v2Skills = skills.filter((skill) =>
+    skill.pluginAlgorithm === PROCEDURAL_V2_SKILL_ALGORITHM);
+  const v3Skills = skills.filter((skill) =>
+    skill.pluginAlgorithm === PROCEDURAL_V3_SKILL_ALGORITHM);
   const oldSkills = skills.filter((skill) => skill.pluginAlgorithm === UPSTREAM_SKILL_ALGORITHM);
   const unknownSkills = skills.filter((skill) =>
-    skill.pluginAlgorithm !== PROCEDURAL_SKILL_ALGORITHM &&
+    skill.pluginAlgorithm !== PROCEDURAL_V2_SKILL_ALGORITHM &&
+    skill.pluginAlgorithm !== PROCEDURAL_V3_SKILL_ALGORITHM &&
     skill.pluginAlgorithm !== UPSTREAM_SKILL_ALGORITHM
   );
   const summarizeSkills = (rows: typeof skills) => ({
@@ -434,7 +440,7 @@ function buildArtifact(input: {
   });
 
   return {
-    schemaVersion: "kw-dual-skill-replay.v2",
+    schemaVersion: "kw-three-route-skill-replay.v1",
     startedAt: input.startedAt,
     finishedAt: new Date().toISOString(),
     elapsedMs: input.elapsedMs,
@@ -469,7 +475,8 @@ function buildArtifact(input: {
     },
     parameters: {
       oldL2: input.config.algorithm.l2Induction,
-      proceduralWindow: input.config.algorithm.proceduralWindow
+      proceduralWindow: input.config.algorithm.proceduralWindow,
+      longTrajectory: input.config.algorithm.longTrajectory
     },
     seeded: input.seeded,
     drain: input.drain,
@@ -479,9 +486,11 @@ function buildArtifact(input: {
       candidatePool: scalarCount(input.targetDb, "l2_candidate_pool"),
       tracePolicyLinks: scalarCount(input.targetDb, "trace_policy_links")
     },
-    newChain: {
+    sharedProceduralChain: {
       executionPaths: scalarCount(input.targetDb, "episode_execution_paths"),
       stepEmbeddings: scalarCount(input.targetDb, "procedural_step_embeddings"),
+    },
+    v2LocalChain: {
       windows: scalarCount(input.targetDb, "trajectory_window_occurrences"),
       families: groupedCount(input.targetDb, "trajectory_window_families", "status"),
       familyRevisions: scalarCount(input.targetDb, "trajectory_window_family_revisions"),
@@ -499,9 +508,19 @@ function buildArtifact(input: {
       ),
       skillVersions: scalarCount(input.targetDb, "trajectory_skill_versions")
     },
+    v3GlobalChain: {
+      episodeRepresentations: scalarCount(
+        input.targetDb,
+        "long_trajectory_episode_representations"
+      ),
+      candidates: groupedCount(input.targetDb, "long_trajectory_candidates", "status"),
+      candidateVersions: scalarCount(input.targetDb, "long_trajectory_candidate_versions"),
+      skillVersions: scalarCount(input.targetDb, "long_trajectory_skill_versions")
+    },
     skills: {
       old: summarizeSkills(oldSkills),
-      new: summarizeSkills(newSkills),
+      v2: summarizeSkills(v2Skills),
+      v3: summarizeSkills(v3Skills),
       unknown: summarizeSkills(unknownSkills),
       total: skills.length
     }
@@ -705,8 +724,8 @@ function helpText(): string {
     "Historical L2/L3/Skill/Span state and jobs are never imported.",
     "",
     "old: seed eligible L1 traces into the upstream Turn→L2→Skill chain",
-    "new: seed closed Episodes into the Span-5/10 procedural direct-Skill chain",
-    "both: run both chains in the same isolated DB and count Skills by plugin algorithm",
+    "new: seed closed Episodes once; shared Step Semantics feeds V2 local and V3 global mining",
+    "both: run OLD, V2, and V3 in one isolated DB and count Skills by plugin algorithm",
     ""
   ].join("\n");
 }

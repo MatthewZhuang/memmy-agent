@@ -197,6 +197,25 @@ export interface AlgorithmConfig {
       minAlignmentScore: number;
     }>;
   };
+  longTrajectory: {
+    enabled: boolean;
+    episodeRecallLimit: number;
+    minEpisodeSimilarity: number;
+    minGoalSimilarity: number;
+    goalWeight: number;
+    trajectoryWeight: number;
+    windowTopK: number;
+    minSupportEpisodes: number;
+    minSpanSequenceLength: number;
+    minTrajectorySpanSteps: number;
+    minEpisodeCoverage: number;
+    maxSkillCandidatesPerEpisode: number;
+    scales: Array<{
+      length: number;
+      stride: number;
+      coarseSimilarityThreshold: number;
+    }>;
+  };
   l2Induction: {
     useLlm: boolean;
     minEpisodesForInduction: number;
@@ -457,6 +476,25 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
           gapPenalty: 0.10,
           minAlignmentScore: 0.43
         }
+      ]
+    },
+    longTrajectory: {
+      enabled: true,
+      episodeRecallLimit: 10,
+      minEpisodeSimilarity: 0.65,
+      minGoalSimilarity: 0.55,
+      goalWeight: 0.4,
+      trajectoryWeight: 0.6,
+      windowTopK: 3,
+      minSupportEpisodes: 2,
+      minSpanSequenceLength: 2,
+      minTrajectorySpanSteps: 12,
+      minEpisodeCoverage: 0.5,
+      maxSkillCandidatesPerEpisode: 12,
+      scales: [
+        { length: 5, stride: 2, coarseSimilarityThreshold: 0.76 },
+        { length: 10, stride: 5, coarseSimilarityThreshold: 0.70 },
+        { length: 15, stride: 7, coarseSimilarityThreshold: 0.68 }
       ]
     },
     l2Induction: {
@@ -974,6 +1012,7 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
   const feedback = asRecord(input.feedback);
   const negativeExperience = asRecord(input.negativeExperience);
   const proceduralWindow = asRecord(input.proceduralWindow);
+  const longTrajectory = asRecord(input.longTrajectory);
   const l2 = asRecord(input.l2Induction);
   const l3 = asRecord(input.l3Abstraction);
   const skill = asRecord(input.skill);
@@ -1122,6 +1161,57 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
       ),
       scales: normalizeProceduralWindowScales(proceduralWindow.scales)
     },
+    longTrajectory: {
+      enabled: booleanValue(
+        longTrajectory.enabled,
+        DEFAULT_MEMMY_CONFIG.algorithm.longTrajectory.enabled
+      ),
+      episodeRecallLimit: numberValue(
+        longTrajectory.episodeRecallLimit,
+        DEFAULT_MEMMY_CONFIG.algorithm.longTrajectory.episodeRecallLimit
+      ),
+      minEpisodeSimilarity: numberValue(
+        longTrajectory.minEpisodeSimilarity,
+        DEFAULT_MEMMY_CONFIG.algorithm.longTrajectory.minEpisodeSimilarity
+      ),
+      minGoalSimilarity: numberValue(
+        longTrajectory.minGoalSimilarity,
+        DEFAULT_MEMMY_CONFIG.algorithm.longTrajectory.minGoalSimilarity
+      ),
+      goalWeight: numberValue(
+        longTrajectory.goalWeight,
+        DEFAULT_MEMMY_CONFIG.algorithm.longTrajectory.goalWeight
+      ),
+      trajectoryWeight: numberValue(
+        longTrajectory.trajectoryWeight,
+        DEFAULT_MEMMY_CONFIG.algorithm.longTrajectory.trajectoryWeight
+      ),
+      windowTopK: numberValue(
+        longTrajectory.windowTopK,
+        DEFAULT_MEMMY_CONFIG.algorithm.longTrajectory.windowTopK
+      ),
+      minSupportEpisodes: numberValue(
+        longTrajectory.minSupportEpisodes,
+        DEFAULT_MEMMY_CONFIG.algorithm.longTrajectory.minSupportEpisodes
+      ),
+      minSpanSequenceLength: numberValue(
+        longTrajectory.minSpanSequenceLength,
+        DEFAULT_MEMMY_CONFIG.algorithm.longTrajectory.minSpanSequenceLength
+      ),
+      minTrajectorySpanSteps: numberValue(
+        longTrajectory.minTrajectorySpanSteps,
+        DEFAULT_MEMMY_CONFIG.algorithm.longTrajectory.minTrajectorySpanSteps
+      ),
+      minEpisodeCoverage: numberValue(
+        longTrajectory.minEpisodeCoverage,
+        DEFAULT_MEMMY_CONFIG.algorithm.longTrajectory.minEpisodeCoverage
+      ),
+      maxSkillCandidatesPerEpisode: numberValue(
+        longTrajectory.maxSkillCandidatesPerEpisode,
+        DEFAULT_MEMMY_CONFIG.algorithm.longTrajectory.maxSkillCandidatesPerEpisode
+      ),
+      scales: normalizeLongTrajectoryScales(longTrajectory.scales)
+    },
     l2Induction: {
       useLlm: booleanValue(l2.useLlm, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.useLlm),
       minEpisodesForInduction: numberValue(l2.minEpisodesForInduction, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.minEpisodesForInduction),
@@ -1245,6 +1335,34 @@ function normalizeProceduralWindowScales(
     item.minMatchedSteps <= item.length
   );
   return valid.length > 0 ? valid : defaults.map((item) => ({ ...item }));
+}
+
+function normalizeLongTrajectoryScales(
+  value: unknown
+): AlgorithmConfig["longTrajectory"]["scales"] {
+  const defaults = DEFAULT_MEMMY_CONFIG.algorithm.longTrajectory.scales;
+  if (!Array.isArray(value) || value.length === 0) {
+    return defaults.map((item) => ({ ...item }));
+  }
+  const normalized = value.map((item, index) => {
+    const input = asRecord(item);
+    const fallback = defaults.find((candidate) => candidate.length === Number(input.length))
+      ?? defaults[index]
+      ?? defaults[0]!;
+    return {
+      length: numberValue(input.length, fallback.length),
+      stride: numberValue(input.stride, fallback.stride),
+      coarseSimilarityThreshold: numberValue(
+        input.coarseSimilarityThreshold,
+        fallback.coarseSimilarityThreshold
+      )
+    };
+  }).filter((item) =>
+    Number.isInteger(item.length) && item.length >= 2 &&
+    Number.isInteger(item.stride) && item.stride >= 1 && item.stride <= item.length &&
+    item.coarseSimilarityThreshold > 0 && item.coarseSimilarityThreshold <= 1
+  );
+  return normalized.length > 0 ? normalized : defaults.map((item) => ({ ...item }));
 }
 
 function memoryDomainName(value: unknown, fallback: MemoryDomainName): MemoryDomainName {

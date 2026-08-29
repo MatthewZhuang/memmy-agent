@@ -1341,7 +1341,10 @@ function isReadOnlySkillMemory(memory: MemoryRow): boolean {
 }
 
 function isProceduralPatternSkillMemory(memory: MemoryRow): boolean {
-  return memory.properties.internal_info.plugin_algorithm === "procedural.pattern.skill.v1";
+  return [
+    "procedural.pattern.skill.v1",
+    "procedural.long-trajectory.skill.v1"
+  ].includes(String(memory.properties.internal_info.plugin_algorithm));
 }
 
 function compareSkillMergeTargets(

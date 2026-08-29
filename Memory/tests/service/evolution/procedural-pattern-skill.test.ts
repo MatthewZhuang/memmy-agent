@@ -5,7 +5,8 @@ import { DEFAULT_MEMMY_CONFIG, type MemmyConfig } from "../../../src/config/inde
 import type { LlmClient, LlmMessage } from "../../../src/model/types.js";
 import {
   ProceduralPatternSkillMaterializer,
-  type ProceduralPatternSkillInput
+  type ProceduralPatternSkillInput,
+  type ProceduralSkillComparisonCandidate
 } from "../../../src/service/evolution/procedural-pattern-skill.js";
 import { SkillPipeline } from "../../../src/service/evolution/skill-pipeline.js";
 import type {
@@ -35,6 +36,17 @@ describe("procedural pattern Skill compatibility", () => {
     expect(saved.properties.internal_info.source_policy_ids).toEqual([]);
     expect(saved.properties.internal_info.completion_activated).toBe(false);
     expect(harness.llmPayloads[0]).toMatchObject({
+      evidence_anchor_catalog: expect.arrayContaining([
+        expect.objectContaining({
+          anchor_id: "core_0",
+          allowed_usage: "mandatory",
+          support_episode_ids: ["episode-a", "episode-b"]
+        })
+      ]),
+      anchor_contract: {
+        allowed_mandatory_anchor_ids: expect.arrayContaining(["core_0", "core_1"]),
+        allowed_conditional_anchor_ids: []
+      },
       completion: {
         activated: false,
         shared_prefix: [],
@@ -58,15 +70,169 @@ describe("procedural pattern Skill compatibility", () => {
     expect(procedure.steps).toHaveLength(2);
     expect(procedure.steps[0]).toMatchObject({
       id: expect.stringMatching(/^step_[a-f0-9]{12}$/),
+      sourceAnchorIds: ["core_0"],
       evidenceRefs: ["step-a", "step-b"],
       supportingPolicyIds: [],
       supportingOccurrenceIds: ["occ-a", "occ-b"]
     });
     expect(procedure.steps[0]?.body).not.toContain("<script>");
+    expect(saved.properties.internal_info).toMatchObject({
+      evidence_binding_version: "semantic-anchor-binding.v1",
+      selected_mandatory_anchor_ids: ["core_0", "core_1"],
+      local_subproblem_closure: {
+        closed: true,
+        support_episode_ids: ["episode-a", "episode-b"]
+      }
+    });
+    expect(harness.llmSystemPrompts[0]).toContain(
+      "V2 local-subproblem closed-loop admission gate"
+    );
 
     const embedding = harness.enqueued.find((item) => item.jobType === "embedding");
     expect(embedding?.targetMemoryId).toBe(saved.id);
     expect(embedding?.payload.contentHash).toBe(saved.contentHash);
+  });
+
+  it("requires the V2 model to establish a cross-Episode local closed loop", async () => {
+    const response = validSkillResponse();
+    delete response.local_subproblem_closure;
+    const missing = createHarness({ skillResponse: response });
+
+    expect(await missing.induce(skillInput())).toEqual({
+      admitted: false,
+      reason: "missing-v2-local-subproblem-closure"
+    });
+    expect(missing.savedMemory).toBeUndefined();
+
+    const openLoopResponse = validSkillResponse();
+    openLoopResponse.local_subproblem_closure = {
+      closed: false,
+      subproblem: "A generator failed.",
+      entry_condition: "The first execution failed.",
+      resolution: "The script was edited.",
+      resolved_state: "",
+      success_check: "",
+      support_episode_ids: ["episode-a", "episode-b"],
+      reason: "Neither Episode reran and verified the edited script."
+    };
+    const openLoop = createHarness({ skillResponse: openLoopResponse });
+
+    expect(await openLoop.induce(skillInput())).toEqual({
+      admitted: false,
+      reason: "no-cross-episode-local-closed-loop"
+    });
+    expect(openLoop.savedMemory).toBeUndefined();
+  });
+
+  it("accepts a model rejection when the local subproblem has no shared success check", async () => {
+    const response = validSkillResponse();
+    response.admit = false;
+    response.rejection_reason =
+      "no-cross-episode-local-closed-loop:missing-shared-success-check";
+    response.local_subproblem_closure = {
+      closed: false,
+      subproblem: "Repair a failed generator.",
+      entry_condition: "The generator failed.",
+      resolution: "The generator was edited.",
+      resolved_state: "",
+      success_check: "",
+      support_episode_ids: ["episode-a", "episode-b"],
+      reason: "The aligned region contains no repeated rerun and verification."
+    };
+    const harness = createHarness({ skillResponse: response });
+
+    expect(await harness.induce(skillInput())).toEqual({
+      admitted: false,
+      reason: "no-cross-episode-local-closed-loop:missing-shared-success-check"
+    });
+    expect(harness.savedMemory).toBeUndefined();
+  });
+
+  it("keeps the public Skill schema while recording long-trajectory origin", async () => {
+    const response = validSkillResponse();
+    response.procedure_steps = [{
+      title: "Generate and validate artifact",
+      body: "Generate the requested artifact and validate its output.",
+      source_anchor_ids: ["core_0", "core_1"]
+    }];
+    const harness = createHarness({ skillResponse: response });
+    const input = skillInput();
+    input.origin = {
+      kind: "long_trajectory",
+      episodeFamilyId: "episode-family-1",
+      longTrajectoryId: "long-trajectory-1"
+    };
+    input.episodeContextReadOnly = [
+      {
+        episodeId: "episode-a",
+        goal: "Generate a validated artifact for the user.",
+        terminalResult: "The artifact was generated and validated."
+      },
+      {
+        episodeId: "episode-b",
+        goal: "Produce and verify the requested output.",
+        terminalResult: "The output passed verification."
+      }
+    ];
+
+    const result = await harness.induce(input);
+
+    expect(result.admitted).toBe(true);
+    const saved = harness.savedMemory!;
+    expect(skillMetaFromMemory(saved)).not.toBeNull();
+    expect(saved.tags).toEqual(expect.arrayContaining([
+      "skill",
+      "long-trajectory",
+      "episode-family"
+    ]));
+    expect(saved.properties.internal_info).toMatchObject({
+      source: "worker.long_trajectory_induction.v1",
+      plugin_algorithm: "procedural.long-trajectory.skill.v1",
+      source_episode_family_id: "episode-family-1",
+      source_long_trajectory_id: "long-trajectory-1"
+    });
+    expect(harness.llmPayloads[0]).toMatchObject({
+      pattern: {
+        origin: {
+          kind: "long_trajectory",
+          episode_family_id: "episode-family-1",
+          long_trajectory_id: "long-trajectory-1"
+        }
+      },
+      episode_context_read_only: [
+        {
+          episode_id: "episode-a",
+          goal: "Generate a validated artifact for the user.",
+          terminal_result: "The artifact was generated and validated."
+        },
+        {
+          episode_id: "episode-b",
+          goal: "Produce and verify the requested output.",
+          terminal_result: "The output passed verification."
+        }
+      ]
+    });
+    expect(harness.llmSystemPrompts[0]).not.toContain(
+      "V2 local-subproblem closed-loop admission gate"
+    );
+  });
+
+  it("rejects a long-trajectory Skill that drops a required reference Span", async () => {
+    const harness = createHarness();
+    const input = skillInput();
+    input.origin = {
+      kind: "long_trajectory",
+      episodeFamilyId: "episode-family-1",
+      longTrajectoryId: "long-trajectory-1"
+    };
+
+    const result = await harness.induce(input);
+
+    expect(result).toEqual({
+      admitted: false,
+      reason: "incomplete-reference-span-coverage"
+    });
+    expect(harness.savedMemory).toBeUndefined();
   });
 
   it.each([
@@ -151,7 +317,7 @@ describe("procedural pattern Skill compatibility", () => {
         memories: { list: () => [directSkill] }
       } as unknown as Repositories,
       config: config(),
-      skillLlm: llm(validSkillResponse(), () => undefined),
+      skillLlm: llm(() => validSkillResponse()),
       traceMeta: () => null,
       buildMemory: () => directSkill,
       upsertEvolutionMemory: (item) => ({ memory: item, created: false }),
@@ -221,12 +387,12 @@ describe("procedural pattern Skill compatibility", () => {
     response.procedure_steps = [{
       title: "Use the failed attempt",
       body: "Treat the failed action as the reusable procedure.",
-      evidence_refs: ["failed-step-a", "failed-step-b"]
+      source_anchor_ids: ["core_failed"]
     }];
     response.verification_steps = [{
       check: "Use the failed result",
       success_signal: "The failed action is treated as success.",
-      evidence_refs: ["failed-step-a", "failed-step-b"]
+      source_anchor_ids: ["core_failed"]
     }];
     const input = skillInput();
     input.evidence[0]!.alignedSequence.splice(1, 0, {
@@ -257,7 +423,10 @@ describe("procedural pattern Skill compatibility", () => {
 
     const result = await harness.induce(input);
 
-    expect(result).toEqual({ admitted: false, reason: "invalid-evidence-citation" });
+    expect(result).toEqual({
+      admitted: false,
+      reason: "invalid-evidence-anchor"
+    });
     expect(harness.savedMemory).toBeUndefined();
   });
 
@@ -333,7 +502,7 @@ describe("procedural pattern Skill compatibility", () => {
     response.procedure_steps = [{
       title: "Rerun generator",
       body: "Rerun the corrected generator.",
-      evidence_refs: ["gap-a"]
+      source_anchor_ids: [gapAnchorId("occ-a", "gap-a")]
     }];
     const harness = createHarness({ skillResponse: response });
 
@@ -365,7 +534,10 @@ describe("procedural pattern Skill compatibility", () => {
     response.procedure_steps = [{
       title: "Rerun generator",
       body: "Rerun the corrected generator.",
-      evidence_refs: ["gap-0", "gap-1"]
+      source_anchor_ids: [
+        gapAnchorId("occ-a", "gap-0"),
+        gapAnchorId("occ-b", "gap-1")
+      ]
     }];
     const harness = createHarness({ skillResponse: response });
 
@@ -404,7 +576,7 @@ describe("procedural pattern Skill compatibility", () => {
     response.procedure_steps = [{
       title: "Inspect generated content",
       body: "Inspect the generated artifact content.",
-      evidence_refs: ["extension-a", "extension-b"]
+      source_anchor_ids: ["extension_suffix_0"]
     }];
     const harness = createHarness({ skillResponse: response });
 
@@ -446,16 +618,184 @@ describe("procedural pattern Skill compatibility", () => {
     response.procedure_steps = [{
       title: "Use local setup",
       body: "Make occurrence-specific setup mandatory.",
-      evidence_refs: ["local-0", "local-1"]
+      source_anchor_ids: [
+        provisionalAnchorId("occ-a", "local-0"),
+        provisionalAnchorId("occ-b", "local-1")
+      ]
     }];
     const harness = createHarness({ skillResponse: response });
 
     const result = await harness.induce(input);
 
-    expect(result).toEqual({ admitted: false, reason: "invalid-evidence-citation" });
+    expect(result).toEqual({
+      admitted: false,
+      reason: "core-incomplete-after-provisional-extension-fallback"
+    });
   });
 
-  it("rejects a shared extension cited from only one successful Episode", async () => {
+  it("keeps explicitly read-only V3 local context forbidden as positive evidence", async () => {
+    const input = skillInput();
+    input.origin = {
+      kind: "long_trajectory",
+      episodeFamilyId: "family-soft-fine",
+      longTrajectoryId: "trajectory-soft-fine"
+    };
+    for (const occurrenceItem of input.evidence) {
+      const original = occurrenceItem.alignedSequence[0]!;
+      occurrenceItem.alignedSequence[0] = {
+        role: "local_context",
+        spanAnchorId: "core_0",
+        stepId: original.stepId,
+        stepIndex: original.stepIndex,
+        ...(original.toolName ? { toolName: original.toolName } : {}),
+        intent: original.intent,
+        summary: original.summary,
+        outcome: original.outcome,
+        evidenceRefs: original.evidenceRefs
+      };
+    }
+    const harness = createHarness();
+
+    const result = await harness.induce(input);
+
+    expect(result).toEqual({ admitted: false, reason: "invalid-evidence-anchor" });
+    expect(harness.llmPayloads[0]?.anchor_contract).toMatchObject({
+      forbidden_local_context_step_ids: ["step-a", "step-b"]
+    });
+  });
+
+  it("lets V3 ground claims across Episodes without a Fine alignment group", async () => {
+    const input = skillInput();
+    input.origin = {
+      kind: "long_trajectory",
+      episodeFamilyId: "family-soft-fine",
+      longTrajectoryId: "trajectory-soft-fine"
+    };
+    for (const occurrenceItem of input.evidence) {
+      occurrenceItem.alignedSequence = occurrenceItem.alignedSequence.map((step) =>
+        step.role === "core"
+          ? {
+              role: "span_step",
+              anchorId: step.anchorId,
+              spanSimilarity: 0.8,
+              stepId: step.stepId,
+              stepIndex: step.stepIndex,
+              ...(step.toolName ? { toolName: step.toolName } : {}),
+              intent: step.intent,
+              summary: step.summary,
+              outcome: step.outcome,
+              evidenceRefs: step.evidenceRefs
+            }
+          : step);
+    }
+    const response = validSkillResponse();
+    response.procedure_steps = [
+      {
+        title: "Generate artifact",
+        body: "Generate the requested artifact.",
+        source_anchor_ids: [
+          spanStepAnchorId("occ-a", "step-a"),
+          spanStepAnchorId("occ-b", "step-b")
+        ]
+      },
+      {
+        title: "Validate artifact",
+        body: "Validate the generated artifact.",
+        source_anchor_ids: [
+          spanStepAnchorId("occ-a", "step-a-verify"),
+          spanStepAnchorId("occ-b", "step-b-verify")
+        ]
+      }
+    ];
+    response.verification_steps = [{
+      check: "Validate output",
+      success_signal: "The validation command succeeds.",
+      source_anchor_ids: [
+        spanStepAnchorId("occ-a", "step-a-verify"),
+        spanStepAnchorId("occ-b", "step-b-verify")
+      ]
+    }];
+    const harness = createHarness({ skillResponse: response });
+
+    const result = await harness.induce(input);
+
+    expect(result.admitted).toBe(true);
+    expect(harness.llmPayloads[0]?.occurrences).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        aligned_sequence: expect.arrayContaining([
+          expect.objectContaining({ role: "span_step", anchor_id: "core_0" })
+        ])
+      })
+    ]));
+  });
+
+  it("still requires every V3 Skill claim to cite two successful Episodes", async () => {
+    const input = skillInput();
+    input.origin = {
+      kind: "long_trajectory",
+      episodeFamilyId: "family-coarse-span",
+      longTrajectoryId: "trajectory-coarse-span"
+    };
+    for (const occurrenceItem of input.evidence) {
+      occurrenceItem.alignedSequence = occurrenceItem.alignedSequence.map((step) =>
+        step.role === "core"
+          ? {
+              role: "span_step",
+              anchorId: step.anchorId,
+              spanSimilarity: 0.8,
+              stepId: step.stepId,
+              stepIndex: step.stepIndex,
+              ...(step.toolName ? { toolName: step.toolName } : {}),
+              intent: step.intent,
+              summary: step.summary,
+              outcome: step.outcome,
+              evidenceRefs: step.evidenceRefs
+            }
+          : step);
+    }
+    const response = validSkillResponse();
+    response.procedure_steps = [
+      {
+        title: "Generate artifact",
+        body: "Generate the requested artifact.",
+        source_anchor_ids: [
+          spanStepAnchorId("occ-a", "step-a"),
+          spanStepAnchorId("occ-b", "step-b")
+        ]
+      },
+      {
+        title: "Validate artifact",
+        body: "Validate the generated artifact.",
+        source_anchor_ids: [
+          spanStepAnchorId("occ-a", "step-a-verify"),
+          spanStepAnchorId("occ-b", "step-b-verify")
+        ]
+      },
+      {
+        title: "Use an unsupported local refinement",
+        body: "Apply a refinement observed in only one Episode.",
+        source_anchor_ids: [spanStepAnchorId("occ-a", "step-a")]
+      }
+    ];
+    response.verification_steps = [{
+      check: "Validate output",
+      success_signal: "The validation command succeeds.",
+      source_anchor_ids: [
+        spanStepAnchorId("occ-a", "step-a-verify"),
+        spanStepAnchorId("occ-b", "step-b-verify")
+      ]
+    }];
+    const harness = createHarness({ skillResponse: response });
+
+    const result = await harness.induce(input);
+
+    expect(result).toEqual({
+      admitted: false,
+      reason: "insufficient-claim-episode-support"
+    });
+  });
+
+  it("keeps a single-Episode extension as conditional guidance and falls back to Core", async () => {
     const input = skillInput();
     input.evidence[0]!.suffixExpansion.push({
       role: "shared_extension",
@@ -471,10 +811,79 @@ describe("procedural pattern Skill compatibility", () => {
       evidenceRefs: ["extension-evidence-a"]
     });
     const response = validSkillResponse();
+    response.procedure_steps = [
+      ...(response.procedure_steps as Array<Record<string, unknown>>),
+      {
+        title: "Inspect generated content",
+        body: "Inspect the generated content.",
+        source_anchor_ids: [provisionalAnchorId("occ-a", "extension-a")]
+      }
+    ];
+    response.conditional_guidance = [{
+      condition: "The generated content requires an additional format-specific check.",
+      action: "Inspect the generated content before delivery.",
+      source_anchor_ids: [provisionalAnchorId("occ-a", "extension-a")]
+    }];
+    const harness = createHarness({ skillResponse: response });
+
+    const result = await harness.induce(input);
+
+    expect(result.admitted).toBe(true);
+    expect(harness.llmPayloads[0]).toMatchObject({
+      provisional_extensions: [expect.objectContaining({
+        episode_id: "episode-a",
+        allowed_usage: "conditional_only",
+        evidence_status: "provisional",
+        step: expect.objectContaining({ step_id: "extension-a" })
+      })],
+      anchor_contract: {
+        allowed_conditional_anchor_ids: [provisionalAnchorId("occ-a", "extension-a")]
+      }
+    });
+    const procedure = harness.savedMemory?.properties.internal_info.procedure_json as {
+      steps: Array<{ title: string }>;
+      conditionalGuidance: Array<{
+        condition: string;
+        action: string;
+        evidenceStatus: string;
+        supportEpisodeCount: number;
+      }>;
+    };
+    expect(procedure.steps.map((item) => item.title)).not.toContain(
+      "Inspect generated content"
+    );
+    expect(procedure.conditionalGuidance).toEqual([expect.objectContaining({
+      evidenceStatus: "provisional",
+      supportEpisodeCount: 1
+    })]);
+    expect(harness.savedMemory?.properties.internal_info).toMatchObject({
+      core_fallback_applied: true,
+      provisional_extension_evidence_refs: ["extension-a"],
+      provisional_extension_count: 1
+    });
+    expect(harness.savedMemory?.memoryValue).toContain(
+      "## Conditional guidance (provisional)"
+    );
+  });
+
+  it("waits for more evidence when removing a provisional extension leaves no Core procedure", async () => {
+    const input = skillInput();
+    input.evidence[0]!.suffixExpansion.push({
+      role: "local_context",
+      side: "suffix",
+      stepId: "extension-a",
+      stepIndex: 3,
+      toolName: "shell",
+      intent: "Inspect generated content",
+      summary: "Generated content was inspected",
+      outcome: "success",
+      evidenceRefs: ["extension-evidence-a"]
+    });
+    const response = validSkillResponse();
     response.procedure_steps = [{
       title: "Inspect generated content",
       body: "Inspect the generated content.",
-      evidence_refs: ["extension-a"]
+      source_anchor_ids: [provisionalAnchorId("occ-a", "extension-a")]
     }];
     const harness = createHarness({ skillResponse: response });
 
@@ -482,7 +891,7 @@ describe("procedural pattern Skill compatibility", () => {
 
     expect(result).toEqual({
       admitted: false,
-      reason: "insufficient-extension-episode-support"
+      reason: "core-incomplete-after-provisional-extension-fallback"
     });
   });
 
@@ -510,13 +919,13 @@ describe("procedural pattern Skill compatibility", () => {
     response.procedure_steps = [{
       title: "Use boundary",
       body: "Treat setup context as the method.",
-      evidence_refs: ["boundary-a", "boundary-b"]
+      source_anchor_ids: ["boundary-a", "boundary-b"]
     }];
     const harness = createHarness({ skillResponse: response });
 
     const result = await harness.induce(input);
 
-    expect(result).toEqual({ admitted: false, reason: "invalid-evidence-citation" });
+    expect(result).toEqual({ admitted: false, reason: "invalid-evidence-anchor" });
   });
 
   it("allows an empty do-not-apply section when no counterexample exists", async () => {
@@ -530,12 +939,167 @@ describe("procedural pattern Skill compatibility", () => {
     expect(harness.savedMemory?.memoryValue).not.toContain("## Do not apply when");
     expect(harness.llmPayloads[0]?.counterexamples_read_only).toEqual([]);
   });
+
+  it("generates a V2 draft first, then suppresses it in a separate coverage call", async () => {
+    const coverageResponse = {
+      decision: "covered",
+      target_skill_id: "skill-v3-existing",
+      target_route: "V3",
+      relation: "subset",
+      reason: "The V2 procedure is an ordered subset of the V3 procedure."
+    };
+    const harness = createHarness({
+      coverageResponse,
+      comparisonSkills: [comparisonSkill("skill-v3-existing", "V3")]
+    });
+
+    const result = await harness.induce(skillInput());
+
+    expect(result).toEqual({
+      admitted: false,
+      reason: "covered-by-v3:skill-v3-existing",
+      coverageDecision: {
+        decision: "covered",
+        targetSkillId: "skill-v3-existing",
+        targetRoute: "V3",
+        relation: "subset",
+        reason: "The V2 procedure is an ordered subset of the V3 procedure."
+      }
+    });
+    expect(harness.savedMemory).toBeUndefined();
+    expect(harness.llmPayloads).toHaveLength(2);
+    expect(harness.llmPayloads[0]).not.toHaveProperty("comparison_skills_read_only");
+    expect(harness.llmPayloads[1]).toMatchObject({
+      skill_draft_read_only: expect.objectContaining({
+        name: "generate_and_validate_artifact"
+      }),
+      comparison_skills_read_only: [
+        expect.objectContaining({ memory_id: "skill-v3-existing", route: "V3" })
+      ]
+    });
+  });
+
+  it("filters a new Candidate equivalent to an existing V2 Skill instead of updating it", async () => {
+    const existing = existingV2Skill("skill-v2-existing", "skill:procedural:canonical");
+    const harness = createHarness({
+      existingSkills: [existing],
+      comparisonSkills: [comparisonSkill(existing.id, "V2")],
+      coverageResponse: {
+        decision: "covered",
+        target_skill_id: existing.id,
+        target_route: "V2",
+        relation: "equivalent",
+        reason: "The completed Draft expresses the same capability."
+      }
+    });
+
+    const result = await harness.induce(skillInput());
+
+    expect(result).toEqual({
+      admitted: false,
+      reason: `covered-by-v2:${existing.id}`,
+      coverageDecision: {
+        decision: "covered",
+        targetSkillId: existing.id,
+        targetRoute: "V2",
+        relation: "equivalent",
+        reason: "The completed Draft expresses the same capability."
+      }
+    });
+    expect(harness.savedMemory).toBeUndefined();
+    expect(harness.llmCalls).toBe(2);
+  });
+
+  it("creates a new V2 Skill only after the completed Draft is classified distinct", async () => {
+    const harness = createHarness({
+      comparisonSkills: [comparisonSkill("skill-old-related", "OLD")],
+      coverageResponse: {
+        decision: "distinct",
+        target_skill_id: null,
+        target_route: null,
+        relation: "distinct",
+        reason: "The resolved-state and verification contracts differ."
+      }
+    });
+
+    const result = await harness.induce(skillInput());
+
+    expect(result.admitted).toBe(true);
+    expect(harness.savedMemory).toBeDefined();
+    expect(harness.savedMemory?.properties.internal_info.reuse_decision).toMatchObject({
+      action: "create_v2",
+      relation: "distinct"
+    });
+    expect(harness.llmCalls).toBe(2);
+  });
+
+  it("returns the raw post-Draft coverage output when its protocol is invalid", async () => {
+    const harness = createHarness({
+      comparisonSkills: [comparisonSkill("skill-old-related", "OLD")],
+      coverageResponse: {
+        decision: "covered",
+        target_skill_id: null,
+        target_route: "OLD",
+        relation: "equivalent",
+        reason: "Missing the required target id."
+      }
+    });
+
+    const compiled = await harness.materializer.compile(skillInput());
+    expect(compiled.admitted).toBe(true);
+    if (!compiled.admitted) return;
+    const coverage = await harness.materializer.compareDraftCoverage(
+      compiled.draft,
+      [comparisonSkill("skill-old-related", "OLD")]
+    );
+
+    expect(coverage).toEqual({
+      ok: false,
+      reason: "invalid-coverage-decision",
+      rawDecision: {
+        decision: "covered",
+        target_skill_id: null,
+        target_route: "OLD",
+        relation: "equivalent",
+        reason: "Missing the required target id."
+      }
+    });
+  });
+
+  it("updates the Skill already owned by the same Candidate without a coverage call", async () => {
+    const existing = existingV2Skill("skill-v2-existing", "skill:procedural:canonical");
+    const input = skillInput();
+    input.existingSkillReadOnly = existingSkillReadOnly(existing);
+    const harness = createHarness({ existingSkills: [existing] });
+
+    const result = await harness.induce(input);
+
+    expect(result.admitted).toBe(true);
+    expect(harness.savedMemory?.memoryKey).toBe("skill:procedural:canonical");
+    expect(harness.savedMemory?.properties.internal_info).toMatchObject({
+      source_episode_ids: ["episode-old", "episode-a", "episode-b"],
+      source_cluster_ids: ["cluster-old", "cluster-1"],
+      reuse_decision: {
+        action: "update_v2",
+        targetSkillId: existing.id,
+        targetRoute: "V2"
+      }
+    });
+    expect(harness.llmCalls).toBe(1);
+    expect(harness.llmPayloads[0]).not.toHaveProperty("comparison_skills_read_only");
+    expect(harness.llmPayloads[0]?.existing_skill_read_only).toMatchObject({
+      memory_id: existing.id
+    });
+  });
 });
 
 function createHarness(options: {
   episodeRewards?: Record<string, number | undefined>;
   traceValues?: [number, number];
   skillResponse?: Record<string, unknown>;
+  coverageResponse?: Record<string, unknown>;
+  comparisonSkills?: ProceduralSkillComparisonCandidate[];
+  existingSkills?: MemoryRow[];
 } = {}) {
   const episodeRewards = options.episodeRewards ?? {
     "episode-a": 0.9,
@@ -550,17 +1114,22 @@ function createHarness(options: {
   let savedMemory: MemoryRow | undefined;
   let llmCalls = 0;
   const llmPayloads: Array<Record<string, unknown>> = [];
+  const llmSystemPrompts: string[] = [];
   const episodes = new Map(Object.entries(episodeRewards).map(([id, rTask]) => [
     id,
     episode(id, rTask)
   ]));
   const repositories = {
     memories: {
+      get(id: string) {
+        return options.existingSkills?.find((memory) => memory.id === id) ??
+          (savedMemory?.id === id ? savedMemory : undefined);
+      },
       getMany(ids: string[]) {
         return ids.flatMap((id) => traces.get(id) ? [traces.get(id)!] : []);
       },
-      getByKey() {
-        return savedMemory;
+      getByKey(_layer: string, key: string) {
+        return options.existingSkills?.find((memory) => memory.memoryKey === key) ?? savedMemory;
       }
     },
     runtime: {
@@ -574,10 +1143,21 @@ function createHarness(options: {
   const materializer = new ProceduralPatternSkillMaterializer({
     repos: repositories,
     config: config(),
-    skillLlm: llm(options.skillResponse ?? validSkillResponse(), (messages) => {
+    skillLlm: llm((messages) => {
       llmCalls += 1;
+      const system = messages.find((message) => message.role === "system")?.content ?? "";
+      llmSystemPrompts.push(system);
       const user = messages.find((message) => message.role === "user")?.content ?? "{}";
       llmPayloads.push(JSON.parse(user) as Record<string, unknown>);
+      return system.includes("already compiled V2 Skill Draft")
+        ? options.coverageResponse ?? {
+            decision: "distinct",
+            target_skill_id: null,
+            target_route: null,
+            relation: "distinct",
+            reason: "No retrieved Skill covers the Draft."
+          }
+        : options.skillResponse ?? validSkillResponse();
     }),
     traceMeta(item) {
       if (!item) return null;
@@ -617,6 +1197,21 @@ function createHarness(options: {
   async function induce(input: ProceduralPatternSkillInput) {
     const result = await materializer.compile(input);
     if (!result.admitted) return result;
+    if (!input.existingSkillReadOnly && (options.comparisonSkills?.length ?? 0) > 0) {
+      const coverage = await materializer.compareDraftCoverage(
+        result.draft,
+        options.comparisonSkills ?? []
+      );
+      if (!coverage.ok) return { admitted: false as const, reason: coverage.reason };
+      if (coverage.decision.decision === "covered") {
+        return {
+          admitted: false as const,
+          reason: `covered-by-${coverage.decision.targetRoute.toLowerCase()}:` +
+            coverage.decision.targetSkillId,
+          coverageDecision: coverage.decision
+        };
+      }
+    }
     const materialized = materializer.materializeDraft(result.draft, AT);
     savedMemory = materialized.memory;
     if (config().algorithm.capture.embedAfterCapture) {
@@ -638,9 +1233,84 @@ function createHarness(options: {
     induce,
     enqueued,
     llmPayloads,
+    llmSystemPrompts,
     get savedMemory() { return savedMemory; },
     get llmCalls() { return llmCalls; }
   };
+}
+
+function comparisonSkill(
+  memoryId: string,
+  route: "OLD" | "V2" | "V3"
+): ProceduralSkillComparisonCandidate {
+  return {
+    memoryId,
+    route,
+    name: "artifact-generation-recovery",
+    invocationGuide: "Repair a failed generator, rerun it, and verify the output.",
+    triggerContext: "Use after an artifact generator fails.",
+    summary: "Repair, rerun, and verify the generated artifact.",
+    procedureSteps: [
+      { title: "Repair generator", body: "Repair the identified generator error." },
+      { title: "Rerun generator", body: "Rerun the corrected generator." }
+    ],
+    verificationSteps: [{ title: "Verify output", body: "Confirm the artifact exists." }]
+  };
+}
+
+function existingSkillReadOnly(
+  existing: MemoryRow
+): NonNullable<ProceduralPatternSkillInput["existingSkillReadOnly"]> {
+  const skill = skillMetaFromMemory(existing)!;
+  const internal = existing.properties.internal_info;
+  return {
+    memoryId: existing.id,
+    memoryVersion: existing.version,
+    name: skill.name,
+    invocationGuide: skill.invocationGuide,
+    procedureJson: internal.procedure_json as Record<string, unknown> ?? {},
+    sourceEpisodeIds: internal.source_episode_ids as string[] ?? [],
+    sourceTraceIds: internal.source_trace_ids as string[] ?? [],
+    sourceSpanOccurrenceIds: internal.source_span_occurrence_ids as string[] ?? []
+  };
+}
+
+function existingV2Skill(id: string, key: string): MemoryRow {
+  return memory({
+    id,
+    layer: "Skill",
+    kind: "skill",
+    key,
+    value: "# Existing V2 Skill\n\nRepair, rerun, and verify.",
+    status: "resolving",
+    internal: {
+      plugin_algorithm: "procedural.pattern.skill.v1",
+      source_trace_ids: ["trace-old"],
+      source_episode_ids: ["episode-old"],
+      source_span_occurrence_ids: ["occ-old"],
+      source_cluster_id: "cluster-old",
+      source_cluster_version_id: "cluster-version-old",
+      skill: {
+        name: "artifact-generation-recovery",
+        eta: 0.7,
+        status: "candidate",
+        support: 1,
+        source_policy_ids: [],
+        source_world_model_ids: [],
+        evidence_anchor_ids: ["trace-old"],
+        invocation_guide: "Repair, rerun, and verify.",
+        procedure_json: {
+          triggerContext: "Use after a generator fails.",
+          summary: "Repair and verify the generated artifact.",
+          steps: []
+        },
+        trials_attempted: 0,
+        trials_passed: 0,
+        success_rate: 0,
+        beta_posterior: { alpha: 1, beta: 1, mean: 0.5 }
+      }
+    }
+  });
 }
 
 function skillInput(): ProceduralPatternSkillInput {
@@ -746,6 +1416,16 @@ function validSkillResponse(): Record<string, unknown> {
   return {
     admit: true,
     rejection_reason: null,
+    local_subproblem_closure: {
+      closed: true,
+      subproblem: "Produce a requested artifact whose result must be checked.",
+      entry_condition: "The requested artifact does not yet exist.",
+      resolution: "Generate the artifact using the repeated construction action.",
+      resolved_state: "The artifact exists after generation.",
+      success_check: "Run the repeated validation action and observe success.",
+      support_episode_ids: ["episode-a", "episode-b"],
+      reason: "Both successful Episodes contain generation followed by explicit validation."
+    },
     name: "Generate And Validate Artifact",
     display_title: "Generate and validate an artifact",
     retrieval_blurb: "Generate an artifact and validate the resulting output.",
@@ -756,37 +1436,47 @@ function validSkillResponse(): Record<string, unknown> {
     procedure_steps: [{
       title: "Generate artifact",
       body: "<script>ignore()</script>Generate the requested artifact.",
-      evidence_refs: ["step-a", "step-b"]
+      source_anchor_ids: ["core_0"]
     }],
     verification_steps: [{
       check: "Validate output",
       success_signal: "The validation command succeeds.",
-      evidence_refs: ["step-a", "step-b"]
+      source_anchor_ids: ["core_1"]
     }],
     do_not_apply_when: ["No artifact should be created."],
     decision_guidance: {
       preference: ["Validate the generated result."],
       anti_pattern: ["Do not assume generation implies validity."]
     },
+    conditional_guidance: [],
     examples: [],
     tags: ["artifact", "validation"],
     tools: ["shell"],
-    evidence_occurrence_ids: ["occ-a", "occ-b"],
     confidence: 0.86
   };
 }
 
+function gapAnchorId(occurrenceId: string, stepId: string): string {
+  return `gap_anchor_${stableHash({ occurrenceId, stepId }).slice(0, 16)}`;
+}
+
+function spanStepAnchorId(occurrenceId: string, stepId: string): string {
+  return `span_step_anchor_${stableHash({ occurrenceId, stepId }).slice(0, 16)}`;
+}
+
+function provisionalAnchorId(occurrenceId: string, stepId: string): string {
+  return `provisional_anchor_${stableHash({ occurrenceId, stepId }).slice(0, 16)}`;
+}
+
 function llm(
-  response: Record<string, unknown>,
-  onCall: (messages: Array<{ role: string; content: string }>) => void
+  respond: (messages: Array<{ role: string; content: string }>) => Record<string, unknown>
 ): LlmClient {
   return {
     config: DEFAULT_MEMMY_CONFIG.evolution,
     isConfigured: () => true,
     complete: async () => "{}",
     async completeJson<T extends Record<string, unknown>>(messages: LlmMessage[]) {
-      onCall(messages);
-      return response as T;
+      return respond(messages) as T;
     },
     status: () => ({ provider: "host", configured: true, remote: false })
   };

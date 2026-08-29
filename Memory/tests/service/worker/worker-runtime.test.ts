@@ -12,6 +12,76 @@ afterEach(() => {
 });
 
 describe("MemoryService / worker / runtime", () => {
+  it("leases OLD and V3 work before V2 Skill induction for the same user", () => {
+    const { db } = createTestService();
+    const repos = new Repositories(db.db);
+    const at = "2026-01-01T00:00:00.000Z";
+    const enqueue = (
+      id: string,
+      jobType: "l2_induction" | "skill_crystallization" |
+        "long_trajectory_skill_induction" | "procedural_skill_induction"
+    ): void => {
+      repos.runtime.enqueueJob({
+        id,
+        jobType,
+        status: "queued",
+        userId: "user-three-route-order",
+        payload: {},
+        attempts: 0,
+        maxAttempts: 3,
+        createdAt: at,
+        updatedAt: at
+      });
+    };
+    enqueue("v2", "procedural_skill_induction");
+    enqueue("old-policy", "l2_induction");
+    enqueue("v3-skill", "long_trajectory_skill_induction");
+
+    const first = repos.runtime.leaseQueuedJobs(10, 60);
+    expect(first.map((job) => job.id).sort()).toEqual(["old-policy", "v3-skill"]);
+    expect(repos.runtime.leaseQueuedJobs(10, 60)).toEqual([]);
+    for (const job of first) repos.runtime.completeJob(job.id, at);
+
+    enqueue("old-skill", "skill_crystallization");
+    expect(repos.runtime.leaseQueuedJobs(10, 60).map((job) => job.id))
+      .toEqual(["old-skill"]);
+    repos.runtime.completeJob("old-skill", at);
+    expect(repos.runtime.leaseQueuedJobs(10, 60).map((job) => job.id))
+      .toEqual(["v2"]);
+
+    db.close();
+  });
+
+  it("does not lease new same-user V2 work while an earlier V2 batch is active", () => {
+    const { db } = createTestService();
+    const repos = new Repositories(db.db);
+    const at = "2026-01-01T00:00:00.000Z";
+    const enqueueV2 = (id: string): void => {
+      repos.runtime.enqueueJob({
+        id,
+        jobType: "procedural_skill_induction",
+        status: "queued",
+        userId: "user-v2-serialized",
+        payload: {},
+        attempts: 0,
+        maxAttempts: 3,
+        createdAt: at,
+        updatedAt: at
+      });
+    };
+
+    enqueueV2("v2-first");
+    expect(repos.runtime.leaseQueuedJobs(1, 60).map((job) => job.id))
+      .toEqual(["v2-first"]);
+    enqueueV2("v2-later");
+    expect(repos.runtime.leaseQueuedJobs(10, 60)).toEqual([]);
+    repos.runtime.completeJob("v2-first", at);
+    expect(repos.runtime.leaseQueuedJobs(10, 60).map((job) => job.id))
+      .toEqual(["v2-later"]);
+
+    db.close();
+  });
+
   it("leases L3 World Model updates FIFO per field while allowing different fields in parallel", () => {
     const { db } = createTestService();
     const repos = new Repositories(db.db);

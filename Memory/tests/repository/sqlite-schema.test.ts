@@ -86,6 +86,10 @@ describe("repository sqlite schema contract", () => {
         "trajectory_window_cluster_canonical_keys",
         "trajectory_window_family_cluster_links",
         "trajectory_skill_versions",
+        "long_trajectory_episode_representations",
+        "long_trajectory_candidates",
+        "long_trajectory_candidate_versions",
+        "long_trajectory_skill_versions",
         "l3_world_model_input_traces",
         "feedback",
         "l3_world_model_evidence_batches",
@@ -157,6 +161,12 @@ describe("repository sqlite schema contract", () => {
         "idx_episodes_project_updated",
         "idx_episodes_pipeline"
       ]));
+      const clusterMemberIndexes = db.db
+        .prepare(`PRAGMA index_list(trajectory_window_cluster_members)`)
+        .all() as Array<{ name: string }>;
+      expect(clusterMemberIndexes.map((index) => index.name)).toContain(
+        "idx_trajectory_window_cluster_members_user_role_episode"
+      );
       expect(skillTrialColumns.find((column) => column.name === "episode_id")?.notnull).toBe(1);
       expect(skillTrialColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
         "status",
@@ -386,6 +396,203 @@ describe("repository sqlite schema contract", () => {
         "trajectory_window_family_members",
         "trajectory_window_family_cluster_links"
       ]));
+      migrated.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates schema v8 to the current long-trajectory schema without losing Skills", () => {
+    const root = mkdtempSync(join(tmpdir(), "mindock-repo-v8-long-trajectory-migration-"));
+    const dbPath = join(root, "memory.sqlite");
+    try {
+      const seeded = new MemoryDb({ path: dbPath });
+      seeded.db.prepare(
+        `INSERT INTO trajectory_window_clusters (
+          id, user_id, scale, algorithm_version, config_hash, status,
+          created_at, updated_at
+        ) VALUES (?, ?, 5, ?, ?, 'active', ?, ?)`
+      ).run(
+        "trajectory-cluster-preserved-v8",
+        "migration-user",
+        "multi-scale-window.v2",
+        "v8-config",
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:00.000Z"
+      );
+      seeded.db.pragma("foreign_keys = OFF");
+      for (const table of [
+        "long_trajectory_skill_versions",
+        "long_trajectory_candidate_versions",
+        "long_trajectory_candidates",
+        "long_trajectory_episode_representations"
+      ]) {
+        seeded.db.exec(`DROP TABLE ${table}`);
+      }
+      seeded.db.prepare(`DELETE FROM schema_migrations`).run();
+      seeded.db.prepare(
+        `INSERT INTO schema_migrations (id, version, applied_at, checksum)
+         VALUES ('008_procedural_coarse_families', 8, '2026-01-01T00:00:00.000Z', 'v8')`
+      ).run();
+      seeded.close();
+
+      const migrated = new MemoryDb({ path: dbPath });
+      expect(migrated.schemaVersion()).toMatchObject({
+        version: SCHEMA_VERSION,
+        lastMigrationId: SCHEMA_MIGRATION_ID
+      });
+      expect(migrated.db.prepare(
+        `SELECT id FROM trajectory_window_clusters WHERE id = ?`
+      ).get("trajectory-cluster-preserved-v8")).toEqual({
+        id: "trajectory-cluster-preserved-v8"
+      });
+      expect(sqliteNames(migrated, "long_trajectory_%")).toEqual(expect.arrayContaining([
+        "long_trajectory_episode_representations",
+        "long_trajectory_candidates",
+        "long_trajectory_candidate_versions",
+        "long_trajectory_skill_versions"
+      ]));
+      migrated.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates v9 Candidate evidence identity into the current structure", () => {
+    const root = mkdtempSync(join(tmpdir(), "mindock-repo-v9-candidate-evolution-"));
+    const dbPath = join(root, "memory.sqlite");
+    const at = "2026-01-01T00:00:00.000Z";
+    try {
+      const seeded = new MemoryDb({ path: dbPath });
+      const repos = new Repositories(seeded.db);
+      repos.runtime.createSession({
+        id: "session-v9-candidate",
+        userId: "v9-user",
+        source: "codex",
+        profileId: "default",
+        status: "closed",
+        meta: {},
+        openedAt: at,
+        closedAt: at,
+        updatedAt: at
+      });
+      repos.runtime.createEpisode({
+        id: "episode-v9-candidate",
+        sessionId: "session-v9-candidate",
+        userId: "v9-user",
+        status: "closed",
+        l1MemoryIds: [],
+        rawTurnIds: [],
+        feedbackIds: [],
+        decisionRepairIds: [],
+        l2PolicyIds: [],
+        l3WorldModelIds: [],
+        skillMemoryIds: [],
+        turnCount: 0,
+        rTask: 1,
+        rewardDetail: {},
+        pipelineStatus: "idle",
+        meta: {},
+        openedAt: at,
+        closedAt: at,
+        updatedAt: at
+      });
+      seeded.db.pragma("foreign_keys = OFF");
+      seeded.db.exec(`
+        DROP TABLE long_trajectory_skill_versions;
+        DROP TABLE long_trajectory_candidate_versions;
+        DROP TABLE long_trajectory_candidates;
+        CREATE TABLE long_trajectory_candidates (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          algorithm_version TEXT NOT NULL,
+          config_hash TEXT NOT NULL,
+          evidence_signature TEXT NOT NULL,
+          status TEXT NOT NULL,
+          active_version_id TEXT,
+          active_skill_version_id TEXT,
+          active_skill_memory_id TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE (user_id, algorithm_version, config_hash, evidence_signature)
+        );
+        CREATE TABLE long_trajectory_candidate_versions (
+          id TEXT PRIMARY KEY,
+          candidate_id TEXT NOT NULL,
+          version_no INTEGER NOT NULL,
+          structure_hash TEXT NOT NULL,
+          support_hash TEXT NOT NULL,
+          reference_episode_id TEXT NOT NULL,
+          source_path_ids_json TEXT NOT NULL,
+          support_episode_ids_json TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          status TEXT NOT NULL,
+          supersedes_version_id TEXT,
+          created_at TEXT NOT NULL,
+          activated_at TEXT,
+          deactivated_at TEXT,
+          UNIQUE (candidate_id, version_no),
+          UNIQUE (candidate_id, structure_hash, support_hash)
+        );
+        INSERT INTO long_trajectory_candidates VALUES (
+          'candidate-v9', 'v9-user', 'algorithm-v9', 'config-v9',
+          'legacy-evidence-signature', 'active', 'candidate-version-v9',
+          NULL, NULL, '${at}', '${at}'
+        );
+        INSERT INTO long_trajectory_candidate_versions VALUES (
+          'candidate-version-v9', 'candidate-v9', 1, 'legacy-structure-hash',
+          'legacy-support-hash', 'episode-v9-candidate', '[]',
+          '["episode-v9-candidate"]', '{}', 'active', NULL, '${at}', '${at}', NULL
+        );
+        DELETE FROM schema_migrations;
+        INSERT INTO schema_migrations (id, version, applied_at, checksum)
+        VALUES ('009_long_trajectory_skill_channel', 9, '${at}', 'v9');
+      `);
+      seeded.close();
+
+      const migrated = new MemoryDb({ path: dbPath });
+      expect(migrated.schemaVersion()).toEqual({
+        version: SCHEMA_VERSION,
+        lastMigrationId: SCHEMA_MIGRATION_ID
+      });
+      expect(migrated.db.prepare(
+        `SELECT structure_key FROM long_trajectory_candidates WHERE id = 'candidate-v9'`
+      ).get()).toEqual({ structure_key: "legacy-evidence-signature" });
+      expect(migrated.db.prepare(
+        `SELECT evidence_hash FROM long_trajectory_candidate_versions
+         WHERE id = 'candidate-version-v9'`
+      ).get()).toEqual({ evidence_hash: "legacy-support-hash" });
+      migrated.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates v10 by adding the procedural maximality Episode index", () => {
+    const root = mkdtempSync(join(tmpdir(), "mindock-repo-v10-maximality-index-"));
+    const dbPath = join(root, "memory.sqlite");
+    try {
+      const seeded = new MemoryDb({ path: dbPath });
+      seeded.db.exec(`
+        DROP INDEX idx_trajectory_window_cluster_members_user_role_episode;
+        DELETE FROM schema_migrations;
+        INSERT INTO schema_migrations (id, version, applied_at, checksum)
+        VALUES ('010_long_trajectory_candidate_evolution', 10,
+                '2026-01-01T00:00:00.000Z', 'v10');
+      `);
+      seeded.close();
+
+      const migrated = new MemoryDb({ path: dbPath });
+      expect(migrated.schemaVersion()).toEqual({
+        version: SCHEMA_VERSION,
+        lastMigrationId: SCHEMA_MIGRATION_ID
+      });
+      const indexes = migrated.db
+        .prepare(`PRAGMA index_list(trajectory_window_cluster_members)`)
+        .all() as Array<{ name: string }>;
+      expect(indexes.map((index) => index.name)).toContain(
+        "idx_trajectory_window_cluster_members_user_role_episode"
+      );
       migrated.close();
     } finally {
       rmSync(root, { recursive: true, force: true });

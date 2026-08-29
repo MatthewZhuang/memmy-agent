@@ -9,6 +9,7 @@ import {
 } from "../../../src/index.js";
 import { skillMetaFromMemory } from "../../../src/algorithm/plugin-algorithms.js";
 import { Repositories } from "../../../src/storage/repositories.js";
+import { isRecord } from "../../../src/utils/json.js";
 import {
   createCapturingEmbedder,
   createMemoryServiceFixture,
@@ -159,7 +160,7 @@ describe("procedural trajectory direct Skill E2E", () => {
       sourcePolicyIds: []
     });
     expect(operations.filter(isStepSemanticsOperation)).toHaveLength(2);
-    expect(operations).toContain("procedural.procedural-pattern-skill.v3");
+    expect(operations).toContain("procedural.procedural-pattern-skill.v12");
 
     const familyBeforeDrift = db.db.prepare(
       `SELECT id, active_revision_id AS activeRevisionId
@@ -237,6 +238,438 @@ describe("procedural trajectory direct Skill E2E", () => {
       admitted: false,
       reason: "cluster-no-longer-qualified"
     });
+  });
+
+  it("shares one Step path between V2 local and V3 long-trajectory Skill mining", async () => {
+    const operations: string[] = [];
+    const skillPayloads: Array<Record<string, unknown>> = [];
+    let semanticSource = "procedural-e2e-original";
+    const llm = proceduralE2eLlm(operations, {
+      skillPayloads,
+      semanticSource: () => semanticSource
+    });
+    const config = {
+      ...DEFAULT_MEMMY_CONFIG,
+      algorithm: {
+        ...DEFAULT_MEMMY_CONFIG.algorithm,
+        negativeExperience: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.negativeExperience,
+          enabled: false
+        },
+        l2Induction: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+          useLlm: false
+        },
+        l3Abstraction: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+          useLlm: false
+        }
+      }
+    };
+    const { db, service } = createTestService({
+      config,
+      llm,
+      skillLlm: llm,
+      embedder: constantProceduralEmbedder()
+    });
+    const repos = new Repositories(db.db);
+
+    const first = await executeLongSuccessfulEpisode(service, "codex", "long-first");
+    await runWorkerRounds(service, 20);
+    const second = await executeLongSuccessfulEpisode(service, "cursor", "long-second");
+    await runWorkerRounds(service, 30);
+
+    const firstPath = repos.proceduralTrajectory.getActivePath(first.episodeId)!;
+    const secondPath = repos.proceduralTrajectory.getActivePath(second.episodeId)!;
+    expect(firstPath.path.steps).toHaveLength(20);
+    expect(secondPath.path.steps).toHaveLength(20);
+    expect(operations.filter(isStepSemanticsOperation)).toHaveLength(2);
+    expect(repos.proceduralTrajectory.listWindowsForPath(firstPath.id, 15).length)
+      .toBeGreaterThan(0);
+    expect(repos.proceduralTrajectory.listWindowsForPath(secondPath.id, 15).length)
+      .toBeGreaterThan(0);
+
+    const candidate = db.db.prepare(
+      `SELECT id, active_version_id AS activeVersionId,
+              active_skill_memory_id AS activeSkillMemoryId
+       FROM long_trajectory_candidates
+       WHERE user_id = ? AND status = 'active' AND active_skill_memory_id IS NOT NULL
+       ORDER BY created_at ASC LIMIT 1`
+    ).get(USER_ID) as {
+      id: string;
+      activeVersionId: string;
+      activeSkillMemoryId: string;
+    } | undefined;
+    expect(candidate).toBeDefined();
+    const candidateVersion = repos.longTrajectory.getCandidateVersion(
+      candidate!.activeVersionId
+    );
+    expect(candidateVersion?.supportEpisodeIds.sort()).toEqual(
+      [first.episodeId, second.episodeId].sort()
+    );
+    const skill = repos.memories.get(candidate!.activeSkillMemoryId);
+    expect(skill).toMatchObject({
+      memoryLayer: "Skill",
+      memoryType: "SkillMemory",
+      userId: USER_ID,
+      status: "resolving"
+    });
+    expect(skill?.properties.internal_info).toMatchObject({
+      plugin_algorithm: "procedural.long-trajectory.skill.v1",
+      source_cluster_id: candidate!.id,
+      status: "candidate"
+    });
+    expect(skillMetaFromMemory(skill!)?.sourcePolicyIds).toEqual([]);
+    expect(service.listSkills({ userId: USER_ID }).items.map((item) => item.id))
+      .toContain(candidate!.activeSkillMemoryId);
+
+    const initialCandidateVersionId = candidate!.activeVersionId;
+    const initialCandidate = repos.longTrajectory.getCandidate(candidate!.id)!;
+    const initialSkillVersionId = initialCandidate.activeSkillVersionId;
+    const initialSkillMemoryId = initialCandidate.activeSkillMemoryId!;
+    const initialMemoryVersion = repos.memories.get(initialSkillMemoryId)!.version;
+    const candidateCountBefore = (db.db.prepare(
+      `SELECT COUNT(*) AS count FROM long_trajectory_candidates WHERE user_id = ?`
+    ).get(USER_ID) as { count: number }).count;
+    // Episode C deliberately uses different canonical wording, so its exact
+    // structure hash cannot find the old Candidate. Candidate-first projection
+    // must still update S1 because the retained Span sequence aligns.
+    semanticSource = "procedural-e2e-paraphrased";
+    const third = await executeLongSuccessfulEpisode(service, "claude_code", "long-third");
+    await runWorkerRounds(service, 30);
+
+    const updatedCandidate = repos.longTrajectory.getCandidate(candidate!.id)!;
+    expect((db.db.prepare(
+      `SELECT COUNT(*) AS count FROM long_trajectory_candidates WHERE user_id = ?`
+    ).get(USER_ID) as { count: number }).count).toBe(candidateCountBefore);
+    expect(updatedCandidate.activeVersionId).not.toBe(initialCandidateVersionId);
+    expect(updatedCandidate.activeSkillVersionId).not.toBe(initialSkillVersionId);
+    expect(updatedCandidate.activeSkillMemoryId).toBe(initialSkillMemoryId);
+    const updatedCandidateVersion = repos.longTrajectory.getCandidateVersion(
+      updatedCandidate.activeVersionId!
+    )!;
+    expect(updatedCandidateVersion.supportEpisodeIds.sort()).toEqual(
+      [first.episodeId, second.episodeId, third.episodeId].sort()
+    );
+    expect(repos.longTrajectory.getCandidateVersion(initialCandidateVersionId)?.status)
+      .toBe("superseded");
+    expect(repos.memories.get(initialSkillMemoryId)!.version).toBeGreaterThan(initialMemoryVersion);
+    const incrementalPayload = [...skillPayloads].reverse().find((payload) => {
+      const pattern = payload.pattern;
+      return isRecord(pattern) && isRecord(pattern.origin) &&
+        pattern.origin.kind === "long_trajectory" && isRecord(payload.existing_skill_read_only);
+    });
+    expect(incrementalPayload).toBeDefined();
+    expect(incrementalPayload?.existing_skill_read_only).toMatchObject({
+      memory_id: initialSkillMemoryId,
+      memory_version: initialMemoryVersion
+    });
+    expect(incrementalPayload?.evidence_delta_read_only).toMatchObject({
+      previous_candidate_version_id: initialCandidateVersionId,
+      added_episode_ids: [third.episodeId]
+    });
+    expect((incrementalPayload?.occurrences as Array<{ episode_id?: string }> | undefined)
+      ?.map((occurrence) => occurrence.episode_id)).toContain(third.episodeId);
+
+    service.archiveMemory(first.l1MemoryId, { namespace: first.namespace });
+    expect(repos.longTrajectory.getCandidate(candidate!.id)?.status).toBe("retired");
+    expect(repos.memories.get(candidate!.activeSkillMemoryId)?.status).toBe("archived");
+    expect(service.listSkills({ userId: USER_ID }).items.map((item) => item.id))
+      .not.toContain(candidate!.activeSkillMemoryId);
+  });
+
+  it("updates a directly recalled Candidate even when Episode reverse lookup cannot find it", async () => {
+    const operations: string[] = [];
+    let semanticSource = "direct-candidate-original";
+    const llm = proceduralE2eLlm(operations, {
+      semanticSource: () => semanticSource
+    });
+    const config = {
+      ...DEFAULT_MEMMY_CONFIG,
+      algorithm: {
+        ...DEFAULT_MEMMY_CONFIG.algorithm,
+        negativeExperience: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.negativeExperience,
+          enabled: false
+        },
+        l2Induction: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+          useLlm: false
+        },
+        l3Abstraction: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+          useLlm: false
+        }
+      }
+    };
+    const { db, service } = createTestService({
+      config,
+      llm,
+      skillLlm: llm,
+      embedder: constantProceduralEmbedder()
+    });
+    const repos = new Repositories(db.db);
+
+    const first = await executeLongSuccessfulEpisode(service, "codex", "direct-first");
+    await runWorkerRounds(service, 20);
+    const second = await executeLongSuccessfulEpisode(service, "cursor", "direct-second");
+    await runWorkerRounds(service, 30);
+    const candidateRow = db.db.prepare(
+      `SELECT id FROM long_trajectory_candidates
+       WHERE user_id = ? AND status = 'active' AND active_skill_memory_id IS NOT NULL
+       ORDER BY created_at ASC LIMIT 1`
+    ).get(USER_ID) as { id: string } | undefined;
+    expect(candidateRow).toBeDefined();
+    const original = repos.longTrajectory.getCandidate(candidateRow!.id)!;
+    const candidateCount = (db.db.prepare(
+      `SELECT COUNT(*) AS count FROM long_trajectory_candidates WHERE user_id = ?`
+    ).get(USER_ID) as { count: number }).count;
+
+    // Simulate an Episode Top-K miss while preserving the Candidate payload.
+    // Reverse lookup can no longer find S1, but direct Candidate recall can.
+    db.db.prepare(
+      `UPDATE long_trajectory_candidate_versions
+       SET support_episode_ids_json = ? WHERE id = ?`
+    ).run(JSON.stringify(["episode-not-recalled"]), original.activeVersionId);
+    expect(repos.longTrajectory.listActiveCandidatesLinkedToEpisodes({
+      userId: USER_ID,
+      algorithmVersion: "reference-span-sequence-mining.v1",
+      configHash: original.configHash,
+      episodeIds: [first.episodeId, second.episodeId]
+    })).toEqual([]);
+    expect(repos.longTrajectory.listActiveCandidates({
+      userId: USER_ID,
+      algorithmVersion: "reference-span-sequence-mining.v1",
+      configHash: original.configHash
+    }).map((item) => item.id)).toContain(original.id);
+
+    semanticSource = "direct-candidate-paraphrased";
+    const third = await executeLongSuccessfulEpisode(service, "claude_code", "direct-third");
+    await runWorkerRounds(service, 30);
+
+    const updated = repos.longTrajectory.getCandidate(original.id)!;
+    expect(updated.activeVersionId).not.toBe(original.activeVersionId);
+    expect((db.db.prepare(
+      `SELECT COUNT(*) AS count FROM long_trajectory_candidates WHERE user_id = ?`
+    ).get(USER_ID) as { count: number }).count).toBe(candidateCount);
+    expect(repos.longTrajectory.getCandidateVersion(updated.activeVersionId!)
+      ?.supportEpisodeIds.sort()).toEqual(
+      [first.episodeId, second.episodeId, third.episodeId].sort()
+    );
+  });
+
+  it("keeps the last-known-good V3 Skill live when its replacement fails validation", async () => {
+    const operations: string[] = [];
+    let semanticSource = "last-known-good-original";
+    let rejectReplacement = false;
+    const llm = proceduralE2eLlm(operations, {
+      semanticSource: () => semanticSource,
+      skillResponse(originKind, _payload, response) {
+        if (originKind !== "long_trajectory" || !rejectReplacement) return response;
+        const procedureSteps = response.procedure_steps as Array<Record<string, unknown>>;
+        return {
+          ...response,
+          procedure_steps: procedureSteps.map((step, index) => index === 0
+            ? { ...step, source_anchor_ids: ["not-an-allowed-evidence-ref"] }
+            : step)
+        };
+      }
+    });
+    const config = {
+      ...DEFAULT_MEMMY_CONFIG,
+      algorithm: {
+        ...DEFAULT_MEMMY_CONFIG.algorithm,
+        negativeExperience: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.negativeExperience,
+          enabled: false
+        },
+        l2Induction: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+          useLlm: false
+        },
+        l3Abstraction: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+          useLlm: false
+        }
+      }
+    };
+    const { db, service } = createTestService({
+      config,
+      llm,
+      skillLlm: llm,
+      embedder: constantProceduralEmbedder()
+    });
+    const repos = new Repositories(db.db);
+
+    const first = await executeLongSuccessfulEpisode(service, "codex", "known-good-first");
+    await runWorkerRounds(service, 20);
+    const second = await executeLongSuccessfulEpisode(service, "cursor", "known-good-second");
+    await runWorkerRounds(service, 30);
+
+    const candidateRow = db.db.prepare(
+      `SELECT id FROM long_trajectory_candidates
+       WHERE user_id = ? AND status = 'active' AND active_skill_memory_id IS NOT NULL
+       ORDER BY created_at ASC LIMIT 1`
+    ).get(USER_ID) as { id: string } | undefined;
+    expect(candidateRow).toBeDefined();
+    const originalCandidate = repos.longTrajectory.getCandidate(candidateRow!.id)!;
+    const originalCandidateVersionId = originalCandidate.activeVersionId!;
+    const originalSkillVersionId = originalCandidate.activeSkillVersionId!;
+    const originalSkillMemoryId = originalCandidate.activeSkillMemoryId!;
+    const originalSkillMemory = repos.memories.get(originalSkillMemoryId)!;
+    expect(originalSkillMemory.status).toBe("resolving");
+
+    // Episode C updates the existing Candidate, but its proposed replacement
+    // deliberately violates the citation contract.
+    semanticSource = "last-known-good-paraphrased";
+    rejectReplacement = true;
+    const third = await executeLongSuccessfulEpisode(
+      service,
+      "claude_code",
+      "known-good-third"
+    );
+    await runWorkerRounds(service, 30);
+
+    const current = repos.longTrajectory.getCandidate(originalCandidate.id)!;
+    expect(current.activeVersionId).not.toBe(originalCandidateVersionId);
+    expect(current.activeSkillVersionId).toBe(originalSkillVersionId);
+    expect(current.activeSkillMemoryId).toBe(originalSkillMemoryId);
+    expect(repos.longTrajectory.getSkillVersion(originalSkillVersionId)?.status).toBe("active");
+    expect(repos.memories.get(originalSkillMemoryId)).toMatchObject({
+      status: "resolving",
+      version: originalSkillMemory.version
+    });
+    expect(service.listSkills({ userId: USER_ID }).items.map((item) => item.id))
+      .toContain(originalSkillMemoryId);
+
+    const replacementVersion = repos.longTrajectory.getCandidateVersion(current.activeVersionId!);
+    expect(replacementVersion?.supportEpisodeIds.sort()).toEqual(
+      [first.episodeId, second.episodeId, third.episodeId].sort()
+    );
+    const decisions = db.db.prepare(
+      `SELECT id, status, skill_memory_id AS skillMemoryId, payload_json AS payloadJson
+       FROM long_trajectory_skill_versions
+       WHERE candidate_id = ? ORDER BY version_no ASC`
+    ).all(current.id) as Array<{
+      id: string;
+      status: string;
+      skillMemoryId: string | null;
+      payloadJson: string;
+    }>;
+    expect(decisions).toHaveLength(2);
+    expect(decisions[0]).toMatchObject({
+      id: originalSkillVersionId,
+      status: "active",
+      skillMemoryId: originalSkillMemoryId
+    });
+    expect(decisions[1]).toMatchObject({ status: "superseded", skillMemoryId: null });
+    expect(JSON.parse(decisions[1]!.payloadJson)).toMatchObject({
+      admitted: false,
+      reason: "invalid-evidence-anchor",
+      preservedActiveSkillVersionId: originalSkillVersionId,
+      preservedActiveSkillMemoryId: originalSkillMemoryId
+    });
+  });
+
+  it("does not resurrect a V3 Skill archived while its induction LLM is running", async () => {
+    const skillStarted = deferred<void>();
+    const releaseSkill = deferred<void>();
+    let blockLongTrajectorySkill = false;
+    const operations: string[] = [];
+    const llm = proceduralE2eLlm(operations, {
+      async beforeSkillResponse(originKind) {
+        if (!blockLongTrajectorySkill || originKind !== "long_trajectory") return;
+        skillStarted.resolve();
+        await releaseSkill.promise;
+      }
+    });
+    const config = {
+      ...DEFAULT_MEMMY_CONFIG,
+      algorithm: {
+        ...DEFAULT_MEMMY_CONFIG.algorithm,
+        negativeExperience: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.negativeExperience,
+          enabled: false
+        },
+        l2Induction: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+          useLlm: false
+        },
+        l3Abstraction: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+          useLlm: false
+        }
+      }
+    };
+    const { db, service } = createTestService({
+      config,
+      llm,
+      skillLlm: llm,
+      embedder: constantProceduralEmbedder()
+    });
+    const repos = new Repositories(db.db);
+
+    const first = await executeLongSuccessfulEpisode(service, "codex", "slow-first");
+    await runWorkerRounds(service, 20);
+    await executeLongSuccessfulEpisode(service, "cursor", "slow-second");
+    await runWorkerRounds(service, 30);
+
+    const candidateRow = db.db.prepare(
+      `SELECT id FROM long_trajectory_candidates
+       WHERE user_id = ? AND status = 'active' AND active_skill_memory_id IS NOT NULL
+       ORDER BY created_at ASC LIMIT 1`
+    ).get(USER_ID) as { id: string } | undefined;
+    expect(candidateRow).toBeDefined();
+    const candidate = repos.longTrajectory.getCandidate(candidateRow!.id)!;
+    const archivedSkillId = candidate.activeSkillMemoryId!;
+    blockLongTrajectorySkill = true;
+    const at = new Date().toISOString();
+    repos.runtime.enqueueJob({
+      id: `job_slow_v3_${candidate.id}`,
+      jobType: "long_trajectory_skill_induction",
+      status: "queued",
+      userId: USER_ID,
+      sessionId: first.sessionId,
+      episodeId: first.episodeId,
+      targetMemoryId: candidate.id,
+      payload: {
+        candidateId: candidate.id,
+        candidateVersionId: candidate.activeVersionId,
+        inductionVersion: "slow-governance-race-test"
+      },
+      attempts: 0,
+      maxAttempts: 1,
+      createdAt: at,
+      updatedAt: at
+    });
+
+    const slowRun = service.runWorkerOnce(100);
+    await skillStarted.promise;
+    service.archiveMemory(archivedSkillId, { namespace: first.namespace });
+    expect(repos.memories.getIncludingDeleted(archivedSkillId)?.status).toBe("archived");
+    expect(repos.memories.getIncludingDeleted(archivedSkillId)
+      ?.properties.internal_info.procedural_governance).toMatchObject({
+      disabled: true,
+      action: "archive"
+    });
+
+    releaseSkill.resolve();
+    await slowRun;
+
+    expect(repos.runtime.getJob(`job_slow_v3_${candidate.id}`)?.status).toBe("succeeded");
+    const current = repos.longTrajectory.getCandidate(candidate.id)!;
+    expect(current.activeSkillMemoryId).toBeUndefined();
+    expect(repos.longTrajectory.getSkillVersion(current.activeSkillVersionId!)?.payload)
+      .toMatchObject({ admitted: false, reason: "governance-disabled" });
+    expect(repos.memories.getIncludingDeleted(archivedSkillId)?.status).toBe("archived");
+    const liveLongTrajectorySkills = db.db.prepare(
+      `SELECT COUNT(*) AS count FROM memories
+       WHERE user_id = ? AND memory_layer = 'Skill' AND deleted_at IS NULL
+         AND status != 'archived'
+         AND json_extract(properties_json, '$.internal_info.plugin_algorithm') =
+           'procedural.long-trajectory.skill.v1'`
+    ).get(USER_ID) as { count: number };
+    expect(liveLongTrajectorySkills.count).toBe(0);
   });
 
   it("removes deactivated Path evidence from its Family and canonical Skill", async () => {
@@ -367,7 +800,7 @@ describe("procedural trajectory direct Skill E2E", () => {
     expect(repos.proceduralTrajectory.listFamilyMembers(familyXAfter.activeRevisionId)
       .map((member) => member.episodeId)).toContain(localX.episodeId);
     expect(operations.filter((operation) =>
-      operation === "procedural.procedural-pattern-skill.v3")).toHaveLength(0);
+      operation === "procedural.procedural-pattern-skill.v12")).toHaveLength(0);
 
     const sharedA = await executeSuccessfulEpisode(service, "codex", "shared-a", "z");
     await runWorkerRounds(service, 16);
@@ -409,7 +842,7 @@ describe("procedural trajectory direct Skill E2E", () => {
     const sharedCluster = repos.proceduralTrajectory.getClusterHead(sharedClusters[0]!.id)!;
     expect(sharedCluster.activeSkillMemoryId).toBeTruthy();
     expect(operations.filter((operation) =>
-      operation === "procedural.procedural-pattern-skill.v3")).toHaveLength(1);
+      operation === "procedural.procedural-pattern-skill.v12")).toHaveLength(1);
     expect(service.listSkills({ userId: USER_ID }).items.map((item) => item.id))
       .toEqual([sharedCluster.activeSkillMemoryId]);
   });
@@ -464,6 +897,73 @@ async function executeSuccessfulEpisode(
   };
 }
 
+async function executeLongSuccessfulEpisode(
+  service: ReturnType<typeof createTestService>["service"],
+  source: string,
+  suffix: string
+) {
+  const namespace: RuntimeNamespace = {
+    source,
+    profileId: `profile-${suffix}`,
+    userId: USER_ID
+  };
+  const session = service.openSession({ namespace });
+  const toolNames = Array.from({ length: 20 }, (_, index) =>
+    `long_stage_${String(index + 1).padStart(2, "0")}`);
+  const completed = service.completeTurn(`turn-${suffix}`, {
+    namespace,
+    sessionId: session.sessionId,
+    query: "Build, repair, and validate a complex document artifact",
+    answer: "The complex artifact was built and passed all validation checks.",
+    toolCalls: toolNames.map((name, index) => ({
+      id: `${suffix}-tool-${index}`,
+      name,
+      input: { artifactType: "document", stage: index }
+    })),
+    toolResults: toolNames.map((name, index) => ({
+      toolCallId: `${suffix}-tool-${index}`,
+      name,
+      output: { ok: true, stage: index }
+    }))
+  });
+  service.closeSession(session.sessionId);
+  await service.feedback({
+    namespace,
+    sessionId: session.sessionId,
+    episodeId: completed.episodeId,
+    l1MemoryId: completed.l1MemoryId,
+    channel: "explicit",
+    polarity: "positive",
+    magnitude: 1,
+    rationale: "the long artifact workflow succeeded"
+  });
+  return {
+    namespace,
+    sessionId: session.sessionId,
+    episodeId: completed.episodeId,
+    l1MemoryId: completed.l1MemoryId
+  };
+}
+
+function constantProceduralEmbedder(): Embedder {
+  return {
+    config: {
+      ...DEFAULT_MEMMY_CONFIG.embedding,
+      provider: "local",
+      model: "constant-procedural-test"
+    },
+    isRemote: () => false,
+    embed: async (texts) => texts.map(() => [1, 0, 0, 0]),
+    embedOne: async () => [1, 0, 0, 0],
+    status: () => ({
+      provider: "local",
+      model: "constant-procedural-test",
+      configured: true,
+      remote: false
+    })
+  };
+}
+
 function overlappingFamilyEmbedder(): Embedder {
   const angle = 38 * Math.PI / 180;
   const coarse = {
@@ -507,7 +1007,14 @@ function proceduralE2eLlm(
   operations: string[],
   clientOptions: {
     model?: string;
-    semanticSource?: string;
+    semanticSource?: string | (() => string);
+    skillPayloads?: Array<Record<string, unknown>>;
+    beforeSkillResponse?(originKind: string | undefined): Promise<void>;
+    skillResponse?(
+      originKind: string | undefined,
+      payload: Record<string, unknown>,
+      response: Record<string, unknown>
+    ): Record<string, unknown>;
   } = {}
 ): LlmClient {
   return {
@@ -581,19 +1088,82 @@ function proceduralE2eLlm(
           steps: candidates.map((candidate) => ({
             candidate_id: candidate.candidateId,
             include: candidate.kind !== "response_generation",
-            intent: `[${clientOptions.semanticSource ?? "procedural-e2e"}] Complete reusable stage ${candidate.toolName ?? "tool"}`,
+            intent: `[${typeof clientOptions.semanticSource === "function"
+              ? clientOptions.semanticSource()
+              : clientOptions.semanticSource ?? "procedural-e2e"}] Complete reusable stage ${candidate.toolName ?? "tool"}`,
             summary: `${candidate.toolName ?? "tool"} completed successfully`
           }))
         } as unknown as T;
       }
-      if (options.operation === "procedural.procedural-pattern-skill.v3") {
-        const payload = JSON.parse(content) as {
-          occurrences?: Array<{ occurrence_id: string }>;
-        };
-        const occurrenceIds = (payload.occurrences ?? []).map((item) => item.occurrence_id);
+      if (options.operation === "procedural.procedural-skill-coverage.v1") {
         return {
+          decision: "distinct",
+          target_skill_id: null,
+          target_route: null,
+          relation: "distinct",
+          reason: "No existing Skill covers this Draft."
+        } as unknown as T;
+      }
+      if (options.operation === "procedural.procedural-pattern-skill.v12" ||
+          options.operation === "procedural.procedural-long-trajectory-skill.v3") {
+        const payload = JSON.parse(content) as {
+          pattern?: { origin?: { kind?: string } };
+          occurrences?: Array<{
+            occurrence_id: string;
+            episode_id: string;
+            aligned_sequence?: Array<{
+              anchor_id?: string;
+              step_id: string;
+              outcome?: string;
+            }>;
+          }>;
+          common_core?: { anchors?: Array<{ anchor_id: string }> };
+          evidence_anchor_catalog?: Array<{
+            anchor_id: string;
+            allowed_usage: "mandatory" | "conditional_only";
+            semantic_parent_anchor_id?: string;
+            support_episode_ids: string[];
+          }>;
+        };
+        clientOptions.skillPayloads?.push(payload as Record<string, unknown>);
+        await clientOptions.beforeSkillResponse?.(payload.pattern?.origin?.kind);
+        const mandatoryAnchors = (payload.evidence_anchor_catalog ?? [])
+          .filter((anchor) => anchor.allowed_usage === "mandatory");
+        const anchorEvidence = (anchorId: string) => mandatoryAnchors
+          .filter((anchor) => anchor.anchor_id === anchorId ||
+            anchor.semantic_parent_anchor_id === anchorId)
+          .map((anchor) => anchor.anchor_id);
+        const sharedAnchors = mandatoryAnchors
+          .filter((anchor) => anchor.support_episode_ids.length >= 2)
+          .map((anchor) => anchor.anchor_id);
+        const closureSupportEpisodeIds = [...new Set(mandatoryAnchors.flatMap((anchor) =>
+          anchor.support_episode_ids))];
+        const longProcedure = payload.pattern?.origin?.kind === "long_trajectory"
+          ? (payload.common_core?.anchors ?? []).map((anchor, index) => ({
+              title: `Complete repeated Span ${index + 1}`,
+              body: "Complete this repeated segment of the long workflow.",
+              source_anchor_ids: anchorEvidence(anchor.anchor_id)
+            }))
+          : [{
+              title: "Build through the validated stages",
+              body: "Run the shared ordered construction stages.",
+              source_anchor_ids: sharedAnchors
+            }];
+        const response = {
           admit: true,
           rejection_reason: null,
+          ...(payload.pattern?.origin?.kind === "long_trajectory" ? {} : {
+            local_subproblem_closure: {
+              closed: true,
+              subproblem: "Build and validate a requested local artifact stage.",
+              entry_condition: "The artifact stage has not been completed.",
+              resolution: "Run the shared ordered construction actions.",
+              resolved_state: "The artifact stage is complete.",
+              success_check: "The shared output verification succeeds.",
+              support_episode_ids: closureSupportEpisodeIds,
+              reason: "The same successful Episodes support construction and verification."
+            }
+          }),
           name: "build-and-verify-artifact",
           display_title: "Build and verify an artifact",
           retrieval_blurb: "Build an artifact through ordered stages and verify the final output.",
@@ -601,24 +1171,26 @@ function proceduralE2eLlm(
           summary: "Inspect, prepare, build, check, and verify the requested artifact.",
           preconditions: ["The target artifact and expected validation signal are known."],
           parameters: [],
-          procedure_steps: [{
-            title: "Build through the validated stages",
-            body: "Run the shared ordered construction stages.",
-            evidence_refs: occurrenceIds
-          }],
+          procedure_steps: longProcedure,
           verification_steps: [{
             check: "Verify the generated artifact",
             success_signal: "The final output check succeeds.",
-            evidence_refs: occurrenceIds
+            source_anchor_ids: payload.pattern?.origin?.kind === "long_trajectory"
+              ? anchorEvidence(payload.common_core?.anchors?.at(-1)?.anchor_id ?? "")
+              : sharedAnchors.slice(-1)
           }],
           do_not_apply_when: [],
           decision_guidance: { preference: [], anti_pattern: [] },
           examples: [],
           tags: ["artifact", "verification"],
           tools: [],
-          evidence_occurrence_ids: occurrenceIds,
           confidence: 0.9
-        } as unknown as T;
+        };
+        return (clientOptions.skillResponse?.(
+          payload.pattern?.origin?.kind,
+          payload as Record<string, unknown>,
+          response
+        ) ?? response) as T;
       }
       return {} as T;
     },
@@ -633,4 +1205,10 @@ function proceduralE2eLlm(
 
 function isStepSemanticsOperation(operation: string): boolean {
   return operation.startsWith(STEP_SEMANTICS_OPERATION_PREFIX);
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
 }

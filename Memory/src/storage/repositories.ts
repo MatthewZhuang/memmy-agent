@@ -51,6 +51,7 @@ import {
   type VectorSearchCandidate
 } from "./sqlite-vec-store.js";
 import { ProceduralTrajectoryRepository } from "./procedural-trajectory-repository.js";
+import { LongTrajectoryRepository } from "./long-trajectory-repository.js";
 
 type SqlValue = string | number | Buffer | null;
 const BUNDLE_TABLES = [
@@ -73,6 +74,10 @@ const BUNDLE_TABLES = [
   "trajectory_window_cluster_canonical_keys",
   "trajectory_window_family_cluster_links",
   "trajectory_skill_versions",
+  "long_trajectory_episode_representations",
+  "long_trajectory_candidates",
+  "long_trajectory_candidate_versions",
+  "long_trajectory_skill_versions",
   "l3_world_model_input_traces",
   "feedback",
   "l3_world_model_evidence_batches",
@@ -2852,6 +2857,33 @@ export class RuntimeRepository {
                OR CAST(json_extract(payload_json, '$.runAfter') AS TEXT) <= ?
              )
              AND (
+               job_type <> 'procedural_skill_induction'
+               OR (
+                 NOT EXISTS (
+                   SELECT 1
+                   FROM evolution_jobs AS upstream_skill_blocker
+                   WHERE upstream_skill_blocker.user_id = evolution_jobs.user_id
+                     AND upstream_skill_blocker.id <> evolution_jobs.id
+                     AND upstream_skill_blocker.job_type IN (
+                       'l2_association',
+                       'l2_induction',
+                       'skill_crystallization',
+                       'long_trajectory_mining',
+                       'long_trajectory_skill_induction'
+                     )
+                     AND upstream_skill_blocker.status IN ('queued', 'leased', 'failed')
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM evolution_jobs AS leased_v2
+                   WHERE leased_v2.user_id = evolution_jobs.user_id
+                     AND leased_v2.id <> evolution_jobs.id
+                     AND leased_v2.job_type = 'procedural_skill_induction'
+                     AND leased_v2.status = 'leased'
+                 )
+               )
+             )
+             AND (
                job_type <> 'l3_world_model_update'
                OR (
                  scope_key IS NOT NULL
@@ -5015,6 +5047,7 @@ export class Repositories {
   readonly processing: MemoryProcessingRepository;
   readonly runtime: RuntimeRepository;
   readonly proceduralTrajectory: ProceduralTrajectoryRepository;
+  readonly longTrajectory: LongTrajectoryRepository;
   readonly l3WorldModels: L3WorldModelRepository;
   readonly projectEnvironments: ProjectEnvironmentRepository;
   readonly vectors: SqliteVecStore;
@@ -5026,6 +5059,7 @@ export class Repositories {
     this.processing = new MemoryProcessingRepository(db);
     this.runtime = new RuntimeRepository(db);
     this.proceduralTrajectory = new ProceduralTrajectoryRepository(db);
+    this.longTrajectory = new LongTrajectoryRepository(db);
     this.l3WorldModels = new L3WorldModelRepository(db, this.memories);
     this.projectEnvironments = new ProjectEnvironmentRepository(db, this.l3WorldModels, this.runtime);
   }
@@ -6781,6 +6815,26 @@ function redactBundleRow(table: BundleTableName, row: Record<string, unknown>): 
       semantic_hash: stableHash("[REDACTED]")
     };
   }
+  if (table === "long_trajectory_episode_representations") {
+    return {
+      ...row,
+      goal_text: "[REDACTED]",
+      terminal_result_text: "[REDACTED]",
+      trajectory_text: "[REDACTED]",
+      goal_hash: stableHash("[REDACTED]"),
+      trajectory_hash: stableHash("[REDACTED]")
+    };
+  }
+  if (table === "long_trajectory_candidate_versions") {
+    const payload = parseJson<unknown>(
+      typeof row.payload_json === "string" ? row.payload_json : "{}",
+      {}
+    );
+    return {
+      ...row,
+      payload_json: toJson(redactLongTrajectoryPayload(payload))
+    };
+  }
   if (table !== "raw_turns") {
     return row;
   }
@@ -6793,6 +6847,22 @@ function redactBundleRow(table: BundleTableName, row: Record<string, unknown>): 
     tool_results_json: "[]",
     redacted_at: row.redacted_at ?? nowIso()
   };
+}
+
+function redactLongTrajectoryPayload(value: unknown, key = ""): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactLongTrajectoryPayload(item, key));
+  }
+  if (!isRecordLike(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([childKey, childValue]) => {
+    if ([
+      "intent", "summary", "semanticText", "summaryText", "goalText",
+      "terminalResultText", "goal", "terminalResult", "trajectoryText"
+    ].includes(childKey)) {
+      return [childKey, "[REDACTED]"];
+    }
+    return [childKey, redactLongTrajectoryPayload(childValue, childKey)];
+  }));
 }
 
 function normalizeRedactedL3WorldModelBundle(
@@ -6895,6 +6965,20 @@ function applyBundleDefaults(table: BundleTableName, row: Record<string, unknown
       pipeline_error: row.pipeline_error ?? null
     };
   }
+  if (table === "long_trajectory_candidates") {
+    const structureKey = row.structure_key ?? row.evidence_signature;
+    return {
+      ...row,
+      structure_key: structureKey,
+      evidence_signature: row.evidence_signature ?? structureKey
+    };
+  }
+  if (table === "long_trajectory_candidate_versions") {
+    return {
+      ...row,
+      evidence_hash: row.evidence_hash ?? row.support_hash
+    };
+  }
   return row;
 }
 
@@ -6988,10 +7072,12 @@ function evolutionJobPrioritySql(): string {
              WHEN job_type = 'reward' THEN 30
              WHEN job_type = 'episode_path_compile' THEN 34
              WHEN job_type = 'trajectory_window_ingest' THEN 35
+             WHEN job_type = 'long_trajectory_mining' THEN 36
              WHEN job_type = 'span_big_turn' THEN 35
              WHEN job_type = 'l2_association' THEN 40
              WHEN job_type = 'l2_induction' THEN 50
-             WHEN job_type = 'procedural_skill_induction' THEN 50
+             WHEN job_type = 'procedural_skill_induction' THEN 75
+             WHEN job_type = 'long_trajectory_skill_induction' THEN 50
              WHEN job_type = 'project_environment_profile' THEN 55
              WHEN job_type IN ('l3_abstraction', 'l3_world_model_update') THEN 60
              WHEN job_type = 'skill_crystallization' THEN 70

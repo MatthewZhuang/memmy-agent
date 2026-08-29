@@ -70,6 +70,8 @@ export interface WorkerJobProcessors {
     compileEpisodePath(job: EvolutionJobRecord): MaybePromise<void>;
     ingestTrajectoryWindows(job: EvolutionJobRecord): MaybePromise<void>;
     induceProceduralSkill(job: EvolutionJobRecord): MaybePromise<void>;
+    mineLongTrajectories(job: EvolutionJobRecord): MaybePromise<void>;
+    induceLongTrajectorySkill(job: EvolutionJobRecord): MaybePromise<void>;
   };
   feedback: {
     applyReward(job: EvolutionJobRecord): MaybePromise<void>;
@@ -272,6 +274,12 @@ export async function processJob(
       return;
     case "procedural_skill_induction":
       await deps.processors.evolution.induceProceduralSkill(job);
+      return;
+    case "long_trajectory_mining":
+      await deps.processors.evolution.mineLongTrajectories(job);
+      return;
+    case "long_trajectory_skill_induction":
+      await deps.processors.evolution.induceLongTrajectorySkill(job);
       return;
     case "embedding":
       await deps.processors.embedding.embedMemory(job);
@@ -502,7 +510,7 @@ export function workerJobCanRunInParallel(job: EvolutionJobRecord): boolean {
     job.jobType === "import_summary" ||
     job.jobType === "embedding" ||
     job.jobType === "episode_path_compile" ||
-    job.jobType === "procedural_skill_induction" ||
+    job.jobType === "long_trajectory_skill_induction" ||
     job.jobType === "l3_world_model_update" ||
     job.jobType === "project_environment_profile";
 }
@@ -624,6 +632,21 @@ export function evolutionJobDedupeKey(input: Pick<EnqueueJobInput, "jobType" | "
         ?? "current";
       const inductionVersion = payloadVersion("inductionVersion") ?? "current";
       return `procedural_skill_induction:${clusterId}:${clusterVersion}:${inductionVersion}`;
+    }
+    case "long_trajectory_mining": {
+      const pathId = payloadString("pathId") ?? target;
+      if (!pathId) return undefined;
+      return `long_trajectory_mining:${pathId}:` +
+        `${payloadString("pathHash") ?? "current"}:` +
+        `${payloadVersion("miningConfigHash") ?? "current"}:` +
+        `${payloadString("rewardSnapshotHash") ?? "current"}`;
+    }
+    case "long_trajectory_skill_induction": {
+      const candidateId = payloadString("candidateId") ?? target;
+      if (!candidateId) return undefined;
+      return `long_trajectory_skill_induction:${candidateId}:` +
+        `${payloadString("candidateVersionId") ?? "current"}:` +
+        `${payloadVersion("inductionVersion") ?? "current"}`;
     }
     case "negative_experience": {
       const source = payloadString("source");
