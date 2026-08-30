@@ -53,8 +53,13 @@ import {
   extractAnchoredCompletionOverlay,
   extractAlignedCommonCore,
   fineEvidenceSignature,
+  orderedEmbeddedWindows,
   selectConstrainedRealMedoid,
   selectMaximalWindowClusters,
+  preferredFineClusterPartition,
+  resolveFineClusterPartitions,
+  tryAbsorbWindowIntoFineCluster,
+  type AbsorbFineClusterState,
   unitVector,
   type AlignedCommonCoreV1,
   type AnchoredCompletionOccurrenceCandidateV2,
@@ -535,7 +540,7 @@ export class ProceduralTrajectoryPipeline {
       }
     }
     for (const familyId of [...affectedFamilyIds].sort()) {
-      for (const clusterId of this.rebuildFamilyFineClusters(familyId, config, at)) {
+      for (const clusterId of this.absorbWindowsIntoFamilyFineClusters(familyId, config, at)) {
         affectedClusterIds.add(clusterId);
       }
     }
@@ -2016,6 +2021,290 @@ export class ProceduralTrajectoryPipeline {
         rewardHash: this.rewardHashForWindow(member.occurrence)
       })).sort((left, right) => left.occurrenceId.localeCompare(right.occurrenceId))
     });
+  }
+
+  /**
+   * Daily ingest: absorb new Family members into existing Fine clusters.
+   * Cluster ids stay put when a window only grows a stable medoid. Full remesh
+   * remains on the path-reconcile path where members can leave.
+   */
+  private absorbWindowsIntoFamilyFineClusters(
+    familyId: string,
+    config: PipelineConfig,
+    at: string
+  ): Set<string> {
+    const affectedClusterIds = new Set(this.familyLinkedClusterIds(familyId));
+    const head = this.deps.repos.proceduralTrajectory.getFamilyHead(familyId);
+    if (!head || head.status !== "active" || !head.activeRevisionId ||
+        head.algorithmVersion !== config.algorithmVersion ||
+        head.configHash !== config.clusteringConfigHash ||
+        head.embeddingSignature !== this.embeddingSignature()) {
+      return affectedClusterIds;
+    }
+    const revision = this.deps.repos.proceduralTrajectory.getFamilyRevision(
+      head.activeRevisionId
+    );
+    if (!revision) return affectedClusterIds;
+    const familyMembers = this.activeFamilyMembers(revision.id);
+    if (familyMembers.length === 0) return affectedClusterIds;
+    const familyMedoid = familyMembers.find((member) =>
+      member.occurrence.id === revision.medoidOccurrenceId);
+    if (!familyMedoid) return affectedClusterIds;
+    const fineConfig = config.fineConfigByScale.get(head.scale);
+    if (!fineConfig) throw new Error(`fine config missing for Span-${head.scale}`);
+
+    const previousRevision = this.lastLinkedFamilyRevision(familyId, revision.id);
+    const live: Array<{
+      clusterId?: string;
+      previousRevisionId?: string;
+      state: AbsorbFineClusterState;
+    }> = [];
+    const assigned = new Set<string>();
+    if (previousRevision) {
+      for (const link of this.deps.repos.proceduralTrajectory.listFamilyClusterLinks(
+        previousRevision.id
+      )) {
+        const canonical = this.deps.repos.proceduralTrajectory.getClusterCanonicalKey(
+          link.canonicalKeyId
+        );
+        if (!canonical) continue;
+        const cluster = this.deps.repos.proceduralTrajectory.getClusterHead(canonical.clusterId);
+        if (!cluster || cluster.status !== "active" || !cluster.activeVersionId) continue;
+        const version = this.deps.repos.proceduralTrajectory.getClusterVersion(
+          cluster.activeVersionId
+        );
+        if (!version) continue;
+        const members = this.deps.repos.proceduralTrajectory.listClusterMembers(version.id)
+          .flatMap((member) => {
+            const embedded = familyMembers.find((item) =>
+              item.occurrence.id === member.occurrenceId);
+            return embedded ? [embedded] : [];
+          });
+        if (members.length === 0) continue;
+        const partitions = resolveFineClusterPartitions(members, fineConfig, {
+          preferredMedoidId: version.medoidOccurrenceId,
+          medoidSwitchMargin: config.medoidSwitchMargin,
+          medoidUpdateCount: finiteNumber(version.metrics.medoidUpdateCount) ?? 0
+        });
+        const preferred = preferredFineClusterPartition(
+          partitions,
+          version.medoidOccurrenceId
+        );
+        for (const partition of partitions) {
+          live.push({
+            clusterId: partition === preferred ? cluster.id : undefined,
+            previousRevisionId: previousRevision.id,
+            state: partition
+          });
+          for (const member of partition.members) assigned.add(member.occurrence.id);
+        }
+        affectedClusterIds.add(cluster.id);
+      }
+    }
+
+    for (const window of orderedEmbeddedWindows(familyMembers.filter((member) =>
+      !assigned.has(member.occurrence.id)))) {
+      const ranked = live
+        .map((cluster) => ({
+          cluster,
+          match: bandedMonotonicMatch(window.stepVectors, cluster.state.medoid.stepVectors, fineConfig)
+        }))
+        .filter((row) => row.match.admitted)
+        .sort((left, right) => right.match.score - left.match.score ||
+          (left.cluster.clusterId ?? "").localeCompare(right.cluster.clusterId ?? ""));
+      let absorbed = false;
+      for (const row of ranked) {
+        const decision = tryAbsorbWindowIntoFineCluster(
+          row.cluster.state,
+          window,
+          fineConfig,
+          config.medoidSwitchMargin
+        );
+        if (!decision.accepted) continue;
+        row.cluster.state = decision.cluster;
+        absorbed = true;
+        break;
+      }
+      if (absorbed) continue;
+      if (window.occurrence.evidenceRole !== "support") continue;
+      live.push({
+        state: {
+          medoid: window,
+          members: [window],
+          medoidUpdateCount: 0
+        }
+      });
+    }
+
+    for (const cluster of this.expandResolvedFineClusters(live, fineConfig, config.medoidSwitchMargin)) {
+      const clusterId = this.commitAbsorbedFamilyFineCluster({
+        clusterId: cluster.clusterId,
+        previousRevisionId: cluster.previousRevisionId,
+        state: cluster.state,
+        family: head,
+        revision,
+        familyMedoid,
+        config,
+        at
+      });
+      affectedClusterIds.add(clusterId);
+    }
+    return affectedClusterIds;
+  }
+
+  private expandResolvedFineClusters(
+    live: Array<{
+      clusterId?: string;
+      previousRevisionId?: string;
+      state: AbsorbFineClusterState;
+    }>,
+    fineConfig: BandedMonotonicMatchConfig,
+    medoidSwitchMargin: number
+  ): Array<{
+    clusterId?: string;
+    previousRevisionId?: string;
+    state: AbsorbFineClusterState;
+  }> {
+    const expanded: Array<{
+      clusterId?: string;
+      previousRevisionId?: string;
+      state: AbsorbFineClusterState;
+    }> = [];
+    for (const cluster of live) {
+      const partitions = resolveFineClusterPartitions(cluster.state.members, fineConfig, {
+        preferredMedoidId: cluster.state.medoid.occurrence.id,
+        medoidSwitchMargin,
+        medoidUpdateCount: cluster.state.medoidUpdateCount
+      });
+      const preferred = preferredFineClusterPartition(
+        partitions,
+        cluster.state.medoid.occurrence.id
+      );
+      for (const partition of partitions) {
+        expanded.push({
+          clusterId: partition === preferred ? cluster.clusterId : undefined,
+          previousRevisionId: cluster.previousRevisionId,
+          state: partition
+        });
+      }
+    }
+    return expanded;
+  }
+
+  private lastLinkedFamilyRevision(
+    familyId: string,
+    excludeRevisionId?: string
+  ): TrajectoryWindowFamilyRevisionRecord | undefined {
+    for (const revision of this.deps.repos.proceduralTrajectory.listFamilyRevisions(familyId)) {
+      if (excludeRevisionId && revision.id === excludeRevisionId) continue;
+      if (this.deps.repos.proceduralTrajectory.listFamilyClusterLinks(revision.id).length > 0) {
+        return revision;
+      }
+    }
+    return undefined;
+  }
+
+  private commitAbsorbedFamilyFineCluster(input: {
+    clusterId?: string;
+    previousRevisionId?: string;
+    state: AbsorbFineClusterState;
+    family: TrajectoryWindowFamilyRecord;
+    revision: TrajectoryWindowFamilyRevisionRecord;
+    familyMedoid: EmbeddedTrajectoryWindowV1;
+    config: PipelineConfig;
+    at: string;
+  }): string {
+    const seed = input.state.members[0] ?? input.state.medoid;
+    let clusterId = input.clusterId;
+    let canonicalKeyId: string | undefined;
+    if (!clusterId) {
+      const created = this.deps.repos.proceduralTrajectory.resolveCanonicalClusterHead({
+        userId: input.family.userId,
+        scale: input.family.scale,
+        algorithmVersion: input.config.algorithmVersion,
+        configHash: input.config.clusteringConfigHash,
+        embeddingSignature: input.family.embeddingSignature,
+        evidenceSignature: fineEvidenceSignature({
+          scale: input.family.scale,
+          members: [{ occurrence: seed.occurrence }]
+        } as TrajectoryWindowClusterV1),
+        seedOccurrenceId: seed.occurrence.id,
+        createdAt: input.at
+      });
+      clusterId = created.cluster.id;
+      canonicalKeyId = created.canonicalKey.id;
+    } else {
+      canonicalKeyId = this.canonicalKeyIdForCluster(clusterId, input.previousRevisionId);
+    }
+    const currentHead = this.deps.repos.proceduralTrajectory.getClusterHead(clusterId)!;
+    if (!canonicalKeyId) {
+      const created = this.deps.repos.proceduralTrajectory.resolveCanonicalClusterHead({
+        userId: input.family.userId,
+        scale: input.family.scale,
+        algorithmVersion: input.config.algorithmVersion,
+        configHash: input.config.clusteringConfigHash,
+        embeddingSignature: input.family.embeddingSignature,
+        evidenceSignature: fineEvidenceSignature({
+          scale: input.family.scale,
+          members: [{ occurrence: seed.occurrence }]
+        } as TrajectoryWindowClusterV1),
+        seedOccurrenceId: seed.occurrence.id,
+        createdAt: input.at
+      });
+      if (created.cluster.id !== clusterId) {
+        throw new Error(`absorbed Fine cluster lost its canonical key: ${clusterId}`);
+      }
+      canonicalKeyId = created.canonicalKey.id;
+    }
+    const committed = this.deps.repos.proceduralTrajectory.commitClusterVersion({
+      clusterId,
+      expectedActiveVersionId: currentHead.activeVersionId ?? null,
+      medoidOccurrenceId: input.state.medoid.occurrence.id,
+      members: input.state.members.map((member) => ({
+        occurrenceId: member.occurrence.id,
+        rewardHash: this.rewardHashForWindow(member.occurrence),
+        coarseSimilarity: cosineSimilarity(member.coarseVector, input.familyMedoid.coarseVector),
+        alignment: alignmentRecord(
+          member.occurrence.id === input.state.medoid.occurrence.id
+            ? selfBandedMonotonicMatch(member.stepVectors, input.config.fineConfigByScale.get(input.family.scale)!)
+            : bandedMonotonicMatch(
+              member.stepVectors,
+              input.state.medoid.stepVectors,
+              input.config.fineConfigByScale.get(input.family.scale)!
+            )
+        )
+      })),
+      metrics: {
+        algorithmVersion: input.config.algorithmVersion,
+        configHash: input.config.clusteringConfigHash,
+        familyRevisionId: input.revision.id,
+        medoidUpdateCount: input.state.medoidUpdateCount,
+        absorb: true
+      },
+      createdAt: input.at
+    });
+    this.deps.repos.proceduralTrajectory.linkFamilyRevisionToCluster({
+      familyRevisionId: input.revision.id,
+      canonicalKeyId,
+      clusterVersionId: committed.record.id,
+      createdAt: input.at
+    });
+    return clusterId;
+  }
+
+  private canonicalKeyIdForCluster(
+    clusterId: string,
+    previousRevisionId?: string
+  ): string | undefined {
+    if (previousRevisionId) {
+      for (const link of this.deps.repos.proceduralTrajectory.listFamilyClusterLinks(
+        previousRevisionId
+      )) {
+        const key = this.deps.repos.proceduralTrajectory.getClusterCanonicalKey(link.canonicalKeyId);
+        if (key?.clusterId === clusterId) return key.id;
+      }
+    }
+    return this.deps.repos.proceduralTrajectory.listClusterCanonicalKeys(clusterId)[0]?.id;
   }
 
   /** Rebuild only this Family's deterministic, exclusive fine partition. */

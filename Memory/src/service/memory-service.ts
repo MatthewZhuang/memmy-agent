@@ -962,6 +962,9 @@ export class MemoryService {
     request: L3WorldModelRequestEnvelope
   ): SessionL3WorldModelContextResponse {
     this.assertMemorySearchEnabled();
+    if (!this.memoryAddEnabled()) {
+      return this.l3WorldModelContextNoWrite(sessionId, request);
+    }
     const session = this.requireSession(sessionId);
     this.assertL3WorldModelSessionScope(session, request.namespace);
     if (session.status !== "open") {
@@ -2178,6 +2181,45 @@ export class MemoryService {
       openedAt: nowIso(),
       serverTime: nowIso()
     };
+  }
+
+  private l3WorldModelContextNoWrite(
+    sessionId: string,
+    request: L3WorldModelRequestEnvelope
+  ): SessionL3WorldModelContextResponse {
+    const existing = this.repos.runtime.getSession(sessionId);
+    if (existing) {
+      this.assertSessionInScope(existing, request.namespace);
+      return this.loadL3WorldModelContextForRead(existing);
+    }
+    const namespace = normalizeNamespace(request.namespace);
+    const at = nowIso();
+    return this.loadL3WorldModelContextForRead({
+      id: sessionId,
+      userId: namespace.userId,
+      source: request.source ?? namespace.source,
+      profileId: namespace.profileId,
+      profileLabel: namespace.profileLabel,
+      projectId: namespace.projectId,
+      workspaceId: namespace.workspaceId,
+      hostSessionKey: namespace.sessionKey,
+      conversationId: undefined,
+      status: "open",
+      meta: { l3_world_model_protocol_version: 2 },
+      openedAt: at,
+      updatedAt: at
+    });
+  }
+
+  private loadL3WorldModelContextForRead(session: SessionRecord): SessionL3WorldModelContextResponse {
+    const loaded = this.l3WorldModelContextReadModel.load(session);
+    if (loaded.memoryId || !session.projectId) {
+      return loaded;
+    }
+    return this.l3WorldModelContextReadModel.load({
+      ...session,
+      projectId: undefined
+    });
   }
 
   private closeSessionNoWrite(sessionId: string, request: RequestEnvelope): ReturnType<MemoryService["closeSession"]> {

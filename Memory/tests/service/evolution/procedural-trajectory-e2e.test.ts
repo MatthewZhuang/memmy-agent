@@ -240,6 +240,65 @@ describe("procedural trajectory direct Skill E2E", () => {
     });
   });
 
+  it("absorbs a third similar Episode into the same V2 cluster without archiving the Skill", async () => {
+    const operations: string[] = [];
+    const llm = proceduralE2eLlm(operations);
+    const config = {
+      ...DEFAULT_MEMMY_CONFIG,
+      algorithm: {
+        ...DEFAULT_MEMMY_CONFIG.algorithm,
+        negativeExperience: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.negativeExperience,
+          enabled: false
+        },
+        l2Induction: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+          useLlm: false
+        },
+        l3Abstraction: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+          useLlm: false
+        }
+      }
+    };
+    const { db, service } = createTestService({
+      config,
+      llm,
+      skillLlm: llm,
+      embedder: constantProceduralEmbedder()
+    });
+    const repos = new Repositories(db.db);
+
+    await executeSuccessfulEpisode(service, "codex", "absorb-first");
+    await runWorkerRounds(service, 16);
+    await executeSuccessfulEpisode(service, "cursor", "absorb-second");
+    await runWorkerRounds(service, 20);
+
+    const clusterAfterTwo = db.db.prepare(
+      `SELECT id, active_skill_memory_id AS skillMemoryId
+       FROM trajectory_window_clusters
+       WHERE user_id = ? AND scale = 5 AND status = 'active'
+         AND active_skill_memory_id IS NOT NULL
+       ORDER BY created_at ASC
+       LIMIT 1`
+    ).get(USER_ID) as { id: string; skillMemoryId: string } | undefined;
+    expect(clusterAfterTwo).toBeDefined();
+    const skillAfterTwo = repos.memories.get(clusterAfterTwo!.skillMemoryId);
+    expect(skillAfterTwo?.status).not.toBe("archived");
+
+    await executeSuccessfulEpisode(service, "claude_code", "absorb-third");
+    await runWorkerRounds(service, 20);
+
+    const clusterAfterThree = repos.proceduralTrajectory.getClusterHead(clusterAfterTwo!.id);
+    expect(clusterAfterThree?.status).toBe("active");
+    expect(clusterAfterThree?.activeSkillMemoryId).toBe(clusterAfterTwo!.skillMemoryId);
+    const version = repos.proceduralTrajectory.getClusterVersion(
+      clusterAfterThree!.activeVersionId!
+    )!;
+    expect(version.supportEpisodeCount).toBe(3);
+    expect(repos.memories.get(clusterAfterTwo!.skillMemoryId)?.status).not.toBe("archived");
+  });
+
   it("shares one Step path between V2 local and V3 long-trajectory Skill mining", async () => {
     const operations: string[] = [];
     const skillPayloads: Array<Record<string, unknown>> = [];
@@ -728,7 +787,17 @@ describe("procedural trajectory direct Skill E2E", () => {
     expect(activeFamilies).toHaveLength(1);
     expect(repos.proceduralTrajectory.listFamilyMembers(activeFamilies[0]!.activeRevisionId)
       .map((member) => member.episodeId)).toEqual([first.episodeId]);
-    expect(repos.proceduralTrajectory.getClusterHead(pairCluster.id)?.status).toBe("retired");
+    // Seed-stable Fine identity keeps the same cluster when the leftover
+    // member is the original medoid; only the deactivated Path is gone.
+    const remainingCluster = repos.proceduralTrajectory.getClusterHead(pairCluster.id);
+    expect(remainingCluster?.status).toBe("active");
+    expect(remainingCluster?.activeSkillMemoryId).toBeUndefined();
+    const remainingVersion = repos.proceduralTrajectory.getClusterVersion(
+      remainingCluster!.activeVersionId!
+    )!;
+    expect(remainingVersion.supportEpisodeCount).toBe(1);
+    expect(repos.proceduralTrajectory.listClusterMembers(remainingVersion.id)
+      .map((member) => member.episodeId)).toEqual([first.episodeId]);
     expect(service.listSkills({ userId: USER_ID }).items.map((item) => item.id))
       .not.toContain(skillMemoryId);
   });

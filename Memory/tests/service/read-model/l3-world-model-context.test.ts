@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { Repositories } from "../../../src/storage/repositories.js";
-import { createMemoryServiceFixture } from "../../fixtures/memory-service-fixture.js";
+import {
+  configWithMemoryGates,
+  createMemoryServiceFixture
+} from "../../fixtures/memory-service-fixture.js";
 
 const {
   cleanup: cleanupMemoryServiceFixture,
+  createTestMemoryService,
   createTestService
 } = createMemoryServiceFixture();
 
@@ -126,6 +130,101 @@ describe("Session L3 World Model context read model", () => {
       sessionKey: "context-other-project-session",
       projectId: other.projectId!
     })).memoryId).toBeNull();
+
+    db.close();
+  });
+
+  it("loads user-level L3 in search-only mode without a persisted session", () => {
+    const { db, service: writer } = createTestService();
+    const namespace = {
+      source: "codex",
+      profileId: "default",
+      sessionKey: "eval-search-only-session",
+      userId: "eval-search-only-user"
+    };
+    const opened = writer.openSession({
+      l3WorldModelProtocolVersion: 2,
+      l3WorldModelTransition: "resume_only",
+      namespace
+    });
+    const repos = new Repositories(db.db);
+    const content = "Round money to 2 decimal places before writing cells.";
+    const memory = repos.l3WorldModels.upsertField({
+      userId: namespace.userId,
+      targetField: "general_rules_and_safety_constraints",
+      value: content,
+      eligibleL1MemoryIds: []
+    });
+    writer.closeSession(opened.sessionId);
+
+    const reader = createTestMemoryService({
+      db,
+      mode: "dev",
+      config: configWithMemoryGates({
+        enableMemoryAdd: false,
+        enableMemorySearch: true
+      })
+    });
+    const synthetic = reader.openSession({
+      l3WorldModelProtocolVersion: 2,
+      l3WorldModelTransition: "allow_legacy_rollover",
+      namespace: { ...namespace, sessionKey: "cli-new-eval-task" }
+    });
+    expect(new Repositories(db.db).runtime.getSession(synthetic.sessionId)).toBeUndefined();
+
+    const context = reader.l3WorldModelContext(synthetic.sessionId, envelope({
+      ...namespace,
+      sessionKey: "cli-new-eval-task"
+    }));
+    expect(context).toMatchObject({
+      schemaVersion: 2,
+      projectId: null,
+      memoryId: memory?.id,
+      generalRulesAndSafetyConstraints: content
+    });
+    expect(context.renderedContext).toContain(content);
+
+    db.close();
+  });
+
+  it("falls back to user-level L3 when search-only session is bound to an unseen project", () => {
+    const { db, service: writer } = createTestService();
+    const namespace = {
+      source: "codex",
+      profileId: "default",
+      sessionKey: "eval-project-fallback-session",
+      userId: "eval-project-fallback-user"
+    };
+    writer.openSession({
+      l3WorldModelProtocolVersion: 2,
+      l3WorldModelTransition: "resume_only",
+      namespace
+    });
+    const repos = new Repositories(db.db);
+    const content = "Preserve original population rows when sampling.";
+    repos.l3WorldModels.upsertField({
+      userId: namespace.userId,
+      targetField: "general_rules_and_safety_constraints",
+      value: content,
+      eligibleL1MemoryIds: []
+    });
+
+    const reader = createTestMemoryService({
+      db,
+      mode: "dev",
+      config: configWithMemoryGates({
+        enableMemoryAdd: false,
+        enableMemorySearch: true
+      })
+    });
+    const context = reader.l3WorldModelContext("session_unbound_eval", envelope({
+      ...namespace,
+      sessionKey: "cli-unseen-project",
+      projectId: "brand-new-eval-workspace"
+    }));
+    expect(context.memoryId).toBeTruthy();
+    expect(context.generalRulesAndSafetyConstraints).toBe(content);
+    expect(context.projectId).toBeNull();
 
     db.close();
   });

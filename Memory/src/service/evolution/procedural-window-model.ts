@@ -989,6 +989,157 @@ interface InternalFineCluster {
   medoidUpdateCount: number;
 }
 
+export interface AbsorbFineClusterState {
+  medoid: EmbeddedTrajectoryWindowV1;
+  members: EmbeddedTrajectoryWindowV1[];
+  medoidUpdateCount: number;
+}
+
+export type AbsorbWindowDecision =
+  | { accepted: false }
+  | { accepted: true; cluster: AbsorbFineClusterState; medoidChanged: boolean };
+
+/**
+ * Write-time Fine partitions. If any support exists, every returned cluster
+ * has a support medoid. Counterexamples that no support can cover are split
+ * off; supports that cannot share a medoid become separate clusters.
+ */
+export function resolveFineClusterPartitions(
+  members: readonly EmbeddedTrajectoryWindowV1[],
+  config: BandedMonotonicMatchConfig,
+  options: {
+    preferredMedoidId?: string;
+    medoidSwitchMargin?: number;
+    medoidUpdateCount?: number;
+  } = {}
+): AbsorbFineClusterState[] {
+  const unique = uniqueEmbeddedWindows(members);
+  if (unique.length === 0) return [];
+  const margin = options.medoidSwitchMargin ?? V15_FINE_MEDOID_SWITCH_MARGIN;
+  const updateCount = options.medoidUpdateCount ?? 0;
+  const supports = unique.filter((member) => member.occurrence.evidenceRole === "support");
+  const others = unique.filter((member) => member.occurrence.evidenceRole !== "support");
+
+  if (supports.length === 0) {
+    return greedyExclusiveFinePartitions(unique, config, margin, 0);
+  }
+
+  const coveringAll = chooseCoveringFineMedoid(unique, config, options.preferredMedoidId);
+  if (coveringAll) {
+    return [packFinePartition(coveringAll, unique, options.preferredMedoidId, updateCount)];
+  }
+
+  const coveringSupports = chooseCoveringFineMedoid(supports, config, options.preferredMedoidId);
+  if (coveringSupports) {
+    const attached = others.filter((member) =>
+      bandedMonotonicMatch(member.stepVectors, coveringSupports.stepVectors, config).admitted);
+    const evicted = others.filter((member) =>
+      !attached.some((item) => item.occurrence.id === member.occurrence.id));
+    return [
+      packFinePartition(
+        coveringSupports,
+        [...supports, ...attached],
+        options.preferredMedoidId,
+        updateCount
+      ),
+      ...greedyExclusiveFinePartitions(evicted, config, margin, 0)
+    ];
+  }
+
+  const supportPartitions = greedyExclusiveFinePartitions(supports, config, margin, updateCount);
+  const leftover: EmbeddedTrajectoryWindowV1[] = [];
+  for (const other of orderedEmbeddedWindows(others)) {
+    const ranked = supportPartitions
+      .map((partition) => ({
+        partition,
+        match: bandedMonotonicMatch(other.stepVectors, partition.medoid.stepVectors, config)
+      }))
+      .filter((row) => row.match.admitted)
+      .sort((left, right) => right.match.score - left.match.score ||
+        left.partition.medoid.occurrence.id.localeCompare(right.partition.medoid.occurrence.id));
+    const best = ranked[0];
+    if (best) {
+      best.partition.members = sortFinePartitionMembers([...best.partition.members, other]);
+    } else {
+      leftover.push(other);
+    }
+  }
+  return [...supportPartitions, ...greedyExclusiveFinePartitions(leftover, config, margin, 0)];
+}
+
+export function preferredFineClusterPartition(
+  partitions: readonly AbsorbFineClusterState[],
+  preferredMedoidId?: string
+): AbsorbFineClusterState | undefined {
+  if (partitions.length === 0) return undefined;
+  return [...partitions].sort((left, right) =>
+    preferredPartitionScore(right, preferredMedoidId) -
+      preferredPartitionScore(left, preferredMedoidId) ||
+    left.medoid.occurrence.id.localeCompare(right.medoid.occurrence.id))[0];
+}
+
+/**
+ * Incremental Family-local absorb. A new window joins a cluster only when it
+ * matches the current medoid. Old members are never evicted. Switching away
+ * from an illegal counterexample medoid is mandatory once support exists.
+ */
+export function tryAbsorbWindowIntoFineCluster(
+  cluster: AbsorbFineClusterState,
+  window: EmbeddedTrajectoryWindowV1,
+  config: BandedMonotonicMatchConfig,
+  medoidSwitchMargin: number
+): AbsorbWindowDecision {
+  if (cluster.members.some((member) => member.occurrence.id === window.occurrence.id)) {
+    return { accepted: true, cluster, medoidChanged: false };
+  }
+  const vsMedoid = bandedMonotonicMatch(window.stepVectors, cluster.medoid.stepVectors, config);
+  if (!vsMedoid.admitted) return { accepted: false };
+
+  const members = [...cluster.members, window];
+  const hasSupport = members.some((member) => member.occurrence.evidenceRole === "support");
+  const medoidIsSupport = cluster.medoid.occurrence.evidenceRole === "support";
+  if (hasSupport && !medoidIsSupport) {
+    const candidate = selectFineRealMedoid(members, config);
+    if (!candidate) return { accepted: false };
+    return {
+      accepted: true,
+      cluster: {
+        medoid: candidate,
+        members,
+        medoidUpdateCount: cluster.medoidUpdateCount + 1
+      },
+      medoidChanged: true
+    };
+  }
+
+  const candidate = selectFineRealMedoid(members, config);
+  if (
+    !candidate ||
+    candidate.occurrence.id === cluster.medoid.occurrence.id ||
+    fineCentrality(candidate, members, config) -
+      fineCentrality(cluster.medoid, members, config) <= medoidSwitchMargin
+  ) {
+    return {
+      accepted: true,
+      cluster: {
+        medoid: cluster.medoid,
+        members,
+        medoidUpdateCount: cluster.medoidUpdateCount
+      },
+      medoidChanged: false
+    };
+  }
+  return {
+    accepted: true,
+    cluster: {
+      medoid: candidate,
+      members,
+      medoidUpdateCount: cluster.medoidUpdateCount + 1
+    },
+    medoidChanged: true
+  };
+}
+
 export function buildExclusiveFineClusters(
   family: ProceduralWindowFamilyV1,
   config: BandedMonotonicMatchConfig,
@@ -1007,22 +1158,26 @@ export function buildExclusiveFineClusters(
       }
     }
     if (!best) {
-      internal.push({
-        id: `trajectory_window_cluster_${stableHash({
-          version: PROCEDURAL_WINDOW_MINING_VERSION,
-          familyId: family.id,
-          anchorOccurrenceId: window.occurrence.id
-        }).slice(0, 24)}`,
-        familyId: family.id,
-        scale: family.scale,
-        medoid: window,
-        members: [window],
-        medoidUpdateCount: 0
-      });
+      if (window.occurrence.evidenceRole !== "support") continue;
+      internal.push(newInternalFineCluster(family, window));
       continue;
     }
     best.cluster.members.push(window);
+    const hasSupport = best.cluster.members.some((member) =>
+      member.occurrence.evidenceRole === "support");
     const candidate = selectFineRealMedoid(best.cluster.members, config);
+    if (hasSupport && best.cluster.medoid.occurrence.evidenceRole !== "support") {
+      if (!candidate) {
+        best.cluster.members.pop();
+        if (window.occurrence.evidenceRole === "support") {
+          internal.push(newInternalFineCluster(family, window));
+        }
+        continue;
+      }
+      best.cluster.medoid = candidate;
+      best.cluster.medoidUpdateCount += 1;
+      continue;
+    }
     if (!candidate) continue;
     const currentCentrality = fineCentrality(best.cluster.medoid, best.cluster.members, config);
     const nextCentrality = fineCentrality(candidate, best.cluster.members, config);
@@ -1033,11 +1188,22 @@ export function buildExclusiveFineClusters(
     }
   }
 
+  const assigned = new Set(internal.flatMap((cluster) =>
+    cluster.members.map((member) => member.occurrence.id)));
+  for (const partition of resolveFineClusterPartitions(
+    family.members.filter((member) => !assigned.has(member.occurrence.id)),
+    config,
+    { medoidSwitchMargin }
+  )) {
+    internal.push({
+      ...newInternalFineCluster(family, partition.medoid),
+      members: partition.members,
+      medoidUpdateCount: partition.medoidUpdateCount
+    });
+  }
+
   internal = mergeCompatibleFineClusters(internal, config);
-  return internal.flatMap((cluster) => {
-    const finalized = finalizeFineCluster(cluster, config);
-    return finalized ? [finalized] : [];
-  });
+  return internal.flatMap((cluster) => finalizeFineClusters(cluster, config, medoidSwitchMargin));
 }
 
 function mergeCompatibleFineClusters(
@@ -1079,16 +1245,39 @@ function mergeCompatibleFineClusters(
   }
 }
 
-function finalizeFineCluster(
+function finalizeFineClusters(
+  cluster: InternalFineCluster,
+  config: BandedMonotonicMatchConfig,
+  medoidSwitchMargin: number
+): TrajectoryWindowClusterV1[] {
+  const nonOverlapping = dedupeOverlappingMembers(cluster.members, cluster.medoid, config);
+  if (nonOverlapping.length === 0) return [];
+  const partitions = resolveFineClusterPartitions(nonOverlapping, config, {
+    preferredMedoidId: cluster.medoid.occurrence.id,
+    medoidSwitchMargin,
+    medoidUpdateCount: cluster.medoidUpdateCount
+  });
+  const preferred = preferredFineClusterPartition(partitions, cluster.medoid.occurrence.id);
+  return partitions.map((partition) => materializeFineCluster({
+    ...cluster,
+    id: partition === preferred
+      ? cluster.id
+      : newInternalFineCluster(
+        { id: cluster.familyId, scale: cluster.scale } as ProceduralWindowFamilyV1,
+        partition.medoid
+      ).id,
+    medoid: partition.medoid,
+    members: partition.members,
+    medoidUpdateCount: partition.medoidUpdateCount
+  }, config));
+}
+
+function materializeFineCluster(
   cluster: InternalFineCluster,
   config: BandedMonotonicMatchConfig
-): TrajectoryWindowClusterV1 | undefined {
-  const nonOverlapping = dedupeOverlappingMembers(cluster.members, cluster.medoid, config);
-  if (nonOverlapping.length === 0) return undefined;
-  const medoid = selectFineRealMedoid(nonOverlapping, config) ??
-    nonOverlapping.find((member) => member.occurrence.id === cluster.medoid.occurrence.id) ??
-    nonOverlapping[0]!;
-  const members = nonOverlapping.map((member): TrajectoryWindowClusterMemberV1 => {
+): TrajectoryWindowClusterV1 {
+  const medoid = cluster.medoid;
+  const members = cluster.members.map((member): TrajectoryWindowClusterMemberV1 => {
     const alignmentToMedoid = member.occurrence.id === medoid.occurrence.id
       ? selfBandedMonotonicMatch(member.stepVectors, config)
       : bandedMonotonicMatch(member.stepVectors, medoid.stepVectors, config);
@@ -1119,26 +1308,139 @@ function finalizeFineCluster(
     occurrenceCount: members.length,
     averageSimilarity: average(similarities),
     minimumSimilarity: Math.min(...similarities),
-    medoidCentrality: fineCentrality(medoid, nonOverlapping, config),
-    medoidUpdateCount: cluster.medoidUpdateCount +
-      (cluster.medoid.occurrence.id === medoid.occurrence.id ? 0 : 1),
+    medoidCentrality: fineCentrality(medoid, cluster.members, config),
+    medoidUpdateCount: cluster.medoidUpdateCount,
     members
   };
+}
+
+function newInternalFineCluster(
+  family: Pick<ProceduralWindowFamilyV1, "id" | "scale">,
+  seed: EmbeddedTrajectoryWindowV1
+): InternalFineCluster {
+  return {
+    id: `trajectory_window_cluster_${stableHash({
+      version: PROCEDURAL_WINDOW_MINING_VERSION,
+      familyId: family.id,
+      anchorOccurrenceId: seed.occurrence.id
+    }).slice(0, 24)}`,
+    familyId: family.id,
+    scale: family.scale,
+    medoid: seed,
+    members: [seed],
+    medoidUpdateCount: 0
+  };
+}
+
+function chooseCoveringFineMedoid(
+  members: readonly EmbeddedTrajectoryWindowV1[],
+  config: BandedMonotonicMatchConfig,
+  preferredMedoidId?: string
+): EmbeddedTrajectoryWindowV1 | undefined {
+  const covering = coveringFineMedoids(members, config);
+  return covering.find((member) => member.occurrence.id === preferredMedoidId) ?? covering[0];
+}
+
+function coveringFineMedoids(
+  members: readonly EmbeddedTrajectoryWindowV1[],
+  config: BandedMonotonicMatchConfig
+): EmbeddedTrajectoryWindowV1[] {
+  const hasSupport = members.some((member) => member.occurrence.evidenceRole === "support");
+  return [...members].filter((candidate) =>
+    (!hasSupport || candidate.occurrence.evidenceRole === "support") &&
+    members.every((member) =>
+      member.occurrence.id === candidate.occurrence.id ||
+      bandedMonotonicMatch(member.stepVectors, candidate.stepVectors, config).admitted))
+    .sort((left, right) =>
+      fineCentrality(right, members, config) - fineCentrality(left, members, config) ||
+      left.occurrence.id.localeCompare(right.occurrence.id));
+}
+
+function greedyExclusiveFinePartitions(
+  windows: readonly EmbeddedTrajectoryWindowV1[],
+  config: BandedMonotonicMatchConfig,
+  medoidSwitchMargin: number,
+  medoidUpdateCount: number
+): AbsorbFineClusterState[] {
+  const partitions: AbsorbFineClusterState[] = [];
+  for (const window of orderedEmbeddedWindows(windows)) {
+    const ranked = partitions
+      .map((partition) => ({
+        partition,
+        match: bandedMonotonicMatch(window.stepVectors, partition.medoid.stepVectors, config)
+      }))
+      .filter((row) => row.match.admitted)
+      .sort((left, right) => right.match.score - left.match.score ||
+        left.partition.medoid.occurrence.id.localeCompare(right.partition.medoid.occurrence.id));
+    const best = ranked[0];
+    if (!best) {
+      partitions.push({
+        medoid: window,
+        members: [window],
+        medoidUpdateCount
+      });
+      continue;
+    }
+    const members = [...best.partition.members, window];
+    const candidate = selectFineRealMedoid(members, config);
+    if (
+      candidate &&
+      candidate.occurrence.id !== best.partition.medoid.occurrence.id &&
+      fineCentrality(candidate, members, config) -
+        fineCentrality(best.partition.medoid, members, config) > medoidSwitchMargin
+    ) {
+      best.partition.medoid = candidate;
+      best.partition.medoidUpdateCount += 1;
+    }
+    best.partition.members = sortFinePartitionMembers(members);
+  }
+  return partitions;
+}
+
+function packFinePartition(
+  medoid: EmbeddedTrajectoryWindowV1,
+  members: readonly EmbeddedTrajectoryWindowV1[],
+  preferredMedoidId: string | undefined,
+  medoidUpdateCount: number
+): AbsorbFineClusterState {
+  return {
+    medoid,
+    members: sortFinePartitionMembers(members),
+    medoidUpdateCount: medoidUpdateCount +
+      (preferredMedoidId && preferredMedoidId !== medoid.occurrence.id ? 1 : 0)
+  };
+}
+
+function preferredPartitionScore(
+  partition: AbsorbFineClusterState,
+  preferredMedoidId?: string
+): number {
+  const supportCount = partition.members.filter((member) =>
+    member.occurrence.evidenceRole === "support").length;
+  const preferredMedoid = preferredMedoidId &&
+    partition.medoid.occurrence.id === preferredMedoidId &&
+    partition.medoid.occurrence.evidenceRole === "support" ? 8 : 0;
+  const containsPreferred = preferredMedoidId &&
+    partition.members.some((member) =>
+      member.occurrence.id === preferredMedoidId &&
+      member.occurrence.evidenceRole === "support") ? 4 : 0;
+  return preferredMedoid + containsPreferred + supportCount * 2 + partition.members.length;
+}
+
+function sortFinePartitionMembers(
+  members: readonly EmbeddedTrajectoryWindowV1[]
+): EmbeddedTrajectoryWindowV1[] {
+  return [...members].sort((left, right) =>
+    left.occurrence.episodeId.localeCompare(right.occurrence.episodeId) ||
+    left.occurrence.startStepIndex - right.occurrence.startStepIndex ||
+    left.occurrence.id.localeCompare(right.occurrence.id));
 }
 
 function selectFineRealMedoid(
   members: readonly EmbeddedTrajectoryWindowV1[],
   config: BandedMonotonicMatchConfig
 ): EmbeddedTrajectoryWindowV1 | undefined {
-  const hasSupport = members.some((member) =>
-    member.occurrence.evidenceRole === "support");
-  return [...members].filter((candidate) =>
-    (!hasSupport || candidate.occurrence.evidenceRole === "support") && members.every((member) =>
-    member.occurrence.id === candidate.occurrence.id ||
-    bandedMonotonicMatch(member.stepVectors, candidate.stepVectors, config).admitted))
-    .sort((left, right) =>
-      fineCentrality(right, members, config) - fineCentrality(left, members, config) ||
-      left.occurrence.id.localeCompare(right.occurrence.id))[0];
+  return coveringFineMedoids(members, config)[0];
 }
 
 function fineCentrality(
@@ -1247,7 +1549,7 @@ function dedupeEquivalentClusters(
   return [...byEvidence.values()];
 }
 
-function orderedEmbeddedWindows(
+export function orderedEmbeddedWindows(
   windows: readonly EmbeddedTrajectoryWindowV1[]
 ): EmbeddedTrajectoryWindowV1[] {
   const ordered = [...windows].sort((left, right) =>

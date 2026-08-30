@@ -16,9 +16,14 @@ import {
   ingestWindowIntoCoarseFamilies,
   matchingCoarseFamilies,
   proceduralEvidenceRoleForReward,
+  preferredFineClusterPartition,
+  resolveFineClusterPartitions,
   selectConstrainedRealMedoid,
   selectMaximalWindowClusters,
+  tryAbsorbWindowIntoFineCluster,
+  buildExclusiveFineClusters,
   unitVector,
+  V15_FINE_MEDOID_SWITCH_MARGIN,
   windowIntentSequenceText,
   type EmbeddedTrajectoryWindowV1,
   type EpisodeExecutionPathLiteV1,
@@ -31,6 +36,209 @@ import {
   bandedMonotonicMatch,
   selfBandedMonotonicMatch
 } from "../../../src/service/evolution/trajectory-window-alignment.js";
+
+describe("incremental Fine-cluster absorb", () => {
+  const fineConfig = V15_FINE_MATCH_CONFIGS.find((item) => item.scale === 5)!;
+
+  it("joins a window that matches the current medoid without changing the cluster identity payload", () => {
+    const medoid = embeddedWindow("episode-a", 0, [1, 0], 1);
+    const next = embeddedWindow("episode-b", 0, [1, 0], 1);
+    const decision = tryAbsorbWindowIntoFineCluster(
+      { medoid, members: [medoid], medoidUpdateCount: 0 },
+      next,
+      fineConfig,
+      V15_FINE_MEDOID_SWITCH_MARGIN
+    );
+    expect(decision.accepted).toBe(true);
+    if (!decision.accepted) return;
+    expect(decision.medoidChanged).toBe(false);
+    expect(decision.cluster.medoid.occurrence.id).toBe(medoid.occurrence.id);
+    expect(decision.cluster.members.map((member) => member.occurrence.id).sort()).toEqual(
+      [medoid.occurrence.id, next.occurrence.id].sort()
+    );
+  });
+
+  it("rejects a window that fails the current medoid Fine gate", () => {
+    const medoid = embeddedWindow("episode-a", 0, [1, 0], 1);
+    const isolated = isolatedFineWindow("episode-x", [1, 0], 5);
+    const decision = tryAbsorbWindowIntoFineCluster(
+      { medoid, members: [medoid], medoidUpdateCount: 0 },
+      isolated,
+      fineConfig,
+      V15_FINE_MEDOID_SWITCH_MARGIN
+    );
+    expect(decision).toEqual({ accepted: false });
+  });
+
+  it("does not evict old members when a better medoid is unavailable", () => {
+    const medoid = embeddedWindow("episode-a", 0, [1, 0], 1);
+    const oldMember = embeddedWindow("episode-c", 0, [1, 0], 1);
+    const next = embeddedWindow("episode-b", 0, [1, 0], 1);
+    const decision = tryAbsorbWindowIntoFineCluster(
+      { medoid, members: [medoid, oldMember], medoidUpdateCount: 0 },
+      next,
+      fineConfig,
+      V15_FINE_MEDOID_SWITCH_MARGIN
+    );
+    expect(decision.accepted).toBe(true);
+    if (!decision.accepted) return;
+    expect(decision.cluster.members).toHaveLength(3);
+    expect(decision.cluster.members.map((member) => member.occurrence.id)).toEqual(
+      expect.arrayContaining([medoid.occurrence.id, oldMember.occurrence.id, next.occurrence.id])
+    );
+  });
+
+  it("switches off a counterexample medoid when a covering support joins", () => {
+    const counterexample = withRole(embeddedWindow("episode-fail", 0, [1, 0], -1), -1);
+    const support = embeddedWindow("episode-ok", 0, [1, 0], 1);
+    const decision = tryAbsorbWindowIntoFineCluster(
+      { medoid: counterexample, members: [counterexample], medoidUpdateCount: 0 },
+      support,
+      fineConfig,
+      V15_FINE_MEDOID_SWITCH_MARGIN
+    );
+    expect(decision.accepted).toBe(true);
+    if (!decision.accepted) return;
+    expect(decision.medoidChanged).toBe(true);
+    expect(decision.cluster.medoid.occurrence.evidenceRole).toBe("support");
+    expect(decision.cluster.medoid.occurrence.id).toBe(support.occurrence.id);
+  });
+
+  it("rejects a support that would leave a counterexample medoid in a mixed cluster", () => {
+    const counterexample = withRole(isolatedFineWindow("episode-fail", [1, 0], 5), -1);
+    const support = embeddedWindow("episode-ok", 0, [1, 0], 1);
+    const vsCounterexample = bandedMonotonicMatch(
+      support.stepVectors,
+      counterexample.stepVectors,
+      fineConfig
+    );
+    if (!vsCounterexample.admitted) {
+      expect(tryAbsorbWindowIntoFineCluster(
+        { medoid: counterexample, members: [counterexample], medoidUpdateCount: 0 },
+        support,
+        fineConfig,
+        V15_FINE_MEDOID_SWITCH_MARGIN
+      )).toEqual({ accepted: false });
+      return;
+    }
+    const decision = tryAbsorbWindowIntoFineCluster(
+      { medoid: counterexample, members: [counterexample], medoidUpdateCount: 0 },
+      support,
+      fineConfig,
+      V15_FINE_MEDOID_SWITCH_MARGIN
+    );
+    if (decision.accepted) {
+      expect(decision.cluster.medoid.occurrence.evidenceRole).toBe("support");
+    } else {
+      expect(decision).toEqual({ accepted: false });
+    }
+  });
+});
+
+describe("resolveFineClusterPartitions", () => {
+  const fineConfig = V15_FINE_MATCH_CONFIGS.find((item) => item.scale === 5)!;
+
+  it("uses a support medoid when one support covers the whole mixed cluster", () => {
+    const support = embeddedWindow("episode-ok", 0, [1, 0], 1);
+    const counterexample = withRole(embeddedWindow("episode-fail", 0, [1, 0], -1), -1);
+    const partitions = resolveFineClusterPartitions(
+      [counterexample, support],
+      fineConfig,
+      { preferredMedoidId: counterexample.occurrence.id }
+    );
+    expect(partitions).toHaveLength(1);
+    expect(partitions[0]!.medoid.occurrence.evidenceRole).toBe("support");
+    expect(partitions[0]!.members.map((member) => member.occurrence.id).sort()).toEqual(
+      [support.occurrence.id, counterexample.occurrence.id].sort()
+    );
+  });
+
+  it("keeps supports together and evicts a counterexample no support can cover", () => {
+    const supportA = embeddedWindow("episode-a", 0, [1, 0], 1);
+    const supportB = embeddedWindow("episode-b", 0, [1, 0], 1);
+    const isolated = withRole(isolatedFineWindow("episode-fail", [1, 0], 5), -1);
+    const partitions = resolveFineClusterPartitions(
+      [supportA, supportB, isolated],
+      fineConfig
+    );
+    const supportPartition = partitions.find((partition) =>
+      partition.members.some((member) => member.occurrence.id === supportA.occurrence.id));
+    expect(supportPartition?.medoid.occurrence.evidenceRole).toBe("support");
+    expect(supportPartition?.members.map((member) => member.occurrence.id).sort()).toEqual(
+      [supportA.occurrence.id, supportB.occurrence.id].sort()
+    );
+    expect(partitions.some((partition) =>
+      partition.members.length === 1 &&
+      partition.members[0]!.occurrence.id === isolated.occurrence.id)).toBe(true);
+    expect(partitions.every((partition) =>
+      partition.members.some((member) => member.occurrence.evidenceRole === "support")
+        ? partition.medoid.occurrence.evidenceRole === "support"
+        : true)).toBe(true);
+  });
+
+  it("splits supports that cannot share a medoid and hangs a matching counterexample", () => {
+    const supportA = embeddedWindow("episode-a", 0, [1, 0], 1);
+    const supportB = isolatedFineWindow("episode-b", [1, 0], 5);
+    const counterexample = withRole(embeddedWindow("episode-fail", 0, [1, 0], -1), -1);
+    const partitions = resolveFineClusterPartitions(
+      [supportA, supportB, counterexample],
+      fineConfig
+    );
+    const withA = partitions.find((partition) =>
+      partition.members.some((member) => member.occurrence.id === supportA.occurrence.id));
+    const withB = partitions.find((partition) =>
+      partition.members.some((member) => member.occurrence.id === supportB.occurrence.id));
+    expect(withA).toBeDefined();
+    expect(withB).toBeDefined();
+    expect(withA?.medoid.occurrence.evidenceRole).toBe("support");
+    expect(withB?.medoid.occurrence.evidenceRole).toBe("support");
+    expect(withA?.members.map((member) => member.occurrence.id)).toEqual(
+      expect.arrayContaining([supportA.occurrence.id, counterexample.occurrence.id])
+    );
+    expect(withB?.members.map((member) => member.occurrence.id)).toEqual(
+      [supportB.occurrence.id]
+    );
+  });
+
+  it("keeps a counterexample-only partition without inventing a support medoid", () => {
+    const first = withRole(embeddedWindow("episode-fail-a", 0, [1, 0], -1), -1);
+    const second = withRole(embeddedWindow("episode-fail-b", 0, [1, 0], -1), -1);
+    const partitions = resolveFineClusterPartitions([first, second], fineConfig);
+    expect(partitions.length).toBeGreaterThanOrEqual(1);
+    expect(partitions.every((partition) =>
+      partition.medoid.occurrence.evidenceRole === "counterexample")).toBe(true);
+  });
+
+  it("prefers the existing support medoid when several covering supports exist", () => {
+    const first = embeddedWindow("episode-a", 0, [1, 0], 1);
+    const second = embeddedWindow("episode-b", 0, [1, 0], 1);
+    const partitions = resolveFineClusterPartitions(
+      [first, second],
+      fineConfig,
+      { preferredMedoidId: second.occurrence.id }
+    );
+    expect(preferredFineClusterPartition(partitions, second.occurrence.id)?.medoid.occurrence.id)
+      .toBe(second.occurrence.id);
+  });
+
+  it("does not let an earlier counterexample remain the exclusive Fine medoid", () => {
+    const counterexample = withRole(embeddedWindow("episode-aaa-fail", 0, [1, 0], -1), -1);
+    const support = embeddedWindow("episode-zzz-ok", 0, [1, 0], 1);
+    const family = makeFamily("family-mixed", support);
+    family.members = [counterexample, support];
+    family.medoid = counterexample;
+    const clusters = buildExclusiveFineClusters(
+      family,
+      fineConfig,
+      V15_FINE_MEDOID_SWITCH_MARGIN
+    );
+    const mixed = clusters.find((cluster) => cluster.occurrenceCount === 2);
+    expect(mixed).toBeDefined();
+    const medoid = mixed?.members.find((member) =>
+      member.occurrence.id === mixed.medoidOccurrenceId);
+    expect(medoid?.occurrence.evidenceRole).toBe("support");
+  });
+});
 
 describe("procedural multi-scale windows", () => {
   it("pins the quality-validated v15 parameters", () => {
@@ -481,6 +689,20 @@ function embeddedWindow(
     },
     coarseVector: unitVector(coarseVector),
     stepVectors
+  };
+}
+
+function withRole(
+  window: EmbeddedTrajectoryWindowV1,
+  reward: number
+): EmbeddedTrajectoryWindowV1 {
+  return {
+    ...window,
+    occurrence: {
+      ...window.occurrence,
+      ...(reward === undefined ? {} : { terminalReward: reward }),
+      evidenceRole: proceduralEvidenceRoleForReward(reward)
+    }
   };
 }
 
