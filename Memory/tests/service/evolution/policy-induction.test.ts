@@ -1218,6 +1218,112 @@ describe("MemoryService / evolution / policy induction", () => {
 
     db.close();
   });
+
+  it("does not bucket fully wildcard L1 signatures into the L2 candidate pool", async () => {
+    const { db, service } = createTestService({
+      skillLlm: createCapturingL2Llm([]),
+      config: {
+        ...DEFAULT_MEMMY_CONFIG,
+        algorithm: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          l2Induction: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+            minEpisodesForInduction: 1,
+            minGain: -1
+          }
+        }
+      }
+    });
+    const session = service.openSession({
+      namespace: {
+        source: "codex",
+        profileId: "jiang",
+        userId: "wildcard-l1-user"
+      },
+      workspaceId: "wildcard-l1-workspace"
+    });
+    const first = service.completeTurn("turn-wildcard-email", {
+      sessionId: session.sessionId,
+      episodeId: "episode-wildcard-email",
+      query: "帮我写一封感谢客户的邮件",
+      answer: "感谢您一直以来的支持，后续我们会继续跟进。"
+    });
+    const second = service.completeTurn("turn-wildcard-report", {
+      sessionId: session.sessionId,
+      episodeId: "episode-wildcard-report",
+      query: "把这三点整理成一段给领导的汇报",
+      answer: "本周已完成客户回访、方案修订和交付排期。"
+    });
+    const preference = service.completeTurn("turn-wildcard-preference", {
+      sessionId: session.sessionId,
+      episodeId: "episode-wildcard-preference",
+      query: "我喜欢吃苹果",
+      answer: "记下了，你喜欢吃苹果。"
+    });
+    expect(first.l1MemoryId).toBeTruthy();
+    expect(second.l1MemoryId).toBeTruthy();
+
+    for (const turn of [first, second]) {
+      makeTraceEligibleForL2(db, turn.l1MemoryId);
+      setTraceSignatureAndVectorForTest(db, turn.l1MemoryId, "_|_|_|_", [1, 0, 0]);
+      await addPositiveFeedbackForTurn(service, session.sessionId, turn);
+    }
+    service.closeSession(session.sessionId);
+    await runWorkerRounds(service, 8, 50);
+
+    expect(traceSignatureForTest(db, first.l1MemoryId)).toBe("_|_|_|_");
+    expect(traceSignatureForTest(db, second.l1MemoryId)).toBe("_|_|_|_");
+    expect(db.db.prepare(`SELECT status FROM memories WHERE id = ?`).get(first.l1MemoryId))
+      .toEqual({ status: "activated" });
+    const userMemories = db.db.prepare(
+      `SELECT content FROM user_memories WHERE status = 'active' ORDER BY created_at`
+    ).all() as Array<{ content: string }>;
+    expect(userMemories.map((memory) => memory.content)).toEqual(["我喜欢吃苹果"]);
+    expect(preference.userMemoryIds.length).toBeGreaterThan(0);
+    expect(db.db.prepare(
+      `SELECT COUNT(*) AS count FROM l2_candidate_pool WHERE candidate_key = '_|_|_|_'`
+    ).get()).toEqual({ count: 0 });
+    expect(db.db.prepare(
+      `SELECT COUNT(*) AS count FROM memories WHERE memory_layer = 'L2'`
+    ).get()).toEqual({ count: 0 });
+
+    const at = new Date().toISOString();
+    db.db.prepare(
+      `INSERT INTO l2_candidate_pool (
+         id, user_id, session_id, source_memory_id, candidate_key,
+         candidate_value, score, status, evidence_json, created_at, updated_at, expires_at
+       ) VALUES (?, ?, ?, ?, '_|_|_|_', 'stale wildcard', 1, 'pending', '[]', ?, ?, ?)`
+    ).run(
+      l2CandidateIdFor("_|_|_|_", first.l1MemoryId),
+      "wildcard-l1-user",
+      session.sessionId,
+      first.l1MemoryId,
+      at,
+      at,
+      new Date(Date.parse(at) + 86_400_000).toISOString()
+    );
+    db.db.prepare(
+      `INSERT INTO evolution_jobs (
+         id, job_type, status, user_id, session_id, episode_id, target_memory_id,
+         payload_json, attempts, max_attempts, created_at, updated_at
+       ) VALUES (?, 'l2_induction', 'queued', ?, ?, ?, ?, ?, 0, 3, ?, ?)`
+    ).run(
+      "job_wildcard_l2",
+      "wildcard-l1-user",
+      session.sessionId,
+      first.episodeId,
+      first.l1MemoryId,
+      JSON.stringify({ sourceMemoryId: first.l1MemoryId }),
+      at,
+      at
+    );
+    await runWorkerRounds(service, 4, 20);
+
+    expect(db.db.prepare(
+      `SELECT COUNT(*) AS count FROM memories WHERE memory_layer = 'L2'`
+    ).get()).toEqual({ count: 0 });
+    db.close();
+  });
 });
 
 function createBc08SummaryLlm(): LlmClient {

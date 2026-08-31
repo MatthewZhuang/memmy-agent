@@ -28,6 +28,7 @@ import {
   retrievePluginMemories,
   retrievalLayersForMode,
   retrievalLayersForProfile,
+  isBucketableSignature,
   signatureFromTraceParts,
   traceMetaFromMemory,
   type PolicyMemoryMeta,
@@ -1035,6 +1036,18 @@ describe("plugin algorithm parity helpers", () => {
       output: "command completed",
       success: false
     }], "reflection saw EXIT_2")).toBe("shell|_|shell|EXIT_2");
+  });
+
+  it("keeps empty no-tool signatures unbucketable and leaves tagged no-tool signatures bucketable", () => {
+    expect(signatureFromTraceParts([], [], "")).toBe("_|_|_|_");
+    expect(signatureFromTraceParts([], [], "你好，今天天气怎么样")).toBe("_|_|_|_");
+    expect(isBucketableSignature("_|_|_|_")).toBe(false);
+    expect(isBucketableSignature("")).toBe(false);
+    expect(isBucketableSignature("_|_|_")).toBe(false);
+    expect(isBucketableSignature("error|python|_|_")).toBe(true);
+    expect(isBucketableSignature("compact|summary|_|_")).toBe(true);
+    expect(isBucketableSignature("python|pytest|pytest|EXIT_1")).toBe(true);
+    expect(signatureFromTraceParts(["error", "python"], [], "")).toBe("error|python|_|_");
   });
 
   it("uses the plugin skill lifecycle prior when resolving trials", () => {

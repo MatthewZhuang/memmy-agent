@@ -2,6 +2,7 @@ import {
   L2_INDUCTION_PROMPT,
   buildPolicyDraft,
   detectDominantLanguage,
+  isBucketableSignature,
   l2CandidateIdFor,
   languageSteeringLine,
   packL2InductionTraces,
@@ -192,6 +193,14 @@ export class PolicyInductionEngine {
     );
 
     for (const signature of signatures) {
+      if (!isBucketableSignature(signature)) {
+        logEvolutionDecision(job, "l2_induction", "gate_not_met", {
+          sourceMemoryId: source.id,
+          reason: "non_discriminative_signature",
+          signature
+        });
+        continue;
+      }
       const bucket = uniq(
         pendingCandidates
           .filter((candidate) => candidate.candidateKey === signature)
@@ -796,6 +805,7 @@ export class PolicyInductionEngine {
     signature: string,
     at: string
   ): void {
+    if (!isBucketableSignature(signature)) return;
     const id = l2CandidateIdFor(signature, trace.id);
     this.deps.repos.runtime.upsertCandidatePoolTrace({
       id,
@@ -823,7 +833,8 @@ export class PolicyInductionEngine {
       trace.memory.properties.internal_info.evidence_status !== "provisional" &&
       trace.memory.properties.internal_info.evidence_status !== "disputed" &&
       trace.value >= this.deps.config.algorithm.l2Induction.minTraceValue &&
-      Boolean(trace.vecSummary ?? trace.vecAction);
+      Boolean(trace.vecSummary ?? trace.vecAction) &&
+      isBucketableSignature(signatureFromTrace(trace));
   }
 
   private markCandidatePoolPromoted(

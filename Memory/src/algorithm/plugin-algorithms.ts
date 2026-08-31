@@ -4426,6 +4426,13 @@ export function signatureFromTraceParts(
   return signatureFromTraceLike(tags, toolCalls, reflection);
 }
 
+export function isBucketableSignature(signature: string): boolean {
+  return signature
+    .split("|")
+    .map((part) => part.trim())
+    .some((part) => part.length > 0 && part !== "_");
+}
+
 export function l2CandidateSignatureHash(signature: string): string {
   let hash = 5381;
   for (let index = 0; index < signature.length; index += 1) {
