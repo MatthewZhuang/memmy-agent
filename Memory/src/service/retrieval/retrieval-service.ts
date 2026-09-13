@@ -28,6 +28,10 @@ import {
   worldModelMetaFromMemory
 } from "../../algorithm/plugin-algorithms.js";
 import {
+  clipSkillGuide,
+  MEMORY_PACKET_SKILL_FULL_MAX_CHARS
+} from "../../algorithm/trace-direct-skill.js";
+import {
   MEMORY_SUMMARY_MAX_TOKENS,
   type MemmyConfig
 } from "../../config/index.js";
@@ -537,6 +541,7 @@ interface InjectedRenderOptions {
   query?: string;
   skillInjectionMode?: "summary" | "full";
   skillSummaryChars?: number;
+  skillFullMaxChars?: number;
   domain?: "" | "research";
   timeZone?: string;
 }
@@ -551,6 +556,7 @@ export function buildInjectedContext(
   tuning?: {
     skillInjectionMode?: "summary" | "full";
     skillSummaryChars?: number;
+    skillFullMaxChars?: number;
     domain?: "" | "research";
     timeZone?: string;
   }
@@ -570,6 +576,7 @@ export function buildInjectedContext(
     query,
     skillInjectionMode: tuning?.skillInjectionMode ?? "summary",
     skillSummaryChars: tuning?.skillSummaryChars ?? MEMORY_PACKET_SKILL_SUMMARY_CHARS,
+    skillFullMaxChars: tuning?.skillFullMaxChars ?? MEMORY_PACKET_SKILL_FULL_MAX_CHARS,
     domain: tuning?.domain,
     timeZone: tuning?.timeZone
   };
@@ -774,10 +781,11 @@ function renderInjectedSnippet(
     const guide = skill?.invocationGuide || hit.snippet;
     const summaryChars = options.skillSummaryChars ?? MEMORY_PACKET_SKILL_SUMMARY_CHARS;
     if (options.skillInjectionMode === "full") {
+      const fullMax = options.skillFullMaxChars ?? MEMORY_PACKET_SKILL_FULL_MAX_CHARS;
       return {
         refKind: "skill",
         title: "Skill",
-        body: truncateInjectedSnippet([
+        body: [
           `id: ${hit.id}`,
           ...(hit.sourceAgentId ? [`source agent: ${hit.sourceAgentId}`] : []),
           ...(hit.sourceSkillId ? [`source skill: ${hit.sourceSkillId}`] : []),
@@ -785,8 +793,8 @@ function renderInjectedSnippet(
           "",
           ...labeledInjectedBlock("Name", name),
           "",
-          ...labeledInjectedBlock("Guide", guide.trim() || "(not provided)")
-        ].join("\n"))
+          ...labeledInjectedBlock("Guide", clipSkillGuide(guide.trim() || "(not provided)", fullMax))
+        ].join("\n")
       };
     }
     const lines = [
@@ -2497,6 +2505,7 @@ export class RetrievalService {
     multiChannelBypass: boolean;
     skillInjectionMode: "summary" | "full";
     skillSummaryChars: number;
+    skillFullMaxChars: number;
     decayHalfLifeDays: number;
     domain: "" | "research";
     readOnlyInjectionProfile: "all" | "experience" | "skill" | "skill_experience";
@@ -2526,6 +2535,7 @@ export class RetrievalService {
       multiChannelBypass: retrieval.multiChannelBypass,
       skillInjectionMode: retrieval.skillInjectionMode,
       skillSummaryChars: retrieval.skillSummaryChars,
+      skillFullMaxChars: retrieval.skillFullMaxChars,
       decayHalfLifeDays: this.deps.config.algorithm.reward.decayHalfLifeDays,
       domain: this.deps.config.domain,
       readOnlyInjectionProfile: retrieval.readOnlyInjectionProfile

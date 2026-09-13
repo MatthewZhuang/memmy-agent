@@ -222,6 +222,13 @@ export interface AlgorithmConfig {
     outcomeRTaskFailureThreshold: number;
     failureEpisodeScorePenalty: number;
     failureEpisodeMaxRatio: number;
+    directFromTrace: boolean;
+    clusterJoinThreshold: number;
+    clusterJoinThresholdEmpty: number;
+    toolJaccardFloor: number;
+    artifactJaccardFloor: number;
+    batchSuccessLimit: number;
+    batchFailureLimit: number;
   };
   session: {
     followUpMode: "merge_follow_ups" | "episode_per_turn";
@@ -250,6 +257,7 @@ export interface AlgorithmConfig {
     multiChannelBypass: boolean;
     skillInjectionMode: "summary" | "full";
     skillSummaryChars: number;
+    skillFullMaxChars: number;
     llmFilterEnabled: boolean;
     llmFilterMaxKeep: number;
     llmFilterFallbackMaxKeep: number;
@@ -448,7 +456,14 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
       outcomeRTaskSuccessThreshold: 0.5,
       outcomeRTaskFailureThreshold: -0.15,
       failureEpisodeScorePenalty: 0,
-      failureEpisodeMaxRatio: 0.4
+      failureEpisodeMaxRatio: 0.4,
+      directFromTrace: true,
+      clusterJoinThreshold: 0.5,
+      clusterJoinThresholdEmpty: 0.7,
+      toolJaccardFloor: 0.4,
+      artifactJaccardFloor: 0.3,
+      batchSuccessLimit: 3,
+      batchFailureLimit: 3
     },
     session: {
       followUpMode: "merge_follow_ups",
@@ -477,6 +492,7 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
       multiChannelBypass: true,
       skillInjectionMode: "summary",
       skillSummaryChars: 200,
+      skillFullMaxChars: 16_384,
       llmFilterEnabled: true,
       llmFilterMaxKeep: 8,
       llmFilterFallbackMaxKeep: 6,
@@ -584,7 +600,10 @@ function configFromEnv(): Record<string, unknown> {
       retrieval: compactRecord({
         readOnlyInjectionProfile:
           process.env.MEMMY_RETRIEVAL_INJECTION_PROFILE ??
-          process.env.MEMMY_READONLY_INJECTION_PROFILE
+          process.env.MEMMY_READONLY_INJECTION_PROFILE,
+        skillInjectionMode: process.env.MEMMY_SKILL_INJECTION_MODE,
+        skillSummaryChars: numberEnv("MEMMY_SKILL_SUMMARY_CHARS"),
+        skillFullMaxChars: numberEnv("MEMMY_SKILL_FULL_MAX_CHARS")
       })
     })
   });
@@ -1169,7 +1188,14 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
       outcomeRTaskSuccessThreshold: numberValue(skill.outcomeRTaskSuccessThreshold, DEFAULT_MEMMY_CONFIG.algorithm.skill.outcomeRTaskSuccessThreshold),
       outcomeRTaskFailureThreshold: numberValue(skill.outcomeRTaskFailureThreshold, DEFAULT_MEMMY_CONFIG.algorithm.skill.outcomeRTaskFailureThreshold),
       failureEpisodeScorePenalty: numberValue(skill.failureEpisodeScorePenalty, DEFAULT_MEMMY_CONFIG.algorithm.skill.failureEpisodeScorePenalty),
-      failureEpisodeMaxRatio: numberValue(skill.failureEpisodeMaxRatio, DEFAULT_MEMMY_CONFIG.algorithm.skill.failureEpisodeMaxRatio)
+      failureEpisodeMaxRatio: numberValue(skill.failureEpisodeMaxRatio, DEFAULT_MEMMY_CONFIG.algorithm.skill.failureEpisodeMaxRatio),
+      directFromTrace: booleanValue(skill.directFromTrace, DEFAULT_MEMMY_CONFIG.algorithm.skill.directFromTrace),
+      clusterJoinThreshold: numberValue(skill.clusterJoinThreshold, DEFAULT_MEMMY_CONFIG.algorithm.skill.clusterJoinThreshold),
+      clusterJoinThresholdEmpty: numberValue(skill.clusterJoinThresholdEmpty, DEFAULT_MEMMY_CONFIG.algorithm.skill.clusterJoinThresholdEmpty),
+      toolJaccardFloor: numberValue(skill.toolJaccardFloor, DEFAULT_MEMMY_CONFIG.algorithm.skill.toolJaccardFloor),
+      artifactJaccardFloor: numberValue(skill.artifactJaccardFloor, DEFAULT_MEMMY_CONFIG.algorithm.skill.artifactJaccardFloor),
+      batchSuccessLimit: numberValue(skill.batchSuccessLimit, DEFAULT_MEMMY_CONFIG.algorithm.skill.batchSuccessLimit),
+      batchFailureLimit: numberValue(skill.batchFailureLimit, DEFAULT_MEMMY_CONFIG.algorithm.skill.batchFailureLimit)
     },
     session: {
       followUpMode: "merge_follow_ups",
@@ -1198,6 +1224,7 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
       multiChannelBypass: booleanValue(retrieval.multiChannelBypass, DEFAULT_MEMMY_CONFIG.algorithm.retrieval.multiChannelBypass),
       skillInjectionMode: skillInjectionMode(retrieval.skillInjectionMode, DEFAULT_MEMMY_CONFIG.algorithm.retrieval.skillInjectionMode),
       skillSummaryChars: numberValue(retrieval.skillSummaryChars, DEFAULT_MEMMY_CONFIG.algorithm.retrieval.skillSummaryChars),
+      skillFullMaxChars: numberValue(retrieval.skillFullMaxChars, DEFAULT_MEMMY_CONFIG.algorithm.retrieval.skillFullMaxChars),
       llmFilterEnabled: booleanValue(retrieval.llmFilterEnabled, DEFAULT_MEMMY_CONFIG.algorithm.retrieval.llmFilterEnabled),
       llmFilterMaxKeep: numberValue(retrieval.llmFilterMaxKeep, DEFAULT_MEMMY_CONFIG.algorithm.retrieval.llmFilterMaxKeep),
       llmFilterFallbackMaxKeep: numberValue(retrieval.llmFilterFallbackMaxKeep, DEFAULT_MEMMY_CONFIG.algorithm.retrieval.llmFilterFallbackMaxKeep),
