@@ -65,6 +65,8 @@ export interface WorkerJobProcessors {
     updateL3WorldModel(job: EvolutionJobRecord): MaybePromise<void>;
     updateProjectEnvironment(job: EvolutionJobRecord): MaybePromise<void>;
     crystallizeSkill(job: EvolutionJobRecord): MaybePromise<void>;
+    assignSkillCluster(job: EvolutionJobRecord): MaybePromise<void>;
+    evolveSkillCluster(job: EvolutionJobRecord): MaybePromise<void>;
     associateL2(job: EvolutionJobRecord): MaybePromise<void>;
     splitBigTurn(job: EvolutionJobRecord): MaybePromise<void>;
   };
@@ -257,6 +259,12 @@ export async function processJob(
       return;
     case "skill_crystallization":
       await deps.processors.evolution.crystallizeSkill(job);
+      return;
+    case "skill_cluster_assign":
+      await deps.processors.evolution.assignSkillCluster(job);
+      return;
+    case "skill_batch_evolve":
+      await deps.processors.evolution.evolveSkillCluster(job);
       return;
     case "reward":
       await deps.processors.feedback.applyReward(job);
@@ -616,6 +624,12 @@ export function evolutionJobDedupeKey(input: Pick<EnqueueJobInput, "jobType" | "
     case "skill_crystallization": {
       const seed = payloadString("skillId") ?? target ?? payloadString("policyId");
       return seed ? `skill_crystallization:${seed}` : input.episodeId ? `skill_crystallization:${input.episodeId}` : undefined;
+    }
+    case "skill_cluster_assign":
+      return input.episodeId ? `skill_cluster_assign:${input.episodeId}` : undefined;
+    case "skill_batch_evolve": {
+      const clusterId = payloadString("clusterId");
+      return clusterId ? `skill_batch_evolve:${clusterId}` : input.episodeId ? `skill_batch_evolve:${input.episodeId}` : undefined;
     }
     case "skill_trial_resolve": {
       const trial = payloadString("trialId") ?? target;

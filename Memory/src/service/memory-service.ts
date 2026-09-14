@@ -308,6 +308,8 @@ export class MemoryService {
           updateL3WorldModel: (job) => this.evolutionJobs.updateL3WorldModel(job),
           updateProjectEnvironment: (job) => this.projectEnvironment.processProfileJob(job),
           crystallizeSkill: (job) => this.evolutionJobs.crystallizeSkill(job),
+          assignSkillCluster: (job) => this.evolutionJobs.assignSkillCluster(job),
+          evolveSkillCluster: (job) => this.evolutionJobs.evolveSkillCluster(job),
           associateL2: (job) => this.evolutionJobs.associateL2(job),
           splitBigTurn: (job) => this.evolutionJobs.splitBigTurn(job)
         },
@@ -344,7 +346,8 @@ export class MemoryService {
         llm: this.skillLlm
       }),
       scheduleEmbeddingAfterTextUpdate: (input) => this.embeddingJobs.scheduleEmbeddingAfterTextUpdate(input),
-      repairEvidenceValueDiff: sessionRepairEvidenceValueDiff
+      repairEvidenceValueDiff: sessionRepairEvidenceValueDiff,
+      queryVector: this.queryVector.bind(this)
     });
     const trialOwner = this;
     this.skillTrials = new SkillTrialResolver({
@@ -1186,6 +1189,7 @@ export class MemoryService {
     multiChannelBypass: boolean;
     skillInjectionMode: "summary" | "full";
     skillSummaryChars: number;
+    skillFullMaxChars: number;
     decayHalfLifeDays: number;
     domain: "" | "research";
     readOnlyInjectionProfile: "all" | "experience" | "skill" | "skill_experience";
