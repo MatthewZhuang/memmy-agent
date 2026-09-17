@@ -67,6 +67,7 @@ for required in \
   "$REPO_ROOT/App/backend/dist/src/analytics/analytics-transport.js" \
   "$REPO_ROOT/App/backend/dist/src/services/builtin-skill-target-registry.js" \
   "$REPO_ROOT/Migrations/dist/index.js" \
+  "$REPO_ROOT/Knowledge/dist/index.js" \
   "$REPO_ROOT/App/backend/local-api-contracts/dist/index.js"; do
   if [ ! -f "$required" ]; then
     echo "Required build output is missing: $required" >&2
@@ -120,6 +121,9 @@ cp "$REPO_ROOT/App/backend/dist/src/services/builtin-skill-target-registry.js" \
   "$PAYLOAD_DIR/App/backend/dist/src/services/builtin-skill-target-registry.js"
 cp "$REPO_ROOT/Memory/package.json" "$PAYLOAD_DIR/Memory/package.json"
 cp -R "$REPO_ROOT/Memory/dist" "$PAYLOAD_DIR/Memory/dist"
+mkdir -p "$PAYLOAD_DIR/Knowledge"
+cp "$REPO_ROOT/Knowledge/package.json" "$PAYLOAD_DIR/Knowledge/package.json"
+cp -R "$REPO_ROOT/Knowledge/dist" "$PAYLOAD_DIR/Knowledge/dist"
 cp "$REPO_ROOT/Migrations/package.json" "$PAYLOAD_DIR/Migrations/package.json"
 cp -R "$REPO_ROOT/Migrations/dist" "$PAYLOAD_DIR/Migrations/dist"
 cp "$REPO_ROOT/App/backend/local-api-contracts/package.json" \
@@ -134,6 +138,7 @@ const manifestPath = process.argv[2];
 const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
 manifest.workspaces = [
   "AgentSourceCore",
+  "Knowledge",
   "Memory",
   "Migrations",
   "App/backend/local-api-contracts"

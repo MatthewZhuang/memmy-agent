@@ -770,6 +770,11 @@ if [ ! -f "$RUNTIME_LOCAL_API_CONTRACTS_DIR/dist/index.js" ]; then
   echo "Packaged local API contracts entrypoint is missing." >&2
   exit 1
 fi
+RUNTIME_KNOWLEDGE_DIR="$RUNTIME_DIR/memmy-agent/node_modules/@memmy/knowledge"
+rm -rf "$RUNTIME_KNOWLEDGE_DIR"
+mkdir -p "$RUNTIME_KNOWLEDGE_DIR"
+cp "$ROOT_DIR/Knowledge/package.json" "$RUNTIME_KNOWLEDGE_DIR/package.json"
+cp -R "$ROOT_DIR/Knowledge/dist" "$RUNTIME_KNOWLEDGE_DIR/dist"
 RUNTIME_MIGRATIONS_DIR="$RUNTIME_DIR/memmy-agent/node_modules/@memmy/migrations"
 rm -rf "$RUNTIME_MIGRATIONS_DIR"
 mkdir -p "$RUNTIME_MIGRATIONS_DIR"
