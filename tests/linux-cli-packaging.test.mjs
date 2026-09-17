@@ -320,6 +320,7 @@ describe("Linux CLI package boundary", () => {
     expect(listing.stdout).toContain("App/backend/dist/src/adapters/outbound/skill-writer/templates/memmy-opencode-plugin.js");
     expect(listing.stdout).toContain("resources/embedding-models/Xenova/all-MiniLM-L6-v2/onnx/model_quantized.onnx");
     expect(listing.stdout).toContain("Migrations/dist/index.js");
+    expect(listing.stdout).toContain("Knowledge/dist/index.js");
     expect(listing.stdout).toContain("App/backend/local-api-contracts/dist/index.js");
     expect(listing.stdout).not.toMatch(/electron|\.dmg|\.exe|App\/frontend|App\/shell/i);
     expect(listing.stdout).not.toMatch(/node_modules|App\/memmy-agent\/src\/|Memory\/src\/(?!server|cli)/);

@@ -555,6 +555,9 @@ async function createAsarFixture(
   );
   mkdirSync(dirname(contracts), { recursive: true });
   writeFileSync(contracts, "export {};\n");
+  const knowledge = join(source, "dist/runtime/memmy-agent/node_modules/@memmy/knowledge/dist/index.js");
+  mkdirSync(dirname(knowledge), { recursive: true });
+  writeFileSync(knowledge, "export {};\n");
   if (platform === "win32") {
     const ownSourceMap = join(source, "dist/runtime/memmy-agent/dist/main.js.map");
     mkdirSync(dirname(ownSourceMap), { recursive: true });

@@ -10,9 +10,9 @@
   },
   "scripts": {
     "version:sync": "npm --prefix ../.. run version:sync",
-    "prebuild": "npm run version:sync && npm --prefix ../../Migrations run build && npm --prefix ../backend/local-api-contracts run build",
-    "pretypecheck": "npm run version:sync && npm --prefix ../../Migrations run build && npm --prefix ../backend/local-api-contracts run build",
-    "pretest": "npm run version:sync && npm --prefix ../../Migrations run build && npm --prefix ../backend/local-api-contracts run build",
+    "prebuild": "npm --prefix ../../Knowledge run build && npm run version:sync && npm --prefix ../../Migrations run build && npm --prefix ../backend/local-api-contracts run build",
+    "pretypecheck": "npm --prefix ../../Knowledge run build && npm run version:sync && npm --prefix ../../Migrations run build && npm --prefix ../backend/local-api-contracts run build",
+    "pretest": "npm --prefix ../../Knowledge run build && npm run version:sync && npm --prefix ../../Migrations run build && npm --prefix ../backend/local-api-contracts run build",
     "pretest:tui-cursor": "npm run version:sync",
     "build": "tsc -p tsconfig.build.json && node scripts/copy-build-assets.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -85,7 +85,8 @@
     "which": "^5.0.0",
     "ws": "^8.21.0",
     "yaml": "^2.8.2",
-    "zod": "^4.1.13"
+    "zod": "^4.1.13",
+    "@memmy/knowledge": "file:../../Knowledge"
   },
   "devDependencies": {
     "@types/mime-types": "^3.0.1",
