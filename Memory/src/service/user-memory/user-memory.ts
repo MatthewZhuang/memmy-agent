@@ -97,6 +97,20 @@ export type L1CaptureDropReason = "cron_heartbeat" | "ui_system" | "ack_social";
 const CRON_HEARTBEAT_PATTERN = /scheduled reminder has been triggered|\[openclaw heartbeat poll\]|\[cron:/i;
 const ACK_ONLY_PATTERN = /^(确认|好的|嗯+|继续|ok|okay|可以了?|换个话题|hello|hi|你好|需要|好的[，,\s]*感谢[，。\s]*换个话题)$/i;
 
+export function stripL1CaptureChrome(text: string): string {
+  return text
+    .replace(/```chat_selection[\s\S]*?```/g, " ")
+    .replace(/<timestamp>[\s\S]*?<\/timestamp>/g, " ")
+    .replace(/<system_notification>[\s\S]*?<\/system_notification>/g, " ")
+    .replace(/<environment_context>[\s\S]*?<\/environment_context>/g, " ")
+    .replace(/<in-app-browser-context[\s\S]*$/g, " ")
+    .replace(/<!-- memmy:start[\s\S]*?<!-- memmy:end[\s\S]*?-->/g, " ")
+    .replace(/^# AGENTS\.md[\s\S]*/i, " ")
+    .replace(/<user_query>\s*([\s\S]*?)\s*<\/user_query>/gi, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function l1CaptureDropReason(text: string): L1CaptureDropReason | undefined {
   const raw = text.trim();
   if (!raw) return "ui_system";
@@ -108,18 +122,7 @@ export function l1CaptureDropReason(text: string): L1CaptureDropReason | undefin
     return "ui_system";
   }
 
-  const stripped = raw
-    .replace(/```chat_selection[\s\S]*?```/g, " ")
-    .replace(/<timestamp>[\s\S]*?<\/timestamp>/g, " ")
-    .replace(/<system_notification>[\s\S]*?<\/system_notification>/g, " ")
-    .replace(/<environment_context>[\s\S]*?<\/environment_context>/g, " ")
-    .replace(/<in-app-browser-context[\s\S]*$/g, " ")
-    .replace(/<!-- memmy:start[\s\S]*?<!-- memmy:end[\s\S]*?-->/g, " ")
-    .replace(/^# AGENTS\.md[\s\S]*/i, " ")
-    .replace(/<user_query>\s*([\s\S]*?)\s*<\/user_query>/gi, "$1")
-    .replace(/\s+/g, " ")
-    .trim();
-
+  const stripped = stripL1CaptureChrome(raw);
   if (!stripped || /^start multitasking$/i.test(stripped)) return "ui_system";
   if (ACK_ONLY_PATTERN.test(stripped.replace(/[。.!！]+$/g, "").trim())) return "ack_social";
   return undefined;

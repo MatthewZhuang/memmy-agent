@@ -40,13 +40,13 @@ export function createCapturingL2Llm(calls: Array<{
         } as unknown as T;
       }
       if (options.operation === "capture.summarize") {
-        const payload = messages.find((message) => message.role === "user")?.content ?? "";
-        const userQuote = payload.match(/\bUSER:\s*(.*?)\s+ASSISTANT:/)?.[1]?.trim() ?? "";
         return {
           l1: {
-            summary: "reflected trace summary",
-            evidence: [{ quote: userQuote, role: "user", kind: "task_outcome" }]
+            summary: "reflected trace summary"
           },
+          turn_role: "local_subproblem",
+          task_summary: "reflected trace summary",
+          intent: "local step — reflected trace summary",
           user: null
         } as unknown as T;
       }

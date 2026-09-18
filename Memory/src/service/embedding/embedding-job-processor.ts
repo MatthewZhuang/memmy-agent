@@ -47,13 +47,15 @@ type TurnCaptureDecision = {
   createL1: boolean;
   l1Summary: string;
   policyEligible: boolean;
+  turnRole: "local_subproblem" | "continuation";
+  taskSummary: string;
+  intent: string;
   createUserMemory: boolean;
   userMemoryTypes: UserMemoryType[];
   userMemoryEvidence: Array<{ quote: string; type: UserMemoryType }>;
   userMemoryAction: "none" | "create" | "confirm_existing" | "correct_existing";
   matchedUserMemoryId?: string;
   correctedUserMemoryContent?: string;
-  l1Evidence: Array<{ quote: string; sourceRole: "user" | "assistant" | "tool"; kind: string }>;
   reason: string;
 };
 
@@ -684,6 +686,9 @@ function acceptTurnMemoryDecision(
       internal_info: {
         ...internalWithoutEvidence,
         policy_eligible: decision.policyEligible,
+        turn_role: decision.turnRole,
+        task_summary: decision.taskSummary,
+        intent: decision.intent,
         ...(originalEvidenceStatus ? { evidence_status: originalEvidenceStatus } : {}),
         capture_decision: recordTurnMemoryDecisionFields(pending, decision, "accepted", updatedAt)
       }
@@ -719,22 +724,21 @@ function recordTurnMemoryDecisionFields(
   status: "accepted" | "rejected",
   updatedAt: string
 ): Record<string, unknown> {
+  const { l1_evidence: _droppedL1Evidence, ...rest } = pending;
   return {
-    ...pending,
+    ...rest,
     status,
     create_l1: decision.createL1,
     policy_eligible: decision.policyEligible,
+    turn_role: decision.turnRole,
+    task_summary: decision.taskSummary,
+    intent: decision.intent,
     create_user_memory: decision.createUserMemory,
     user_memory_types: decision.userMemoryTypes,
     user_memory_evidence: decision.userMemoryEvidence,
     user_memory_action: decision.userMemoryAction,
     matched_user_memory_id: decision.matchedUserMemoryId,
     corrected_user_memory_content: decision.correctedUserMemoryContent,
-    l1_evidence: decision.l1Evidence.map((item) => ({
-      quote: item.quote,
-      source_role: item.sourceRole,
-      kind: item.kind
-    })),
     reason: decision.reason,
     decided_at: updatedAt
   };
@@ -758,16 +762,15 @@ function constrainTurnMemoryDecision(
   if (decision.createUserMemory && decision.userMemoryEvidence.length === 0) {
     guards.push("user-memory-evidence-missing");
   }
-  if (decision.createL1 && decision.l1Evidence.length === 0) {
-    guards.push("l1-evidence-missing");
-  }
-  let createL1 = dropReason === undefined;
+  const createL1 = dropReason === undefined;
   if (dropReason) {
     guards.push(`l1-drop:${dropReason}`);
   } else if (verifiedToolObservation) {
     guards.push("verified-tool-evidence");
   }
-  const policyEligible = isPolicyEligibleCapture(decision, createL1, verifiedToolObservation);
+  const policyEligible = createL1 &&
+    decision.turnRole === "local_subproblem" &&
+    decision.intent.trim().length > 0;
 
   return {
     ...decision,
@@ -780,25 +783,6 @@ function constrainTurnMemoryDecision(
     matchedUserMemoryId: createUserMemory ? decision.matchedUserMemoryId : undefined,
     reason: clip([decision.reason, guards.length > 0 ? `guards=${guards.join(",")}` : ""].filter(Boolean).join("; "), 300)
   };
-}
-
-function isPolicyEligibleCapture(
-  decision: TurnCaptureDecision,
-  createL1: boolean,
-  verifiedToolObservation: boolean
-): boolean {
-  if (!createL1 || !decision.policyEligible) return false;
-  return decision.l1Evidence.some((evidence) => {
-    if (
-      evidence.sourceRole === "user" &&
-      (evidence.kind === "user_preference" ||
-        evidence.kind === "user_directive" ||
-        evidence.kind === "decision" ||
-        evidence.kind === "correction")
-    ) return true;
-    if (evidence.kind !== "task_outcome") return false;
-    return evidence.sourceRole === "user" || evidence.sourceRole === "tool" || verifiedToolObservation;
-  });
 }
 
 function hasVerifiedDurableToolObservation(

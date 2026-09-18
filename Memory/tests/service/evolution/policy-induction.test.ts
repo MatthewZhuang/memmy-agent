@@ -1239,13 +1239,11 @@ function createBc08SummaryLlm(): LlmClient {
       if (payload.includes("以后不要写不必要的兜底代码")) {
         return {
           l1: {
-            summary: "用户要求代码保持简洁、避免不必要的兜底；本轮已精简并通过测试。",
-            evidence: [{
-              quote: "已精简代码并通过测试",
-              role: "assistant",
-              kind: "task_outcome"
-            }]
+            summary: "用户要求代码保持简洁、避免不必要的兜底；本轮已精简并通过测试。"
           },
+          turn_role: "local_subproblem",
+          task_summary: "把代码写得更简洁",
+          intent: "避免写不必要的兜底代码",
           user: {
             action: "create",
             evidence: [{
@@ -1262,13 +1260,11 @@ function createBc08SummaryLlm(): LlmClient {
       }
       return {
         l1: {
-          summary: "按既有反馈删除不必要兜底，并通过测试验证。",
-          evidence: [{
-            quote: "测试验证通过",
-            role: "assistant",
-            kind: "task_outcome"
-          }]
+          summary: "按既有反馈删除不必要兜底，并通过测试验证。"
         },
+        turn_role: "local_subproblem",
+        task_summary: "把代码写得更简洁",
+        intent: "避免写不必要的兜底代码",
         user: null
       } as unknown as T;
     },

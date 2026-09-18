@@ -19,6 +19,7 @@ import type { MemoryRow } from "../../types.js";
 import { isRecord } from "../../utils/json.js";
 import { stableHash } from "../../utils/id.js";
 import type { EnqueueJobInput } from "../worker/job-handlers.js";
+import { isInternalInfoEligibleForPositiveL2 } from "./span-pipeline.js";
 import { logEvolutionDecision } from "./evolution-logging.js";
 
 export type PolicyDraft = ReturnType<typeof buildPolicyDraft> & {
@@ -819,7 +820,7 @@ export class PolicyInductionEngine {
   }
 
   isTraceEligibleForL2(trace: TraceMeta): boolean {
-    return trace.memory.properties.internal_info.policy_eligible !== false &&
+    return isInternalInfoEligibleForPositiveL2(trace.memory.properties.internal_info) &&
       trace.memory.properties.internal_info.evidence_status !== "provisional" &&
       trace.memory.properties.internal_info.evidence_status !== "disputed" &&
       trace.value >= this.deps.config.algorithm.l2Induction.minTraceValue &&

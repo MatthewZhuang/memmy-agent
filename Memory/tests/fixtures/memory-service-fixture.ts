@@ -317,15 +317,16 @@ export function createBatchReflectionLlm(calls: Array<{
         } as unknown as T;
       }
       if (options.operation === "capture.summarize") {
-        const decisionCall = messages[0]?.content.includes("Judge L1 and User Memory") === true;
+        const system = messages[0]?.content ?? "";
+        const decisionCall = system.includes("Judge L1") && system.includes("User Memory");
         if (!decisionCall) return { summary: captureSummary } as unknown as T;
-        const payload = messages.find((message) => message.role === "user")?.content ?? "";
-        const userQuote = payload.match(/\bUSER:\s*(.*?)\s+ASSISTANT:/)?.[1]?.trim() ?? "";
         return {
           l1: {
-            summary: captureSummary,
-            evidence: [{ quote: userQuote, role: "user", kind: "task_outcome" }]
+            summary: captureSummary
           },
+          turn_role: "local_subproblem",
+          task_summary: captureSummary,
+          intent: `local step — ${captureSummary}`,
           user: null
         } as unknown as T;
       }

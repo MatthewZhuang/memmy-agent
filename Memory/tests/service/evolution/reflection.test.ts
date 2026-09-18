@@ -563,7 +563,9 @@ describe("MemoryService / evolution / reflection", () => {
     expect(summaryCalls.some((call) => call.options.operation === "capture.reflection.batch.v13")).toBe(false);
     const summaryCall = summaryCalls.find((call) => call.options.operation === "capture.summarize");
     expect(summaryCall).toBeTruthy();
-    expect(summaryCall!.messages[0]?.content).toContain("Judge L1 and User Memory");
+    expect(summaryCall!.messages[0]?.content).toContain("Judge L1");
+    expect(summaryCall!.messages[0]?.content).toContain("turn_role");
+    expect(summaryCall!.messages[1]?.content).toContain("PREVIOUS_USER_QUERIES");
     expect(summaryCall!.messages[1]?.content).not.toContain("REFLECTION:");
     expect(summaryCalls.some((call) => call.options.operation === "capture.reflected_trace_summary.v1")).toBe(false);
     const payload = JSON.parse(
@@ -858,7 +860,9 @@ describe("MemoryService / evolution / reflection", () => {
     expect(payload.task_context).toContain("sqlite migration");
     const summaryCall = calls.find((call) => call.options.operation === "capture.summarize");
     expect(summaryCall).toBeTruthy();
-    expect(summaryCall!.messages[0]?.content).toContain("Judge L1 and User Memory");
+    expect(summaryCall!.messages[0]?.content).toContain("Judge L1");
+    expect(summaryCall!.messages[0]?.content).toContain("turn_role");
+    expect(summaryCall!.messages[1]?.content).toContain("PREVIOUS_USER_QUERIES");
     const summaryPayload = summaryCall!.messages.find((message) => message.role === "user")?.content ?? "";
     expect(summaryPayload).not.toContain("REFLECTION:");
     expect(summaryPayload).toContain("TOOLS:");

@@ -30,6 +30,9 @@ export function makeTraceEligibleForL2(db: MemoryDb, memoryId: string): void {
   const properties = JSON.parse(row.properties_json) as {
     internal_info?: {
       trace?: Record<string, unknown>;
+      turn_role?: string;
+      intent?: string;
+      policy_eligible?: boolean;
     };
   };
   if (!properties.internal_info?.trace) {
@@ -37,6 +40,9 @@ export function makeTraceEligibleForL2(db: MemoryDb, memoryId: string): void {
   }
   properties.internal_info.trace.value = 1;
   properties.internal_info.trace.priority = 1;
+  properties.internal_info.turn_role = "local_subproblem";
+  properties.internal_info.intent = "reusable local work step";
+  properties.internal_info.policy_eligible = true;
   db.db.prepare(
     `UPDATE memories
      SET properties_json = ?,

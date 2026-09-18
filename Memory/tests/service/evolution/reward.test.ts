@@ -98,12 +98,13 @@ function createCapturingRewardSummaryLlm(calls: Array<{
       calls.push({ messages, options });
       if (options.operation === "capture.summarize") {
         const payload = messages.find((message) => message.role === "user")?.content ?? "";
-        const turnSummary = payload.includes("verify reward scoring prompt")
-          ? "verify reward scoring prompt"
-          : payload.includes("now summarize the final reward result")
-            ? "now summarize the final reward result"
+        const current = payload.split("\nCURRENT\n").at(-1) ?? payload;
+        const turnSummary = current.includes("now summarize the final reward result")
+          ? "now summarize the final reward result"
+          : current.includes("verify reward scoring prompt")
+            ? "verify reward scoring prompt"
             : "completed task turn";
-        const userQuote = payload.match(/\bUSER:\s*(.*?)\s+ASSISTANT:/)?.[1]?.trim() ?? turnSummary;
+        const userQuote = current.match(/\bUSER:\s*(.*?)\s+ASSISTANT:/)?.[1]?.trim() ?? turnSummary;
         return {
           l1: {
             summary: turnSummary,
@@ -161,6 +162,9 @@ function createRejectingCaptureLlm(calls: string[]): LlmClient {
       }
       return {
         l1: null,
+        turn_role: "continuation",
+        task_summary: "",
+        intent: "",
         user: null
       } as unknown as T;
     },
@@ -210,9 +214,11 @@ function createMixedCaptureLlm(calls: Array<{ operation: string; stepCount?: num
         const accepted = payload.includes("implement the durable migration");
         return {
           l1: accepted ? {
-            summary: "Implement the durable migration.",
-            evidence: [{ quote: "implement the durable migration", role: "user", kind: "task_request" }]
+            summary: "Implement the durable migration."
           } : null,
+          turn_role: accepted ? "local_subproblem" : "continuation",
+          task_summary: accepted ? "implement the durable migration" : "",
+          intent: accepted ? "implement a durable sqlite migration" : "",
           user: null
         } as unknown as T;
       }
@@ -467,8 +473,8 @@ describe("MemoryService / evolution / reward", () => {
     });
     const complete = service.completeTurn("turn-rejected-capture-barrier", {
       sessionId: session.sessionId,
-      query: "What did I ask before?",
-      answer: "There is no durable task result in this turn."
+      query: "确认",
+      answer: "好的。"
     });
 
     service.closeSession(session.sessionId);
@@ -556,8 +562,8 @@ describe("MemoryService / evolution / reward", () => {
     const rejected = service.completeTurn("turn-mixed-capture-rejected", {
       sessionId: session.sessionId,
       episodeId: accepted.episodeId,
-      query: "What did I ask before?",
-      answer: "You asked about a migration."
+      query: "确认",
+      answer: "好的。"
     });
 
     service.closeSession(session.sessionId);
