@@ -32,7 +32,8 @@ import { namespaceForMemory } from "../namespace/namespace-scope.js";
 import { processingJobMatchesMemory } from "../worker/job-handlers.js";
 import {
   buildUserMemory,
-  isDynamicCurrentFactQuery
+  isDynamicCurrentFactQuery,
+  l1CaptureDropReason
 } from "../user-memory/user-memory.js";
 import {
   embeddingTextForMemory,
@@ -752,7 +753,7 @@ function constrainTurnMemoryDecision(
 
   const createUserMemory = !dynamicCurrent && userMemoryTypes.length > 0 &&
     decision.createUserMemory && decision.userMemoryEvidence.length > 0;
-  let createL1 = decision.createL1 && decision.l1Evidence.length > 0;
+  const dropReason = l1CaptureDropReason(text);
   const guards: string[] = [];
   if (decision.createUserMemory && decision.userMemoryEvidence.length === 0) {
     guards.push("user-memory-evidence-missing");
@@ -760,11 +761,10 @@ function constrainTurnMemoryDecision(
   if (decision.createL1 && decision.l1Evidence.length === 0) {
     guards.push("l1-evidence-missing");
   }
-  if (dynamicCurrent) {
-    createL1 = false;
-    guards.push("dynamic-current");
+  let createL1 = dropReason === undefined;
+  if (dropReason) {
+    guards.push(`l1-drop:${dropReason}`);
   } else if (verifiedToolObservation) {
-    createL1 = true;
     guards.push("verified-tool-evidence");
   }
   const policyEligible = isPolicyEligibleCapture(decision, createL1, verifiedToolObservation);

@@ -1017,11 +1017,10 @@ USER MEMORY — use only explicit declarative claims in USER; never infer from o
   3. Same meaning as a candidate, with no new fact/scope/time => confirm.
   4. Otherwise => create.
 
-L1 — apply in order; earlier rules override later exclusions.
-1. An explicit correction (e.g. 前面说错了) with its replacement => create L1, kind=correction, regardless of topic.
-2. A concrete Agent task/instruction => create L1, even if one-off or unfinished.
-3. Also create for reusable work constraints, decisions, verified tool results, durable project facts, or task feedback.
-4. Otherwise do not create for questions, acknowledgements, social chat, recalled answers, ordinary personal facts/preferences, or volatile facts.
+L1 — keep the turn unless USER is only noise. Code already drops cron/heartbeat, UI chrome, and standalone acknowledgements.
+1. An explicit correction (e.g. 前面说错了) with its replacement => create L1, kind=correction.
+2. Create L1 for concrete tasks, questions, work analysis, reusable constraints, decisions, verified tool results, durable facts/preferences, and task feedback.
+3. Do not create L1 only for scheduled reminders, heartbeat polls, in-app/system chrome, or standalone hello/ok/确认/换个话题.
 A durable Agent work convention marked by 以后/每次/始终/always MUST create both L1 and User Memory. Keep summary grounded, in USER language, <=200 characters.
 
 OUTPUT
@@ -1031,7 +1030,7 @@ OUTPUT
 {"l1":null|{"summary":string,"evidence":[{"quote":string,"role":"user|assistant|tool","kind":"task_request|user_fact|user_preference|user_directive|temporal_update|task_outcome|verified_tool_result|environment_fact|decision|correction"}]},"user":null|{"action":"create|confirm|correct","evidence":[{"quote":string,"type":"User Fact|User Preference"}],"target":string,"replacement":string}}
 
 Boundary examples:
-USER=财经类新闻呢？我喜欢看吗 => {"l1":null,"user":null}
+USER=财经类新闻呢？我喜欢看吗 => {"l1":{"summary":"用户询问自己是否喜欢看财经类新闻","evidence":[{"quote":"财经类新闻呢？我喜欢看吗","role":"user","kind":"task_request"}]},"user":null}
 USER=我现在最喜欢西瓜; candidate um1=我最喜欢苹果 => {"l1":null,"user":{"action":"create","evidence":[{"quote":"我现在最喜欢西瓜","type":"User Preference"}],"target":"","replacement":""}}
 USER=前面说错了，我最喜欢西瓜，不是苹果; candidate um1=我最喜欢苹果 => {"l1":{"summary":"用户纠正最喜欢的水果为西瓜","evidence":[{"quote":"前面说错了","role":"user","kind":"correction"}]},"user":{"action":"correct","evidence":[{"quote":"我最喜欢西瓜","type":"User Preference"}],"target":"um1","replacement":"我最喜欢西瓜"}}`;
 
