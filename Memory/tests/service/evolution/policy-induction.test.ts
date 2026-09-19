@@ -397,7 +397,7 @@ describe("MemoryService / evolution / policy induction", () => {
     db.close();
   });
 
-  it("induces one shared L2 policy across profiles and user ids", async () => {
+  it("induces one L2 per user when the same local intent appears under different user ids", async () => {
     const root = createTestRoot("mindock-memory-");
     const db = new MemoryDb({
       path: join(root, "memory.sqlite")
@@ -413,7 +413,7 @@ describe("MemoryService / evolution / policy induction", () => {
           l2Induction: {
             ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
             useLlm: true,
-            minEpisodesForInduction: 2
+            minEpisodesForInduction: 1
           },
           l3Abstraction: {
             ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
@@ -475,7 +475,7 @@ describe("MemoryService / evolution / policy induction", () => {
        FROM memories
        WHERE memory_layer = 'L2'`
     ).get() as { count: number };
-    expect(crossProfilePolicyCount.count).toBe(1);
+    expect(crossProfilePolicyCount.count).toBe(2);
 
     const profileANext = service.openSession({
       namespace: {
@@ -508,12 +508,8 @@ describe("MemoryService / evolution / policy induction", () => {
        WHERE memory_layer = 'L2'
        ORDER BY created_at`
     ).all() as Array<{ agent_id: string | null; app_id: string | null; info_json: string }>;
-    expect(policies).toHaveLength(1);
-    expect(policies[0]).toMatchObject({
-      agent_id: "codex",
-      app_id: "workspace-shared"
-    });
-    expect(["profile-a", "profile-b"]).toContain(JSON.parse(policies[0]!.info_json).profile_id);
+    expect(policies).toHaveLength(2);
+    expect(policies.every((policy) => policy.agent_id === "codex" && policy.app_id === "workspace-shared")).toBe(true);
     const promotedRows = db.db.prepare(
       `SELECT source_memory_id, status
        FROM l2_candidate_pool
@@ -668,6 +664,7 @@ describe("MemoryService / evolution / policy induction", () => {
       query: "pytest workflow status candidate policy",
       answer: "run tests and keep the policy as a candidate"
     });
+    makeTraceEligibleForL2(db, complete.l1MemoryId);
     await service.feedback({
       sessionId: session.sessionId,
       l1MemoryId: complete.l1MemoryId,
@@ -773,6 +770,7 @@ describe("MemoryService / evolution / policy induction", () => {
         success: true
       }]
     });
+    makeTraceEligibleForL2(db, complete.l1MemoryId);
     await service.feedback({
       sessionId: session.sessionId,
       l1MemoryId: complete.l1MemoryId,
@@ -786,16 +784,20 @@ describe("MemoryService / evolution / policy induction", () => {
       await service.runWorkerOnce(50);
     }
 
-    const l2Call = l2Calls.find((call) => call.options.operation === "l2.induction.v4");
+    const l2Call = l2Calls.find((call) => call.options.operation === "l2.induction.v6");
     expect(l2Call).toBeTruthy();
-    expect(l2Calls.filter((call) => call.options.operation === "l2.induction.v4")).toHaveLength(1);
+    expect(l2Calls.filter((call) => call.options.operation === "l2.induction.v6")).toHaveLength(1);
     expect(l2Call!.options.thinkingMode).toBe("enabled");
+    expect(l2Call!.messages[0]!.content).toContain("META-POLICY");
     expect(l2Call!.messages[0]!.content).toContain("procedural policies");
     expect(l2Call!.messages[0]!.content).toContain("should_generate=false");
+    expect(l2Call!.messages[0]!.content).toContain("fewer future detours");
+    expect(l2Call!.messages[0]!.content).toContain("Skill is a callable SOP");
     expect(l2Call!.messages[0]!.content).toContain("Same fact, two framings");
     expect(l2Call!.messages[0]!.content).toContain("Do NOT express here (declarative");
     expect(l2Call!.messages[1]!.content).toContain("English");
     expect(l2Call!.messages[2]!.content).toContain("PATTERN_SIGNATURE");
+    expect(l2Call!.messages[2]!.content).toContain("RAW_TURNS");
     expect(l2Call!.messages[2]!.content).not.toContain("x".repeat(500));
 
     const row = db.db.prepare(
@@ -1037,12 +1039,12 @@ describe("MemoryService / evolution / policy induction", () => {
     makeTraceEligibleForL2(db, complete.l1MemoryId);
     for (let i = 0; i < 8; i += 1) {
       await service.runWorkerOnce(50);
-      if (calls.some((call) => call.options.operation === "l2.induction.v4")) {
+      if (calls.some((call) => call.options.operation === "l2.induction.v6")) {
         break;
       }
     }
 
-    expect(calls.filter((call) => call.options.operation === "l2.induction.v4")).toHaveLength(3);
+    expect(calls.filter((call) => call.options.operation === "l2.induction.v6")).toHaveLength(3);
     const l2Count = db.db.prepare(
       `SELECT COUNT(*) AS count
        FROM memories
@@ -1169,12 +1171,12 @@ describe("MemoryService / evolution / policy induction", () => {
     makeTraceEligibleForL2(db, complete.l1MemoryId);
     for (let i = 0; i < 8; i += 1) {
       await service.runWorkerOnce(50);
-      if (calls.some((call) => call.options.operation === "l2.induction.v4")) {
+      if (calls.some((call) => call.options.operation === "l2.induction.v6")) {
         break;
       }
     }
 
-    expect(calls.filter((call) => call.options.operation === "l2.induction.v4")).toHaveLength(3);
+    expect(calls.filter((call) => call.options.operation === "l2.induction.v6")).toHaveLength(3);
     const l2Rows = db.db.prepare(
       `SELECT id
        FROM memories

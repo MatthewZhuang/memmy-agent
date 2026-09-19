@@ -3,7 +3,6 @@ import {
   backpropagateTraces,
   combineRewardAxes,
   heuristicHumanScore,
-  signatureFromTrace,
   traceMetaFromMemory
 } from "../../algorithm/plugin-algorithms.js";
 import type { MemmyConfig } from "../../config/index.js";
@@ -63,7 +62,6 @@ export interface RewardPipelineDeps {
   decisionRepairTraceSources(memories: MemoryRow[]): DecisionRepairTraceSource[];
   synthesizeDecisionRepairDraft: SynthesizeDecisionRepairDraft;
   isTraceEligibleForL2(trace: TraceMeta): boolean;
-  recordCandidatePoolTrace(trace: TraceMeta, signature: string, at: string): void;
   repairEvidenceValueDiff(highValue: MemoryRow[], lowValue: MemoryRow[]): number;
 }
 
@@ -296,17 +294,7 @@ export class RewardPipeline {
         });
       }
       if (job.payload.downstreamScheduled !== true && savedTrace && this.deps.isTraceEligibleForL2(savedTrace)) {
-        this.deps.recordCandidatePoolTrace(savedTrace, signatureFromTrace(savedTrace), at);
         l2Eligible.push({ memory: saved, trace: savedTrace });
-        this.deps.enqueueJob({
-          jobType: "l2_association",
-          userId: saved.userId,
-          sessionId: saved.sessionId,
-          episodeId: trace.episodeId,
-          targetMemoryId: saved.id,
-          payload: { reason: "reward.updated" },
-          createdAt: at
-        });
       }
       if (this.deps.config.algorithm.feedback.valueDistributionRepairEnabled) {
         await this.maybeCreateValueDistributionRepair(saved, at);

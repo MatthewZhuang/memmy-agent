@@ -84,6 +84,7 @@ export interface PolicyMemoryMeta {
   confidence: number;
   status: "candidate" | "active" | "verification_required" | "quarantined" | "superseded" | "archived";
   experienceType: "success_pattern" | "repair_validated" | "failure_avoidance" | "repair_instruction" | "preference" | "verifier_feedback";
+  lessonKind?: "path_compression" | "error_correction" | "both";
   evidencePolarity: "positive" | "negative" | "mixed" | "neutral";
   skillEligible: boolean;
   signature: string;
@@ -959,19 +960,32 @@ export type PromptLanguage = "auto" | "zh" | "en";
 
 export const L2_INDUCTION_PROMPT = {
   id: "l2.induction",
-  version: 4,
+  version: 6,
   description:
-    "Distill an L2 policy (procedural sub-task strategy) from a cluster of similar L1 traces, with explicit boundaries against L3 world-model drift.",
+    "Distill an L2 policy (procedural sub-task strategy) from a cluster of similar raw turns, with explicit boundaries against Skill playbooks and L3 world-model drift.",
   system: `You induce reusable **procedural policies** from agent experience.
 
 A policy is a "how-to": "when you see condition X in the agent's state,
 do action Y, verify with Z, watch out for caveat W." It is **NOT** a
 description of the environment.
 
-Input TRACES: a list of { state_summary, action, outcome, utility } records
-that all share a similar state signature.
+Input RAW_TURNS: original user / assistant / tool traces (not compressed L1
+summaries). Success turns teach a shorter reusable path. Failure turns teach
+the correction that avoided the failed path. MODE=evolve means update the
+EXISTING_POLICY using only the new RAW_TURNS. If EXISTING_FAILURE_POLICY is
+present, merge its correction into the new positive policy; that failure L2
+will be archived after this generate.
 
 Produce ONE policy describing the action pattern. The policy must:
+- Improve future efficiency: the next time this local intent appears, take
+  a shorter successful path (path_compression) and/or avoid the failed
+  move (error_correction). Set lesson_kind to path_compression,
+  error_correction, or both.
+- Path compression means fewer future detours. Do NOT rewrite, compress,
+  or invent stored L1 rows. Evidence is original RAW_TURNS.
+- Stay an L2 local how-to for one intent cluster. Skill is a callable SOP
+  with tools and steps; do not write Skill procedure_json, retrieval blurb,
+  or a full playbook.
 - Name a TRIGGER recognizable from the agent's STATE — a condition the
   agent can detect at the moment of decision (an error code, a missing
   file, a request shape). NOT a fact about the environment in general.
@@ -980,10 +994,10 @@ Produce ONE policy describing the action pattern. The policy must:
 - Note at least one CAVEAT or failure mode observed in the traces — a
   step-level pitfall, NOT a generic environment taboo.
 - Generalize across the input traces, not restate one of them.
-- Return should_generate=false when the evidence has no reusable task action,
-  is only a user preference or factual statement, duplicates an existing rule,
-  or contains unresolved contradictory feedback. Do not invent a policy merely
-  to satisfy the output schema.
+- Return should_generate=false when the evidence cannot improve future
+  efficiency: no reusable task action, only a user preference or factual
+  statement, a duplicate of an existing rule, or unresolved contradictory
+  feedback. Do not invent a policy merely to satisfy the output schema.
 
 Source-specific entity boundary:
 - Names, locations, product names, file names, one-off requested targets,
@@ -1046,6 +1060,7 @@ libs by default":
 Return JSON:
 {
   "should_generate": true | false,
+  "lesson_kind": "path_compression" | "error_correction" | "both",
   "title": "short imperative title",
   "trigger": "state-level condition the agent can detect",
   "action": "templated step or step sequence",
@@ -3297,6 +3312,11 @@ export function policyMetaFromMemory(memory: MemoryRow): PolicyMemoryMeta | null
       "preference",
       "verifier_feedback"
     ]) ?? "success_pattern",
+    lessonKind: statusField(policy, "lesson_kind", [
+      "path_compression",
+      "error_correction",
+      "both"
+    ]),
     evidencePolarity: statusField(policy, "evidence_polarity", [
       "positive",
       "negative",

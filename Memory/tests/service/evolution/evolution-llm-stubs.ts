@@ -50,7 +50,11 @@ export function createCapturingL2Llm(calls: Array<{
           user: null
         } as unknown as T;
       }
-      if (options.operation === "l2.induction.v4") {
+      if (
+        options.operation === "l2.induction.v4"
+        || options.operation === "l2.induction.v5"
+        || options.operation === "l2.induction.v6"
+      ) {
         const configuredResponse = Array.isArray(l2InductionResponse)
           ? l2InductionResponse[
               Math.min(l2InductionCallIndex, Math.max(0, l2InductionResponse.length - 1))
@@ -58,6 +62,8 @@ export function createCapturingL2Llm(calls: Array<{
           : l2InductionResponse;
         l2InductionCallIndex += 1;
         return (configuredResponse ?? {
+          should_generate: true,
+          lesson_kind: "path_compression",
           title: "Use focused pytest migration checks",
           trigger: "pytest workflow fails around sqlite migration output",
           action: "Run the focused pytest workflow, inspect migration output, then retry the exact failing test.",
@@ -91,6 +97,26 @@ export function createCapturingL2Llm(calls: Array<{
           body: "Pytest sqlite migration environment.",
           confidence: 0.82
         }) as unknown as T;
+      }
+      if (options.operation === "failure.experience.sink.v5") {
+        const payload = JSON.parse(messages.find((message) => message.role === "user")?.content ?? "{}") as {
+          evidence_trace_ids?: string[];
+        };
+        const traceId = payload.evidence_trace_ids?.[0];
+        return {
+          title: "Avoid retrying the whole pytest suite after a focused failure",
+          trigger: "When a focused pytest path fails and the next move is a full-suite retry.",
+          procedure: "Inspect the failing test output, apply the local fix, and rerun only that test.",
+          verification: "Rerun the exact failing pytest and confirm it passes.",
+          boundary: "Use for focused pytest failures, not unrelated suite-wide flakes.",
+          experience_type: "failure_avoidance",
+          decision_guidance: {
+            prefer: ["Inspect the failing test output before retrying."],
+            avoid: ["Do not rerun the whole suite after a focused pytest failure."]
+          },
+          support_trace_ids: traceId ? [traceId] : [],
+          confidence: 0.82
+        } as unknown as T;
       }
       if (options.operation === "skill.crystallize") {
         return (skillCrystallizeResponse ?? {

@@ -1,5 +1,5 @@
-export const POLARDB_SCHEMA_VERSION = "runtime-v4";
-export const POLARDB_MIGRATION_ID = "004_source_turn_captures";
+export const POLARDB_SCHEMA_VERSION = "runtime-v5";
+export const POLARDB_MIGRATION_ID = "005_l2_clusters";
 
 export function polardbMigrationSql(): string[] {
   return [
@@ -274,6 +274,39 @@ export function polardbMigrationSql(): string[] {
     )`,
     `CREATE INDEX IF NOT EXISTS idx_skill_cluster_members_episode
       ON skill_cluster_members (episode_id, assigned_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS l2_clusters (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      intent_centroid_json JSONB,
+      task_centroid_json JSONB,
+      l2_memory_id TEXT,
+      seed_intent TEXT NOT NULL DEFAULT '',
+      seed_task_summary TEXT NOT NULL DEFAULT '',
+      processed_l1_ids_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      meta_policy_md TEXT NOT NULL DEFAULT '',
+      negative_l2_memory_id TEXT,
+      member_count INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    )`,
+    `ALTER TABLE l2_clusters ADD COLUMN IF NOT EXISTS processed_l1_ids_json JSONB NOT NULL DEFAULT '[]'::jsonb`,
+    `ALTER TABLE l2_clusters ADD COLUMN IF NOT EXISTS meta_policy_md TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE l2_clusters ADD COLUMN IF NOT EXISTS negative_l2_memory_id TEXT`,
+    `CREATE INDEX IF NOT EXISTS idx_l2_clusters_user
+      ON l2_clusters (user_id, updated_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_l2_clusters_l2
+      ON l2_clusters (l2_memory_id)`,
+    `CREATE TABLE IF NOT EXISTS l2_cluster_members (
+      cluster_id TEXT NOT NULL,
+      l1_memory_id TEXT NOT NULL,
+      assign_reason TEXT NOT NULL DEFAULT 'create',
+      intent_cosine DOUBLE PRECISION,
+      task_cosine DOUBLE PRECISION,
+      assigned_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY (cluster_id, l1_memory_id)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_l2_cluster_members_l1
+      ON l2_cluster_members (l1_memory_id, assigned_at DESC)`,
     `CREATE TABLE IF NOT EXISTS recall_events (
       id TEXT PRIMARY KEY,
       namespace_id TEXT,

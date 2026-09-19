@@ -64,6 +64,11 @@ export interface NegativeExperiencePipelineDeps {
   enqueueJob(input: EnqueueJobInput): EvolutionJobRecord;
   namespaceIdFromMemory(memory: MemoryRow): string;
   skillLlm: LlmClient;
+  onFailureL2?(input: {
+    memory: MemoryRow;
+    sourceTraceIds: string[];
+    at: string;
+  }): Promise<void>;
 }
 
 export class NegativeExperiencePipeline {
@@ -222,6 +227,11 @@ export class NegativeExperiencePipeline {
       createdAt: job.createdAt
     });
     const upsert = this.deps.upsertEvolutionMemory(memory);
+    await this.deps.onFailureL2?.({
+      memory: upsert.memory,
+      sourceTraceIds: mergedTraceIds,
+      at: job.createdAt
+    });
     this.deps.repos.runtime.appendEpisodeDerivedMemory(
       draft.episode.id,
       "L2",

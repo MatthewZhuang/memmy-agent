@@ -83,6 +83,8 @@ describe("repository sqlite schema contract", () => {
         "skill_trials",
         "skill_clusters",
         "skill_cluster_members",
+        "l2_clusters",
+        "l2_cluster_members",
         "recall_events",
         "memory_change_log",
         "idempotency_keys",

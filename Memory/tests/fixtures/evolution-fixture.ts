@@ -1,8 +1,19 @@
+import { createHash } from "node:crypto";
 import {
   MemoryDb,
   MemoryService
 } from "../../src/index.js";
 import { Repositories } from "../../src/storage/repositories.js";
+
+export function testClusterVector(text: string, dim = 32): number[] {
+  const digest = createHash("sha256").update(text.trim().toLowerCase()).digest();
+  const vec = Array.from({ length: dim }, () => 0);
+  vec[digest[0]! % dim] = 1;
+  const second = digest[1]! % dim;
+  vec[second] = vec[second] === 1 ? 1 : 0.5;
+  const norm = Math.sqrt(vec.reduce((sum, value) => sum + value * value, 0));
+  return vec.map((value) => value / norm);
+}
 
 export function upsertMemoryVectorForTest(
   db: MemoryDb,
@@ -32,16 +43,27 @@ export function makeTraceEligibleForL2(db: MemoryDb, memoryId: string): void {
       trace?: Record<string, unknown>;
       turn_role?: string;
       intent?: string;
+      task_summary?: string;
+      intent_vec?: number[];
+      task_vec?: number[];
       policy_eligible?: boolean;
     };
   };
   if (!properties.internal_info?.trace) {
     throw new Error(`trace metadata not found: ${memoryId}`);
   }
+  const signature = typeof properties.internal_info.trace.signature === "string"
+    ? properties.internal_info.trace.signature
+    : "";
+  const intent = signature ? `local step — ${signature}` : "reusable local work step";
+  const taskSummary = signature ? `task — ${signature}` : "reusable local work task";
   properties.internal_info.trace.value = 1;
   properties.internal_info.trace.priority = 1;
   properties.internal_info.turn_role = "local_subproblem";
-  properties.internal_info.intent = "reusable local work step";
+  properties.internal_info.intent = intent;
+  properties.internal_info.task_summary = taskSummary;
+  properties.internal_info.intent_vec = testClusterVector(intent);
+  properties.internal_info.task_vec = testClusterVector(taskSummary);
   properties.internal_info.policy_eligible = true;
   db.db.prepare(
     `UPDATE memories
@@ -51,6 +73,80 @@ export function makeTraceEligibleForL2(db: MemoryDb, memoryId: string): void {
   ).run(JSON.stringify(properties), new Date().toISOString(), memoryId);
   upsertMemoryVectorForTest(db, memoryId, "vec_summary", [1, 0, 0]);
   upsertMemoryVectorForTest(db, memoryId, "vec_action", [1, 0, 0]);
+}
+
+export function setL2ClusterFieldsForTest(
+  db: MemoryDb,
+  memoryId: string,
+  input: {
+    intent: string;
+    taskSummary: string;
+    intentVec: number[];
+    taskVec: number[];
+    turnRole?: "local_subproblem" | "continuation";
+    value?: number;
+  }
+): void {
+  makeTraceEligibleForL2(db, memoryId);
+  const row = db.db.prepare(
+    `SELECT properties_json
+     FROM memories
+     WHERE id = ?`
+  ).get(memoryId) as { properties_json: string } | undefined;
+  if (!row) {
+    throw new Error(`memory not found: ${memoryId}`);
+  }
+  const properties = JSON.parse(row.properties_json) as {
+    internal_info?: Record<string, unknown>;
+  };
+  if (!properties.internal_info) {
+    throw new Error(`internal_info not found: ${memoryId}`);
+  }
+  const turnRole = input.turnRole ?? "local_subproblem";
+  properties.internal_info.turn_role = turnRole;
+  if (typeof input.value === "number") {
+    const trace = properties.internal_info.trace && typeof properties.internal_info.trace === "object"
+      ? properties.internal_info.trace as Record<string, unknown>
+      : undefined;
+    if (trace) trace.value = input.value;
+  }
+  properties.internal_info.intent = turnRole === "continuation" ? "" : input.intent;
+  properties.internal_info.task_summary = input.taskSummary;
+  properties.internal_info.intent_vec = input.intentVec;
+  properties.internal_info.task_vec = input.taskVec;
+  properties.internal_info.policy_eligible = turnRole === "local_subproblem";
+  delete properties.internal_info.l2_cluster_id;
+  db.db.prepare(`DELETE FROM l2_cluster_members WHERE l1_memory_id = ?`).run(memoryId);
+  db.db.prepare(
+    `UPDATE memories
+     SET properties_json = ?,
+         updated_at = ?
+     WHERE id = ?`
+  ).run(JSON.stringify(properties), new Date().toISOString(), memoryId);
+}
+
+export function setTraceValueForTest(db: MemoryDb, memoryId: string, value: number): void {
+  const row = db.db.prepare(
+    `SELECT properties_json
+     FROM memories
+     WHERE id = ?`
+  ).get(memoryId) as { properties_json: string } | undefined;
+  if (!row) {
+    throw new Error(`memory not found: ${memoryId}`);
+  }
+  const properties = JSON.parse(row.properties_json) as {
+    internal_info?: { trace?: Record<string, unknown> };
+  };
+  if (!properties.internal_info?.trace) {
+    throw new Error(`trace metadata not found: ${memoryId}`);
+  }
+  properties.internal_info.trace.value = value;
+  db.db.prepare(
+    `UPDATE memories
+     SET properties_json = ?,
+         updated_at = ?
+     WHERE id = ?`
+  ).run(JSON.stringify(properties), new Date().toISOString(), memoryId);
 }
 
 export function insertActivePolicyMemory(db: MemoryDb, input: {
@@ -384,6 +480,22 @@ export async function addPositiveFeedbackForTurn(
   });
 }
 
+export async function addNegativeFeedbackForTurn(
+  service: MemoryService,
+  sessionId: string,
+  turn: { episodeId: string; l1MemoryId: string }
+): Promise<void> {
+  await service.feedback({
+    sessionId,
+    episodeId: turn.episodeId,
+    l1MemoryId: turn.l1MemoryId,
+    channel: "explicit",
+    polarity: "negative",
+    magnitude: 1,
+    rationale: "rejected"
+  });
+}
+
 export function setTraceSignatureAndVectorForTest(
   db: MemoryDb,
   memoryId: string,
@@ -401,14 +513,28 @@ export function setTraceSignatureAndVectorForTest(
   const properties = JSON.parse(row.properties_json) as {
     internal_info?: {
       trace?: Record<string, unknown>;
+      turn_role?: string;
+      intent?: string;
+      task_summary?: string;
+      intent_vec?: number[];
+      task_vec?: number[];
+      policy_eligible?: boolean;
     };
   };
   if (!properties.internal_info?.trace) {
     throw new Error(`trace metadata not found: ${memoryId}`);
   }
+  const intent = `local step — ${signature}`;
+  const taskSummary = `task — ${signature}`;
   properties.internal_info.trace.signature = signature;
   properties.internal_info.trace.value = 1;
   properties.internal_info.trace.priority = 1;
+  properties.internal_info.turn_role = "local_subproblem";
+  properties.internal_info.intent = intent;
+  properties.internal_info.task_summary = taskSummary;
+  properties.internal_info.intent_vec = testClusterVector(intent);
+  properties.internal_info.task_vec = testClusterVector(taskSummary);
+  properties.internal_info.policy_eligible = true;
   db.db.prepare(
     `UPDATE memories
      SET properties_json = ?,

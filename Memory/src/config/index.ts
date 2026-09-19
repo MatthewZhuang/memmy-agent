@@ -194,6 +194,9 @@ export interface AlgorithmConfig {
     traceCharCap: number;
     tauSoftmax: number;
     gainEmaAlpha: number;
+    clusterIntentJoin: number;
+    clusterIntentGrayMin: number;
+    clusterTaskGray: number;
   };
   l3Abstraction: {
     useLlm: boolean;
@@ -442,7 +445,10 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
       archiveGain: -0.05,
       traceCharCap: 3_000,
       tauSoftmax: 0.5,
-      gainEmaAlpha: 0.4
+      gainEmaAlpha: 0.4,
+      clusterIntentJoin: 0.6,
+      clusterIntentGrayMin: 0.5,
+      clusterTaskGray: 0.7
     },
     l3Abstraction: {
       useLlm: true,
@@ -1198,7 +1204,10 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
       archiveGain: numberValue(l2.archiveGain, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.archiveGain),
       traceCharCap: numberValue(l2.traceCharCap, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.traceCharCap),
       tauSoftmax: numberValue(l2.tauSoftmax, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.tauSoftmax),
-      gainEmaAlpha: numberValue(l2.gainEmaAlpha, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.gainEmaAlpha)
+      gainEmaAlpha: numberValue(l2.gainEmaAlpha, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.gainEmaAlpha),
+      clusterIntentJoin: numberValue(l2.clusterIntentJoin, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.clusterIntentJoin),
+      clusterIntentGrayMin: numberValue(l2.clusterIntentGrayMin, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.clusterIntentGrayMin),
+      clusterTaskGray: numberValue(l2.clusterTaskGray, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.clusterTaskGray)
     },
     l3Abstraction: {
       useLlm: booleanValue(l3.useLlm, DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction.useLlm),

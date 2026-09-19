@@ -32,7 +32,17 @@ describe("MemoryService / evolution / orchestration", () => {
   it("adds feedback and evolves L2/L3/Skill memories with the worker", async () => {
     const { db, service } = createTestService({
       skillLlm: createNoToolSkillLlm(),
-      embedder: createCapturingEmbedder([])
+      embedder: createCapturingEmbedder([]),
+      config: {
+        ...DEFAULT_MEMMY_CONFIG,
+        algorithm: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          l2Induction: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+            minEpisodesForActivation: 2
+          }
+        }
+      }
     });
     const session = service.openSession({
       namespace: {
@@ -128,12 +138,13 @@ describe("MemoryService / evolution / orchestration", () => {
     expect(l2Internal.boundary).toBeTruthy();
     expect(l2Internal.source_l1_memory_ids?.length).toBeGreaterThan(0);
     expect(l2Internal.policy_confidence).toBeGreaterThan(0);
-    const associationStatsUpdates = db.db.prepare(
+    const policyStatsUpdates = db.db.prepare(
       `SELECT COUNT(*) AS count
        FROM memory_change_log
-       WHERE source = 'worker.l2_association.v7'`
+       WHERE source IN ('worker.l2_association.v7', 'worker.l2_induction.v7')
+         AND kind = 'policy'`
     ).get() as { count: number };
-    expect(associationStatsUpdates.count).toBeGreaterThan(0);
+    expect(policyStatsUpdates.count).toBeGreaterThan(0);
     const workerMemoryChanges = db.db.prepare(
       `SELECT namespace_id, kind, op, entity_id
        FROM memory_change_log
@@ -562,11 +573,23 @@ describe("MemoryService / evolution / orchestration", () => {
     await service.runWorkerOnce(20);
     await service.runWorkerOnce(20);
     makeTraceEligibleForL2(db, second.l1MemoryId);
+    db.db.prepare(`UPDATE evolution_jobs SET status = 'succeeded'`).run();
+    const associationAt = new Date().toISOString();
     db.db.prepare(
-      `UPDATE evolution_jobs
-       SET status = 'succeeded'
-       WHERE NOT (target_memory_id = ? AND job_type = 'l2_association')`
-    ).run(second.l1MemoryId);
+      `INSERT INTO evolution_jobs (
+         id, job_type, status, user_id, session_id, episode_id, target_memory_id,
+         payload_json, attempts, max_attempts, created_at, updated_at
+       ) VALUES (?, 'l2_association', 'queued', ?, ?, ?, ?, '{}', 0, 3, ?, ?)`
+    ).run(
+      "job_l2_activation_association",
+      "user-l2-activation-downstream",
+      session.sessionId,
+      second.episodeId,
+      second.l1MemoryId,
+      associationAt,
+      associationAt
+    );
+    await service.runWorkerOnce(20);
     await service.runWorkerOnce(20);
 
     const policyRow = db.db.prepare(
@@ -606,7 +629,7 @@ describe("MemoryService / evolution / orchestration", () => {
     expect(skillJob?.target_memory_id).toBe("policy_l2_activation_downstream");
     expect(JSON.parse(skillJob!.payload_json)).toMatchObject({
       reason: "l2.policy.updated",
-      previousStatus: "active",
+      previousStatus: "candidate",
       status: "active"
     });
 

@@ -42,7 +42,7 @@ describe("turn memory capture schema", () => {
     });
   });
 
-  it("uses turn_role for new L2 eligibility and policy_eligible only as a legacy fallback", () => {
+  it("only treats local_subproblem turns with intent as L2-eligible", () => {
     expect(isInternalInfoEligibleForPositiveL2({
       turn_role: "local_subproblem",
       intent: "消除查询中的N+1"
@@ -54,9 +54,10 @@ describe("turn memory capture schema", () => {
     })).toBe(false);
     expect(isInternalInfoEligibleForPositiveL2({
       policy_eligible: true
-    })).toBe(true);
+    })).toBe(false);
     expect(isInternalInfoEligibleForPositiveL2({
-      policy_eligible: false
+      turn_role: "local_subproblem",
+      intent: ""
     })).toBe(false);
   });
 

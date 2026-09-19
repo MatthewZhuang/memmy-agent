@@ -8,8 +8,8 @@ import {
 describe("repository PolarDB schema contract", () => {
   it("publishes migration SQL for the memories table and runtime support tables", () => {
     const sql = polardbMigrationSql().join("\n");
-    expect(POLARDB_MIGRATION_ID).toBe("004_source_turn_captures");
-    expect(POLARDB_SCHEMA_VERSION).toBe("runtime-v4");
+    expect(POLARDB_MIGRATION_ID).toBe("005_l2_clusters");
+    expect(POLARDB_SCHEMA_VERSION).toBe("runtime-v5");
     expect(sql).toContain("CREATE EXTENSION IF NOT EXISTS vector");
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS memories");
     expect(sql).toContain("properties JSONB");
@@ -42,6 +42,10 @@ describe("repository PolarDB schema contract", () => {
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS idempotency_keys");
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS memory_capture_claims");
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS source_turn_captures");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS l2_clusters");
+    expect(sql).toContain("meta_policy_md");
+    expect(sql).toContain("negative_l2_memory_id");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS l2_cluster_members");
     expect(sql).toContain("PRIMARY KEY (user_id, source, profile_id, namespace_key, conversation_id, turn_id)");
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS evolution_jobs");
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS embedding_retry_queue");

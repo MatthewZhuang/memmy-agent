@@ -126,7 +126,8 @@ export class EvolutionJobProcessor {
       enqueueJob: deps.enqueueJob,
       enqueueChange: deps.repos.runtime.appendChange.bind(deps.repos.runtime),
       namespaceIdFromMemory: deps.namespaceIdFromMemory,
-      onSkillRewardDrift: this.skill.applySkillRewardDriftForPolicy.bind(this.skill)
+      onSkillRewardDrift: this.skill.applySkillRewardDriftForPolicy.bind(this.skill),
+      queryVector: (query) => owner.deps.queryVector?.(query) ?? Promise.resolve(undefined)
     });
     this.l3WorldModel = new L3WorldModelTraceFieldPipeline({
       repos: deps.repos,
@@ -165,7 +166,6 @@ export class EvolutionJobProcessor {
       decisionRepairTraceSources: deps.decisionRepairTraceSources,
       synthesizeDecisionRepairDraft: deps.synthesizeDecisionRepairDraft,
       isTraceEligibleForL2: this.policy.isTraceEligibleForL2.bind(this.policy),
-      recordCandidatePoolTrace: this.policy.recordCandidatePoolTrace.bind(this.policy),
       repairEvidenceValueDiff: deps.repairEvidenceValueDiff
     });
     this.negativeExperience = new NegativeExperiencePipeline({
@@ -175,7 +175,8 @@ export class EvolutionJobProcessor {
       buildMemory: deps.buildMemory,
       upsertEvolutionMemory: this.upsertEvolutionMemory.bind(this),
       enqueueJob: deps.enqueueJob,
-      namespaceIdFromMemory: deps.namespaceIdFromMemory
+      namespaceIdFromMemory: deps.namespaceIdFromMemory,
+      onFailureL2: (input) => this.policy.bindFailureL2(input.memory, input.sourceTraceIds, input.at)
     });
   }
 

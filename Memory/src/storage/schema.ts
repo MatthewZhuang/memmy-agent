@@ -1,8 +1,8 @@
 import type Database from "better-sqlite3";
 import { memoryCaptureQaHash, normalizeMemoryCaptureSource } from "../utils/memory-capture-claim.js";
 
-export const SCHEMA_VERSION = 8;
-export const SCHEMA_MIGRATION_ID = "008_source_turn_captures";
+export const SCHEMA_VERSION = 9;
+export const SCHEMA_MIGRATION_ID = "009_l2_clusters";
 const API_LOG_SOURCE_AGENT_MIGRATION_FROM_VERSION = 2;
 const PROCESSING_TAGS = new Set([
   "摘要排队中",
@@ -432,6 +432,38 @@ const statements = [
   `CREATE INDEX IF NOT EXISTS idx_skill_cluster_members_episode
     ON skill_cluster_members (episode_id, assigned_at DESC)`,
 
+  `CREATE TABLE IF NOT EXISTS l2_clusters (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    intent_centroid_json TEXT,
+    task_centroid_json TEXT,
+    l2_memory_id TEXT,
+    seed_intent TEXT NOT NULL DEFAULT '',
+    seed_task_summary TEXT NOT NULL DEFAULT '',
+    processed_l1_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(processed_l1_ids_json)),
+    meta_policy_md TEXT NOT NULL DEFAULT '',
+    negative_l2_memory_id TEXT,
+    member_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_l2_clusters_user
+    ON l2_clusters (user_id, updated_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_l2_clusters_l2
+    ON l2_clusters (l2_memory_id)`,
+
+  `CREATE TABLE IF NOT EXISTS l2_cluster_members (
+    cluster_id TEXT NOT NULL,
+    l1_memory_id TEXT NOT NULL,
+    assign_reason TEXT NOT NULL DEFAULT 'create',
+    intent_cosine REAL,
+    task_cosine REAL,
+    assigned_at TEXT NOT NULL,
+    PRIMARY KEY (cluster_id, l1_memory_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_l2_cluster_members_l1
+    ON l2_cluster_members (l1_memory_id, assigned_at DESC)`,
+
   `CREATE TABLE IF NOT EXISTS recall_events (
     id TEXT PRIMARY KEY,
     namespace_id TEXT,
@@ -673,7 +705,7 @@ export function migrate(db: Database.Database): void {
   const hasMemories = tableExists(db, "memories");
   const version = currentSchemaVersion(db);
 
-  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7) {
+  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8) {
     throw new Error(
       `Unsupported memory database schema version ${version}; the database was left unchanged`
     );
@@ -698,6 +730,9 @@ export function migrate(db: Database.Database): void {
       for (const statement of statements) {
         db.prepare(statement).run();
       }
+      addColumnIfMissing(db, "l2_clusters", "processed_l1_ids_json", "TEXT NOT NULL DEFAULT '[]'");
+      addColumnIfMissing(db, "l2_clusters", "meta_policy_md", "TEXT NOT NULL DEFAULT ''");
+      addColumnIfMissing(db, "l2_clusters", "negative_l2_memory_id", "TEXT");
       if (version > 0 && version < 5) {
         addColumnIfMissing(db, "recall_events", "query_id", "TEXT");
         addColumnIfMissing(db, "recall_events", "user_memory_candidate_ids_json", "TEXT NOT NULL DEFAULT '[]'");

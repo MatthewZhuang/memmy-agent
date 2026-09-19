@@ -72,6 +72,8 @@ const BUNDLE_TABLES = [
   "l2_candidate_pool",
   "trace_policy_links",
   "skill_trials",
+  "l2_clusters",
+  "l2_cluster_members",
   "recall_events",
   "api_logs",
   "memory_change_log",
@@ -192,6 +194,31 @@ export interface SkillClusterMemberRecord {
   episodeId: string;
   outcome: "success" | "failure" | "unknown";
   rTask?: number;
+  assignedAt: string;
+}
+
+export interface L2ClusterRecord {
+  id: string;
+  userId: string;
+  intentCentroid: number[] | null;
+  taskCentroid: number[] | null;
+  l2MemoryId?: string;
+  seedIntent: string;
+  seedTaskSummary: string;
+  processedL1Ids: string[];
+  metaPolicyMd: string;
+  negativeL2MemoryId?: string;
+  memberCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface L2ClusterMemberRecord {
+  clusterId: string;
+  l1MemoryId: string;
+  assignReason: string;
+  intentCosine?: number;
+  taskCosine?: number;
   assignedAt: string;
 }
 
@@ -2747,6 +2774,146 @@ export class RuntimeRepository {
       )
       .all(clusterId) as SqlSkillClusterMemberRow[];
     return rows.map(skillClusterMemberFromSql);
+  }
+
+  insertL2Cluster(cluster: L2ClusterRecord): L2ClusterRecord {
+    this.db
+      .prepare(
+        `INSERT INTO l2_clusters (
+          id, user_id, intent_centroid_json, task_centroid_json, l2_memory_id,
+          seed_intent, seed_task_summary, processed_l1_ids_json, meta_policy_md,
+          negative_l2_memory_id, member_count, created_at, updated_at
+        ) VALUES (
+          @id, @userId, @intentCentroidJson, @taskCentroidJson, @l2MemoryId,
+          @seedIntent, @seedTaskSummary, @processedL1IdsJson, @metaPolicyMd,
+          @negativeL2MemoryId, @memberCount, @createdAt, @updatedAt
+        )`
+      )
+      .run({
+        id: cluster.id,
+        userId: cluster.userId,
+        intentCentroidJson: cluster.intentCentroid ? toJson(cluster.intentCentroid) : null,
+        taskCentroidJson: cluster.taskCentroid ? toJson(cluster.taskCentroid) : null,
+        l2MemoryId: cluster.l2MemoryId ?? null,
+        seedIntent: cluster.seedIntent,
+        seedTaskSummary: cluster.seedTaskSummary,
+        processedL1IdsJson: toJson(cluster.processedL1Ids ?? []),
+        metaPolicyMd: cluster.metaPolicyMd ?? "",
+        negativeL2MemoryId: cluster.negativeL2MemoryId ?? null,
+        memberCount: cluster.memberCount,
+        createdAt: cluster.createdAt,
+        updatedAt: cluster.updatedAt
+      });
+    return cluster;
+  }
+
+  updateL2Cluster(cluster: L2ClusterRecord): L2ClusterRecord {
+    this.db
+      .prepare(
+        `UPDATE l2_clusters
+         SET intent_centroid_json = @intentCentroidJson,
+             task_centroid_json = @taskCentroidJson,
+             l2_memory_id = @l2MemoryId,
+             seed_intent = @seedIntent,
+             seed_task_summary = @seedTaskSummary,
+             processed_l1_ids_json = @processedL1IdsJson,
+             meta_policy_md = @metaPolicyMd,
+             negative_l2_memory_id = @negativeL2MemoryId,
+             member_count = @memberCount,
+             updated_at = @updatedAt
+         WHERE id = @id`
+      )
+      .run({
+        id: cluster.id,
+        intentCentroidJson: cluster.intentCentroid ? toJson(cluster.intentCentroid) : null,
+        taskCentroidJson: cluster.taskCentroid ? toJson(cluster.taskCentroid) : null,
+        l2MemoryId: cluster.l2MemoryId ?? null,
+        seedIntent: cluster.seedIntent,
+        seedTaskSummary: cluster.seedTaskSummary,
+        processedL1IdsJson: toJson(cluster.processedL1Ids ?? []),
+        metaPolicyMd: cluster.metaPolicyMd ?? "",
+        negativeL2MemoryId: cluster.negativeL2MemoryId ?? null,
+        memberCount: cluster.memberCount,
+        updatedAt: cluster.updatedAt
+      });
+    return cluster;
+  }
+
+  getL2Cluster(id: string): L2ClusterRecord | undefined {
+    const row = this.db
+      .prepare(`SELECT * FROM l2_clusters WHERE id = ?`)
+      .get(id) as SqlL2ClusterRow | undefined;
+    return row ? l2ClusterFromSql(row) : undefined;
+  }
+
+  getL2ClusterForL1(l1MemoryId: string): L2ClusterRecord | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT c.*
+         FROM l2_cluster_members m
+         JOIN l2_clusters c ON c.id = m.cluster_id
+         WHERE m.l1_memory_id = ?
+         ORDER BY m.assigned_at DESC
+         LIMIT 1`
+      )
+      .get(l1MemoryId) as SqlL2ClusterRow | undefined;
+    return row ? l2ClusterFromSql(row) : undefined;
+  }
+
+  listL2ClustersByUser(userId: string, limit = 200): L2ClusterRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT *
+         FROM l2_clusters
+         WHERE user_id = ?
+         ORDER BY updated_at DESC
+         LIMIT ?`
+      )
+      .all(userId, limit) as SqlL2ClusterRow[];
+    return rows.map(l2ClusterFromSql);
+  }
+
+  upsertL2ClusterMember(member: L2ClusterMemberRecord): L2ClusterMemberRecord {
+    this.db
+      .prepare(
+        `INSERT INTO l2_cluster_members (
+          cluster_id, l1_memory_id, assign_reason, intent_cosine, task_cosine, assigned_at
+        ) VALUES (
+          @clusterId, @l1MemoryId, @assignReason, @intentCosine, @taskCosine, @assignedAt
+        )
+        ON CONFLICT(cluster_id, l1_memory_id) DO UPDATE SET
+          assign_reason = excluded.assign_reason,
+          intent_cosine = excluded.intent_cosine,
+          task_cosine = excluded.task_cosine,
+          assigned_at = excluded.assigned_at`
+      )
+      .run({
+        clusterId: member.clusterId,
+        l1MemoryId: member.l1MemoryId,
+        assignReason: member.assignReason,
+        intentCosine: member.intentCosine ?? null,
+        taskCosine: member.taskCosine ?? null,
+        assignedAt: member.assignedAt
+      });
+    return member;
+  }
+
+  listL2ClusterMembers(clusterId: string): L2ClusterMemberRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT *
+         FROM l2_cluster_members
+         WHERE cluster_id = ?
+         ORDER BY assigned_at DESC`
+      )
+      .all(clusterId) as SqlL2ClusterMemberRow[];
+    return rows.map(l2ClusterMemberFromSql);
+  }
+
+  deletePendingCandidatePoolForSource(sourceMemoryId: string): void {
+    this.db
+      .prepare(`DELETE FROM l2_candidate_pool WHERE source_memory_id = ? AND status = 'pending'`)
+      .run(sourceMemoryId);
   }
 
   insertFeedback(feedback: FeedbackRecord): FeedbackRecord {
@@ -6806,6 +6973,67 @@ function skillClusterMemberFromSql(row: SqlSkillClusterMemberRow): SkillClusterM
     rTask: typeof row.r_task === "number" ? row.r_task : undefined,
     assignedAt: row.assigned_at
   };
+}
+
+interface SqlL2ClusterRow {
+  id: string;
+  user_id: string;
+  intent_centroid_json: string | null;
+  task_centroid_json: string | null;
+  l2_memory_id: string | null;
+  seed_intent: string;
+  seed_task_summary: string;
+  processed_l1_ids_json: string | null;
+  meta_policy_md: string | null;
+  negative_l2_memory_id: string | null;
+  member_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+function l2ClusterFromSql(row: SqlL2ClusterRow): L2ClusterRecord {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    intentCentroid: finiteNumberArray(row.intent_centroid_json),
+    taskCentroid: finiteNumberArray(row.task_centroid_json),
+    l2MemoryId: row.l2_memory_id ?? undefined,
+    seedIntent: row.seed_intent ?? "",
+    seedTaskSummary: row.seed_task_summary ?? "",
+    processedL1Ids: asStringArray(parseJson(row.processed_l1_ids_json, [])),
+    metaPolicyMd: row.meta_policy_md ?? "",
+    negativeL2MemoryId: row.negative_l2_memory_id ?? undefined,
+    memberCount: row.member_count ?? 0,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+interface SqlL2ClusterMemberRow {
+  cluster_id: string;
+  l1_memory_id: string;
+  assign_reason: string;
+  intent_cosine: number | null;
+  task_cosine: number | null;
+  assigned_at: string;
+}
+
+function l2ClusterMemberFromSql(row: SqlL2ClusterMemberRow): L2ClusterMemberRecord {
+  return {
+    clusterId: row.cluster_id,
+    l1MemoryId: row.l1_memory_id,
+    assignReason: row.assign_reason,
+    intentCosine: typeof row.intent_cosine === "number" ? row.intent_cosine : undefined,
+    taskCosine: typeof row.task_cosine === "number" ? row.task_cosine : undefined,
+    assignedAt: row.assigned_at
+  };
+}
+
+function finiteNumberArray(json: string | null): number[] | null {
+  const parsed = parseJson<number[] | null>(json, null);
+  if (!Array.isArray(parsed) || parsed.length === 0) return null;
+  const numbers = parsed.filter((item): item is number => typeof item === "number" && Number.isFinite(item));
+  return numbers.length === parsed.length ? numbers : null;
 }
 
 interface SqlRawTurnRow {

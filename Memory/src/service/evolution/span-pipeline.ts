@@ -1583,11 +1583,8 @@ export function resolveCaptureTurnRole(input: {
 }
 
 export function isInternalInfoEligibleForPositiveL2(info: Record<string, unknown>): boolean {
-  const turnRole = info.turn_role;
   const intent = typeof info.intent === "string" ? info.intent.trim() : "";
-  if (turnRole === "local_subproblem") return intent.length > 0;
-  if (turnRole === "continuation") return false;
-  return info.policy_eligible !== false;
+  return info.turn_role === "local_subproblem" && intent.length > 0;
 }
 
 function comparableCaptureText(value: string): string {
