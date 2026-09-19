@@ -74,16 +74,25 @@ export function admitL2PolicyDraft(input: {
   positiveCount: number;
   negativeCount: number;
 }): { ok: true } | { ok: false; reason: string } {
-  if (input.positiveCount <= 0) {
+  if (input.positiveCount <= 0 && input.negativeCount <= 0) {
     return { ok: false, reason: "admission-declined:no-positive-anchor" };
   }
-  if (!input.trigger.trim() || !input.procedure.trim()) {
+  if (!input.trigger.trim()) {
+    return { ok: false, reason: "admission-declined:missing-procedure" };
+  }
+  const corrections = [...(input.caveats ?? []), ...(input.exclusions ?? [])].filter((item) => item.trim());
+  if (input.positiveCount <= 0) {
+    if (!input.procedure.trim() && corrections.length === 0) {
+      return { ok: false, reason: "admission-declined:missing-error-correction" };
+    }
+    return { ok: true };
+  }
+  if (!input.procedure.trim()) {
     return { ok: false, reason: "admission-declined:missing-procedure" };
   }
   if (input.procedure.trim().length < 20 || !ACTIONABLE_RE.test(input.procedure)) {
     return { ok: false, reason: "admission-declined:no-efficiency-gain" };
   }
-  const corrections = [...(input.caveats ?? []), ...(input.exclusions ?? [])].filter((item) => item.trim());
   if (input.negativeCount > 0 && corrections.length === 0 && input.lessonKind === "path_compression") {
     return { ok: false, reason: "admission-declined:missing-error-correction" };
   }
@@ -120,7 +129,8 @@ export function polarityForL2Value(value: number, minPositive: number): L2Eviden
 }
 
 export function inferL2LessonKind(positiveCount: number, negativeCount: number): L2LessonKind | null {
-  if (positiveCount <= 0) return null;
+  if (positiveCount <= 0 && negativeCount <= 0) return null;
+  if (positiveCount <= 0) return "error_correction";
   return negativeCount > 0 ? "both" : "path_compression";
 }
 
@@ -148,8 +158,10 @@ export function decideL2EvolveBranch(input: {
   positiveCount: number;
   newPositiveCount: number;
   newNegativeCount: number;
+  negativeCount?: number;
 }): L2EvolveDecision {
-  if (input.positiveCount <= 0) return { action: "skip_no_positive" };
+  const negativeCount = input.negativeCount ?? input.newNegativeCount;
+  if (input.positiveCount <= 0 && negativeCount <= 0) return { action: "skip_no_positive" };
   if (!input.hasPolicy) return { action: "create" };
   if (input.newPositiveCount <= 0 && input.newNegativeCount <= 0) return { action: "link_only" };
   const incrementKind: L2LessonKind = input.newPositiveCount > 0 && input.newNegativeCount > 0

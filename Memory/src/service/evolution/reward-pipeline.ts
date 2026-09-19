@@ -62,6 +62,7 @@ export interface RewardPipelineDeps {
   decisionRepairTraceSources(memories: MemoryRow[]): DecisionRepairTraceSource[];
   synthesizeDecisionRepairDraft: SynthesizeDecisionRepairDraft;
   isTraceEligibleForL2(trace: TraceMeta): boolean;
+  isTraceNegativeForL2(trace: TraceMeta): boolean;
   repairEvidenceValueDiff(highValue: MemoryRow[], lowValue: MemoryRow[]): number;
 }
 
@@ -195,31 +196,6 @@ export class RewardPipeline {
           source: "worker.reward.backprop.v7",
           createdAt: savedEpisode.updatedAt
         });
-        if (
-          this.deps.config.algorithm.negativeExperience.enabled
-          && feedback.rHuman <= this.deps.config.algorithm.negativeExperience.failureRTaskThreshold
-        ) {
-          const feedbackId = job.payload.polarity === "negative" && typeof job.payload.feedbackId === "string"
-            ? job.payload.feedbackId
-            : undefined;
-          const repairId = feedbackId && typeof job.payload.repairId === "string"
-            ? job.payload.repairId
-            : undefined;
-          this.deps.enqueueJob({
-            jobType: "negative_experience",
-            userId: savedEpisode.userId,
-            sessionId: savedEpisode.sessionId,
-            episodeId: savedEpisode.id,
-            payload: {
-              source: feedbackId ? "negative_feedback" : "episode_reward",
-              sourceEventId: feedbackId ?? savedEpisode.id,
-              rewardReason: feedback.reason,
-              ...(feedbackId ? { feedbackId } : {}),
-              ...(repairId ? { repairId } : {})
-            },
-            createdAt: savedEpisode.updatedAt
-          });
-        }
       }
       this.deps.resolvePendingSkillTrialsForReward({
         userId: source.userId,
@@ -293,7 +269,11 @@ export class RewardPipeline {
           createdAt: at
         });
       }
-      if (job.payload.downstreamScheduled !== true && savedTrace && this.deps.isTraceEligibleForL2(savedTrace)) {
+      if (
+        job.payload.downstreamScheduled !== true
+        && savedTrace
+        && (this.deps.isTraceEligibleForL2(savedTrace) || this.deps.isTraceNegativeForL2(savedTrace))
+      ) {
         l2Eligible.push({ memory: saved, trace: savedTrace });
       }
       if (this.deps.config.algorithm.feedback.valueDistributionRepairEnabled) {

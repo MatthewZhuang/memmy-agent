@@ -13,7 +13,7 @@ import { clip } from "../../utils/text.js";
 import { formatZonedTime } from "../../utils/time.js";
 import type { EnqueueJobInput } from "../worker/job-handlers.js";
 
-export const SPAN_BIG_TURN_ENABLED = true;
+export const SPAN_BIG_TURN_ENABLED = false;
 export const SPAN_BIG_TURN_MIN_TOOL_CALLS = 11;
 
 const SPAN_BIG_TURN_OPERATION = "span.big_turn.v1";

@@ -98,6 +98,14 @@ export function createCapturingL2Llm(calls: Array<{
           confidence: 0.82
         }) as unknown as T;
       }
+      if (options.operation === "decision.repair.v1") {
+        return {
+          preference: "Inspect the failing test output before retrying.",
+          anti_pattern: "Do not rerun the whole suite after a focused pytest failure.",
+          severity: "warn",
+          confidence: 0.8
+        } as unknown as T;
+      }
       if (options.operation === "failure.experience.sink.v5") {
         const payload = JSON.parse(messages.find((message) => message.role === "user")?.content ?? "{}") as {
           evidence_trace_ids?: string[];

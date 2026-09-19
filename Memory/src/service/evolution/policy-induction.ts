@@ -30,12 +30,21 @@ import {
 import { mergeCentroid } from "../../algorithm/trace-direct-skill.js";
 import type { MemmyConfig } from "../../config/index.js";
 import type { LlmClient } from "../../model/types.js";
-import type { EvolutionJobRecord, L2ClusterRecord, RawTurnRecord } from "../../storage/repositories.js";
+import type {
+  DecisionRepairRecord,
+  EpisodeRecord,
+  EvolutionJobRecord,
+  FeedbackRecord,
+  L2ClusterRecord,
+  RawTurnRecord
+} from "../../storage/repositories.js";
 import { kindFromMemory } from "../../storage/repositories.js";
 import type { MemoryRow } from "../../types.js";
 import { isRecord } from "../../utils/json.js";
 import { newId } from "../../utils/id.js";
+import { clip } from "../../utils/text.js";
 import type { EnqueueJobInput } from "../worker/job-handlers.js";
+import { synthesizeFailureExperienceSink } from "../feedback/feedback-experience.js";
 import { isInternalInfoEligibleForPositiveL2 } from "./span-pipeline.js";
 import { logEvolutionDecision } from "./evolution-logging.js";
 
@@ -94,6 +103,10 @@ type ReposPort = {
     listL2ClustersByUser(userId: string, limit?: number): L2ClusterRecord[];
     listL2ClusterMembers(clusterId: string): Array<{ l1MemoryId: string }>;
     getRawTurn(id: string): RawTurnRecord | undefined;
+    getEpisode(id: string): EpisodeRecord | undefined;
+    listRawTurnsByEpisode(episodeId: string): RawTurnRecord[];
+    getDecisionRepair(id: string): DecisionRepairRecord | undefined;
+    getFeedback(id: string): FeedbackRecord | undefined;
     upsertL2ClusterMember(member: {
       clusterId: string;
       l1MemoryId: string;
@@ -218,7 +231,7 @@ export class PolicyInductionEngine {
       const cluster = await this.assignPositiveL2Cluster(memory, at);
       this.deps.repos.runtime.deletePendingCandidatePoolForSource(trace.id);
       if (!cluster) continue;
-      if (this.isTraceEligibleForL2(trace)) {
+      if (this.isTraceEligibleForL2(trace) || this.isTraceNegativeForL2(trace)) {
         this.recordCandidatePoolTrace(trace, cluster.id, at);
       }
     }
@@ -243,19 +256,14 @@ export class PolicyInductionEngine {
       const memberTraces = this.clusterMemberTraces(cluster.id, source.userId);
       const positiveTraces = memberTraces.filter((trace) => this.isTraceEligibleForL2(trace));
       const negativeTraces = memberTraces.filter((trace) => this.isTraceNegativeForL2(trace));
-      if (positiveTraces.length === 0) {
-        this.bindKnownFailurePolicies(cluster, memberTraces.map((trace) => trace.id), at);
-        logEvolutionDecision(job, "l2_induction", "gate_not_met", {
-          sourceMemoryId: source.id,
-          reason: "no_positive_anchor",
-          evidenceCount: memberTraces.length
-        });
+      const inductionTraces = positiveTraces.length > 0 ? positiveTraces : negativeTraces;
+      if (inductionTraces.length === 0) {
         continue;
       }
 
-      const signature = signatureFromTrace(positiveTraces[0] ?? sourceTrace);
+      const signature = signatureFromTrace(inductionTraces[0] ?? sourceTrace);
       const distinctEpisodeCount = uniq(
-        positiveTraces
+        inductionTraces
           .map((trace) => trace.episodeId)
           .filter((id): id is string => Boolean(id))
       ).length;
@@ -271,11 +279,15 @@ export class PolicyInductionEngine {
 
       const processed = new Set(cluster.processedL1Ids ?? []);
       const newTraces = memberTraces.filter((trace) => !processed.has(trace.id));
-      const matchingPolicy = this.findExistingPositivePolicyForL2Bucket(clusterKey);
-      const failurePolicies = this.findFailurePoliciesForCluster(cluster, memberTraces.map((trace) => trace.id));
+      const matchingPolicy = this.findExistingPolicyForL2Bucket(clusterKey);
+      const orphanFailurePolicies = this.findFailurePoliciesForCluster(
+        cluster,
+        memberTraces.map((trace) => trace.id)
+      ).filter((policy) => policy.id !== matchingPolicy?.id);
       const branch = decideL2EvolveBranch({
         hasPolicy: Boolean(matchingPolicy),
         positiveCount: positiveTraces.length,
+        negativeCount: negativeTraces.length,
         newPositiveCount: newTraces.filter((trace) => this.isTraceEligibleForL2(trace)).length,
         newNegativeCount: newTraces.filter((trace) => this.isTraceNegativeForL2(trace)).length
       });
@@ -285,11 +297,28 @@ export class PolicyInductionEngine {
         continue;
       }
 
+      if (positiveTraces.length === 0) {
+        await this.induceFailureClusterPolicy({
+          job,
+          source,
+          sourceTrace,
+          clusterKey,
+          signature,
+          memberTraces,
+          negativeTraces,
+          matchingPolicy,
+          branch,
+          bucketTraceIds,
+          at
+        });
+        continue;
+      }
+
       if (branch.action === "link_only" && matchingPolicy) {
         this.linkClusterMembers(source.userId, matchingPolicy.id, memberTraces, at);
         this.markCandidatePoolPromoted(source.userId, clusterKey, bucketTraceIds, matchingPolicy.id, at);
         this.recomputePolicyStats(matchingPolicy.id, at, sourceTrace.episodeId);
-        this.archiveFailurePolicies(failurePolicies, matchingPolicy.id, at);
+        this.archiveFailurePolicies(orphanFailurePolicies, matchingPolicy.id, at);
         this.clearClusterNegativeL2(clusterKey, at);
         continue;
       }
@@ -312,8 +341,8 @@ export class PolicyInductionEngine {
               lessonKind: matchingPolicy.lessonKind
             }
           : undefined,
-        existingFailurePolicies: !matchingPolicy && failurePolicies.length > 0
-          ? failurePolicies.map((policy) => ({
+        existingFailurePolicies: !matchingPolicy && orphanFailurePolicies.length > 0
+          ? orphanFailurePolicies.map((policy) => ({
               title: policy.title,
               trigger: policy.trigger,
               procedure: policy.procedure,
@@ -392,13 +421,16 @@ export class PolicyInductionEngine {
         key: policyKey,
         lessonKind
       };
+      const repairs = this.collectClusterRepairs(memberTraces);
       const l2 = this.buildClusterPolicyMemory({
         source,
         draft,
         signature,
         clusterKey,
         memberTraces,
-        at
+        at,
+        existingPolicy: matchingPolicy ?? existingPolicy,
+        repairs
       });
 
       const upsert = this.deps.upsertEvolutionMemory(l2);
@@ -406,7 +438,7 @@ export class PolicyInductionEngine {
       this.markCandidatePoolPromoted(source.userId, clusterKey, bucketTraceIds, upsert.memory.id, at);
       this.bindClusterToPolicy(clusterKey, upsert.memory.id, at);
       this.markClusterProcessed(clusterKey, memberTraces.map((trace) => trace.id), at);
-      this.archiveFailurePolicies(failurePolicies, upsert.memory.id, at);
+      this.archiveFailurePolicies(orphanFailurePolicies, upsert.memory.id, at);
       this.clearClusterNegativeL2(clusterKey, at);
 
       this.deps.enqueueChange({
@@ -636,6 +668,246 @@ export class PolicyInductionEngine {
     }
   }
 
+  private async induceFailureClusterPolicy(input: {
+    job: EvolutionJobRecord;
+    source: MemoryRow;
+    sourceTrace: TraceMeta;
+    clusterKey: string;
+    signature: string;
+    memberTraces: TraceMeta[];
+    negativeTraces: TraceMeta[];
+    matchingPolicy: PolicyMeta | null;
+    branch: ReturnType<typeof decideL2EvolveBranch>;
+    bucketTraceIds: string[];
+    at: string;
+  }): Promise<void> {
+    const {
+      job,
+      source,
+      sourceTrace,
+      clusterKey,
+      signature,
+      memberTraces,
+      negativeTraces,
+      matchingPolicy,
+      branch,
+      bucketTraceIds,
+      at
+    } = input;
+    const repairs = this.collectClusterRepairs(memberTraces);
+
+    if (branch.action === "link_only" && matchingPolicy) {
+      this.linkClusterMembers(source.userId, matchingPolicy.id, memberTraces, at);
+      this.markCandidatePoolPromoted(source.userId, clusterKey, bucketTraceIds, matchingPolicy.id, at);
+      this.bindClusterToPolicy(clusterKey, matchingPolicy.id, at);
+      this.markClusterProcessed(clusterKey, memberTraces.map((trace) => trace.id), at);
+      this.mergeRepairsOntoPolicy(matchingPolicy, repairs, at);
+      return;
+    }
+
+    const sinkEpisodeId = [...negativeTraces].reverse().find((trace) => trace.episodeId)?.episodeId;
+    const episode = sinkEpisodeId ? this.deps.repos.runtime.getEpisode(sinkEpisodeId) : undefined;
+    if (!episode) {
+      logEvolutionDecision(job, "l2_induction", "gate_not_met", {
+        sourceMemoryId: source.id,
+        reason: "no_failure_episode",
+        evidenceCount: memberTraces.length
+      });
+      return;
+    }
+
+    const rawTurns = this.deps.repos.runtime.listRawTurnsByEpisode(episode.id);
+    const feedbackIds = uniq([
+      ...episode.feedbackIds,
+      ...memberTraces
+        .map((trace) => stringField(trace.memory.properties.internal_info.source_feedback_id))
+        .filter(Boolean)
+    ]);
+    const feedbacks = feedbackIds
+      .map((id) => this.deps.repos.runtime.getFeedback(id))
+      .filter((item): item is FeedbackRecord => Boolean(item));
+    const feedbackText = [
+      ...feedbacks.map((item) => item.rationale),
+      ...repairs.map((repair) => [repair.issue, repair.preference, repair.antiPattern].filter(Boolean).join("\n")),
+      typeof episode.rewardDetail.reason === "string" ? episode.rewardDetail.reason : ""
+    ].filter(Boolean).join("\n");
+    const episodeContext = rawTurns
+      .map((turn, index) => [
+        `TURN ${index + 1}`,
+        turn.userText ? `User: ${clip(turn.userText, 700)}` : "",
+        turn.assistantText ? `Agent: ${clip(turn.assistantText, 900)}` : ""
+      ].filter(Boolean).join("\n"))
+      .join("\n\n");
+    const sink = await synthesizeFailureExperienceSink({
+      feedbackText,
+      userRequest: rawTurns.find((turn) => Boolean(turn.userText?.trim()))?.userText?.trim() ?? "",
+      agentResponse: rawTurns.at(-1)?.assistantText?.trim() ?? "",
+      episodeContext,
+      allowedTraceIds: memberTraces.map((trace) => trace.id)
+    }, { llm: this.deps.skillLlm });
+    if (!sink || !isActionableFailureSink(sink)) {
+      logEvolutionDecision(job, "l2_induction", "gate_not_met", {
+        sourceMemoryId: source.id,
+        reason: sink ? "failure_sink_not_actionable" : "failure_sink_missing",
+        evidenceCount: memberTraces.length
+      });
+      return;
+    }
+
+    const policyKey = l2PolicyKeyForCluster(clusterKey);
+    const sourceEpisodeIds = uniq([
+      ...(matchingPolicy?.sourceEpisodeIds ?? []),
+      ...memberTraces.map((trace) => trace.episodeId).filter((id): id is string => Boolean(id))
+    ]);
+    const sourceTraceIds = uniq([
+      ...(matchingPolicy?.sourceTraceIds ?? []),
+      ...sink.supportTraceIds,
+      ...memberTraces.map((trace) => trace.id)
+    ]);
+    const draft = {
+      key: policyKey,
+      title: sink.title,
+      trigger: sink.trigger,
+      procedure: sink.procedure,
+      verification: sink.verification,
+      boundary: sink.boundary,
+      support: Math.max(1, sourceEpisodeIds.length),
+      gain: matchingPolicy?.gain ?? 0,
+      rawGain: 0,
+      confidence: sink.confidence,
+      status: matchingPolicy?.status === "active" ? "active" as const : "candidate" as const,
+      sourceEpisodeIds,
+      sourceTraceIds,
+      vec: matchingPolicy?.vec ?? null,
+      tags: uniq([...(matchingPolicy?.memory.tags ?? []), "policy", "avoidance", "failure"]),
+      body: renderFailureClusterBody({
+        title: sink.title,
+        trigger: sink.trigger,
+        antiPattern: sink.avoid.join("\n"),
+        procedure: sink.procedure,
+        verification: sink.verification,
+        boundary: sink.boundary,
+        support: Math.max(1, sourceEpisodeIds.length),
+        confidence: sink.confidence
+      }),
+      lessonKind: matchingPolicy?.lessonKind
+        ? mergeL2LessonKind(matchingPolicy.lessonKind, "error_correction")
+        : "error_correction"
+    } satisfies PolicyDraft;
+
+    const l2 = this.buildClusterPolicyMemory({
+      source,
+      draft,
+      signature,
+      clusterKey,
+      memberTraces,
+      at,
+      existingPolicy: matchingPolicy,
+      repairs,
+      experienceType: sink.experienceType,
+      skillEligible: false,
+      decisionGuidance: {
+        preference: sink.prefer,
+        antiPattern: sink.avoid
+      },
+      sourceRepairIds: repairs.map((repair) => repair.id),
+      sourceFeedbackIds: feedbacks.map((item) => item.id),
+      evidenceStrength: Math.max(
+        0,
+        ...feedbacks.map((item) => item.magnitude),
+        typeof episode.rTask === "number" ? Math.abs(episode.rTask) : 0
+      )
+    });
+    const upsert = this.deps.upsertEvolutionMemory(l2);
+    this.linkClusterMembers(source.userId, upsert.memory.id, memberTraces, at);
+    this.markCandidatePoolPromoted(source.userId, clusterKey, bucketTraceIds, upsert.memory.id, at);
+    this.bindClusterToPolicy(clusterKey, upsert.memory.id, at);
+    this.markClusterProcessed(clusterKey, memberTraces.map((trace) => trace.id), at);
+    this.deps.enqueueChange({
+      memoryId: upsert.memory.id,
+      namespaceId: this.deps.namespaceIdFromMemory(upsert.memory),
+      kind: kindFromMemory(upsert.memory),
+      op: upsert.created ? "created" : "updated",
+      entityId: upsert.memory.id,
+      userId: source.userId,
+      changeType: upsert.created ? "create" : "update",
+      before: upsert.previous,
+      after: upsert.memory,
+      source: "worker.l2_induction.v7",
+      createdAt: at
+    });
+    if (this.deps.config.algorithm.capture.embedAfterCapture) {
+      this.deps.enqueueJob({
+        jobType: "embedding",
+        userId: source.userId,
+        sessionId: source.sessionId,
+        episodeId: sourceTrace.episodeId,
+        targetMemoryId: upsert.memory.id,
+        payload: { reason: "l2.upserted" },
+        createdAt: at
+      });
+    }
+  }
+
+  private collectClusterRepairs(traces: TraceMeta[]): DecisionRepairRecord[] {
+    const seen = new Set<string>();
+    const repairs: DecisionRepairRecord[] = [];
+    for (const trace of traces) {
+      if (!trace.episodeId) continue;
+      const episode = this.deps.repos.runtime.getEpisode(trace.episodeId);
+      for (const id of episode?.decisionRepairIds ?? []) {
+        if (seen.has(id)) continue;
+        const repair = this.deps.repos.runtime.getDecisionRepair(id);
+        if (!repair) continue;
+        seen.add(id);
+        repairs.push(repair);
+      }
+    }
+    return repairs;
+  }
+
+  private mergeRepairsOntoPolicy(
+    policy: PolicyMeta,
+    repairs: DecisionRepairRecord[],
+    at: string
+  ): void {
+    if (repairs.length === 0) return;
+    const next = this.buildClusterPolicyMemory({
+      source: policy.memory,
+      draft: {
+        key: policy.memory.memoryKey ?? l2PolicyKeyForCluster(""),
+        title: policy.title,
+        trigger: policy.trigger,
+        procedure: policy.procedure,
+        verification: policy.verification,
+        boundary: policy.boundary,
+        support: policy.support,
+        gain: policy.gain,
+        rawGain: policy.salience,
+        confidence: policy.confidence,
+        status: policy.status === "active" ? "active" : "candidate",
+        sourceEpisodeIds: policy.sourceEpisodeIds,
+        sourceTraceIds: policy.sourceTraceIds,
+        vec: policy.vec,
+        tags: policy.memory.tags ?? [],
+        body: policy.memory.memoryValue,
+        lessonKind: policy.lessonKind
+      },
+      signature: policy.signature,
+      clusterKey: stringField(policy.memory.properties.internal_info.l2_cluster_id),
+      memberTraces: policy.sourceTraceIds
+        .map((id) => this.deps.repos.memories.get(id))
+        .map((memory) => this.deps.traceMeta(memory))
+        .filter((trace): trace is TraceMeta => Boolean(trace)),
+      at,
+      existingPolicy: policy,
+      repairs,
+      experienceType: policy.experienceType,
+      skillEligible: policy.skillEligible
+    });
+    this.deps.upsertEvolutionMemory(next);
+  }
+
   async bindFailureL2(memory: MemoryRow, sourceTraceIds: string[], at: string): Promise<void> {
     const seen = new Set<string>();
     for (const id of sourceTraceIds) {
@@ -667,12 +939,6 @@ export class PolicyInductionEngine {
     return policyMetaFromMemory(linked);
   }
 
-  private findExistingPositivePolicyForL2Bucket(clusterKey: string): PolicyMeta | null {
-    const found = this.findExistingPolicyForL2Bucket(clusterKey);
-    if (!found || this.isFailurePolicy(found)) return null;
-    return found;
-  }
-
   private isFailurePolicy(policy: PolicyMeta): boolean {
     return policy.experienceType === "failure_avoidance"
       || policy.experienceType === "repair_instruction"
@@ -702,17 +968,6 @@ export class PolicyInductionEngine {
       }
     }
     return [...found.values()];
-  }
-
-  private bindKnownFailurePolicies(cluster: L2ClusterRecord, memberTraceIds: string[], at: string): void {
-    if (cluster.negativeL2MemoryId) return;
-    const failure = this.findFailurePoliciesForCluster(cluster, memberTraceIds)[0];
-    if (!failure) return;
-    this.deps.repos.runtime.updateL2Cluster({
-      ...cluster,
-      negativeL2MemoryId: failure.id,
-      updatedAt: at
-    });
   }
 
   private clearClusterNegativeL2(clusterId: string, at: string): void {
@@ -928,7 +1183,7 @@ export class PolicyInductionEngine {
       .list({ memoryLayer: "L1", status: "activated" }, 1000)
       .map((memory) => this.deps.traceMeta(memory))
       .filter((trace): trace is TraceMeta =>
-        Boolean(trace && this.isTraceEligibleForL2(trace))
+        Boolean(trace && (this.isTraceEligibleForL2(trace) || this.isTraceNegativeForL2(trace)))
       );
 
     const linkedTraces = allTraces.filter((trace) => linkedTraceIds.has(trace.id));
@@ -1172,18 +1427,56 @@ export class PolicyInductionEngine {
     clusterKey: string;
     memberTraces: TraceMeta[];
     at: string;
+    existingPolicy?: PolicyMeta | null;
+    repairs?: DecisionRepairRecord[];
+    experienceType?: PolicyMeta["experienceType"];
+    skillEligible?: boolean;
+    decisionGuidance?: { preference: string[]; antiPattern: string[] };
+    sourceRepairIds?: string[];
+    sourceFeedbackIds?: string[];
+    evidenceStrength?: number;
   }): MemoryRow {
     const freshnessClass = input.draft.freshnessClass
       ?? inferPolicyFreshness(`${input.draft.trigger}\n${input.draft.procedure}`);
     const revalidateAfter = freshnessClass === "dynamic"
       ? new Date(Date.parse(input.at) + (input.draft.revalidateAfterDays ?? 30) * 24 * 60 * 60 * 1000).toISOString()
       : undefined;
-    const evidencePolarity = input.memberTraces.some((trace) => this.isTraceNegativeForL2(trace))
+    const hasPositive = input.memberTraces.some((trace) => this.isTraceEligibleForL2(trace));
+    const hasNegative = input.memberTraces.some((trace) => this.isTraceNegativeForL2(trace));
+    const evidencePolarity = hasPositive && hasNegative
       ? "mixed"
-      : "positive";
+      : hasNegative
+        ? "negative"
+        : "positive";
+    const skillEligible = input.skillEligible ?? hasPositive;
+    const experienceType = input.experienceType
+      ?? (hasPositive ? "success_pattern" : "failure_avoidance");
     const sourceTraceIds = input.draft.sourceTraceIds.length > 0
       ? input.draft.sourceTraceIds
       : input.memberTraces.map((trace) => trace.id);
+    const preferences = uniq([
+      ...(input.existingPolicy?.decisionGuidance.preference ?? []),
+      ...(input.decisionGuidance?.preference ?? []),
+      ...(input.repairs ?? []).map((repair) => repair.preference).filter((item): item is string => Boolean(item?.trim()))
+    ]);
+    const antiPatterns = uniq([
+      ...(input.existingPolicy?.decisionGuidance.antiPattern ?? []),
+      ...(input.decisionGuidance?.antiPattern ?? []),
+      ...(input.draft.exclusions ?? []),
+      ...(input.repairs ?? []).map((repair) => repair.antiPattern).filter((item): item is string => Boolean(item?.trim()))
+    ]);
+    const sourceRepairIds = uniq([
+      ...(input.sourceRepairIds ?? []),
+      ...stringArray(input.existingPolicy?.memory.properties.internal_info.source_repair_ids),
+      ...(input.repairs ?? []).map((repair) => repair.id)
+    ]);
+    const sourceFeedbackIds = uniq([
+      ...(input.sourceFeedbackIds ?? []),
+      ...(input.existingPolicy?.sourceFeedbackIds ?? [])
+    ]);
+    const decisionGuidance = preferences.length > 0 || antiPatterns.length > 0
+      ? { preference: preferences, anti_pattern: antiPatterns }
+      : undefined;
     return this.deps.buildMemory({
       userId: input.source.userId,
       conversationId: input.source.conversationId,
@@ -1218,6 +1511,8 @@ export class PolicyInductionEngine {
         l2_cluster_id: input.clusterKey,
         source_memory_ids: sourceTraceIds,
         source_l1_memory_ids: sourceTraceIds,
+        source_repair_ids: sourceRepairIds,
+        source_feedback_ids: sourceFeedbackIds,
         title: input.draft.title,
         trigger: input.draft.trigger,
         procedure: input.draft.procedure,
@@ -1235,6 +1530,7 @@ export class PolicyInductionEngine {
         status: input.draft.status,
         source_episode_ids: input.draft.sourceEpisodeIds,
         source_trace_ids: sourceTraceIds,
+        ...(decisionGuidance ? { decision_guidance: decisionGuidance } : {}),
         policy: {
           title: input.draft.title,
           trigger: input.draft.trigger,
@@ -1251,13 +1547,17 @@ export class PolicyInductionEngine {
           last_verified_at: input.at,
           ...(revalidateAfter ? { revalidate_after: revalidateAfter } : {}),
           status: input.draft.status,
-          experience_type: "success_pattern",
-          lesson_kind: input.draft.lessonKind ?? "path_compression",
+          experience_type: experienceType,
+          lesson_kind: input.draft.lessonKind ?? (hasPositive ? "path_compression" : "error_correction"),
           evidence_polarity: evidencePolarity,
-          skill_eligible: true,
+          skill_eligible: skillEligible,
+          is_caveat: !skillEligible,
+          ...(input.evidenceStrength !== undefined ? { evidence_strength: input.evidenceStrength } : {}),
           signature: input.signature,
           source_episode_ids: input.draft.sourceEpisodeIds,
           source_trace_ids: sourceTraceIds,
+          source_feedback_ids: sourceFeedbackIds,
+          ...(decisionGuidance ? { decision_guidance: decisionGuidance } : {}),
           vec: input.draft.vec
         }
       },
@@ -1379,6 +1679,43 @@ export function updatePolicyStats(memory: MemoryRow, input: {
     },
     updatedAt: input.updatedAt
   };
+}
+
+function renderFailureClusterBody(input: {
+  title: string;
+  trigger: string;
+  antiPattern: string;
+  procedure: string;
+  verification: string;
+  boundary: string;
+  support: number;
+  confidence: number;
+}): string {
+  return [
+    input.title,
+    `Trigger: ${input.trigger}`,
+    `Avoid: ${input.antiPattern}`,
+    `Safer behavior: ${input.procedure}`,
+    `Verification: ${input.verification}`,
+    `Boundary: ${input.boundary}`,
+    `Support: ${input.support}`,
+    "Gain: 0",
+    "Raw gain: 0",
+    `Confidence: ${input.confidence}`
+  ].join("\n");
+}
+
+function isActionableFailureSink(sink: {
+  trigger: string;
+  prefer: string[];
+  avoid: string[];
+  confidence: number;
+}): boolean {
+  if (!sink.trigger.trim() || sink.prefer.length === 0 || sink.avoid.length === 0) return false;
+  if (sink.confidence < 0.6) return false;
+  const normalize = (value: string) => value.toLowerCase().replace(/\s+/g, " ").trim();
+  if (normalize(sink.avoid.join("\n")) === normalize(sink.prefer.join("\n"))) return false;
+  return true;
 }
 
 function renderPolicyBody(draft: Pick<PolicyDraft, "title" | "trigger" | "procedure" | "verification" | "boundary" | "support" | "gain" | "rawGain" | "confidence" | "sourceTraceIds">): string {

@@ -5,6 +5,7 @@ import {
   MemoryDb,
   type LlmClient
 } from "../../../src/index.js";
+import { setL2ClusterFieldsForTest } from "../../fixtures/evolution-fixture.js";
 import {
   createCapturingEmbedder,
   createMemoryServiceFixture
@@ -41,6 +42,15 @@ function createFeedbackRefinerLlm(calls: Array<{
       options: { operation: string; thinkingMode?: "inherit" | "enabled" | "disabled" }
     ): Promise<T> {
       calls.push({ messages, options });
+      if (options.operation === "capture.summarize") {
+        return {
+          l1: { summary: "completed task turn" },
+          turn_role: "local_subproblem",
+          task_summary: "completed task turn",
+          intent: "local step — completed task turn",
+          user: null
+        } as unknown as T;
+      }
       if (options.operation === "failure.experience.sink.v5") {
         const payload = JSON.parse(messages.find((message) => message.role === "user")?.content ?? "{}") as {
           evidence_trace_ids?: string[];
@@ -170,10 +180,9 @@ describe("MemoryService / feedback / experience", () => {
        WHERE user_id = 'user-feedback-experience'
          AND memory_layer = 'L2'`
     ).all() as Array<{ id: string; properties_json: string }>;
-    expect(policies).toHaveLength(2);
-    const positivePolicy = (JSON.parse(
-      policies.find((row) => row.id === created[0]!.id)!.properties_json
-    ) as {
+    expect(policies).toHaveLength(1);
+    expect(policies[0]!.id).toBe(created[0]!.id);
+    const positivePolicy = (JSON.parse(policies[0]!.properties_json) as {
       internal_info: {
         policy: {
           support?: number;
@@ -189,27 +198,13 @@ describe("MemoryService / feedback / experience", () => {
     expect(positivePolicy.evidence_polarity).toBe("positive");
     expect(positivePolicy.skill_eligible).toBe(true);
     expect(positivePolicy.source_feedback_ids).toEqual([ok.feedbackId]);
-    const negativePolicy = (JSON.parse(
-      policies.find((row) => row.id !== created[0]!.id)!.properties_json
-    ) as {
-      internal_info: {
-        policy: {
-          status?: string;
-          experience_type?: string;
-          evidence_polarity?: string;
-          skill_eligible?: boolean;
-          source_feedback_ids?: string[];
-          decision_guidance?: { preference?: string[]; anti_pattern?: string[] };
-        };
-      };
-    }).internal_info.policy;
-    expect(negativePolicy.status).toBe("candidate");
-    expect(negativePolicy.experience_type).toBe("repair_instruction");
-    expect(negativePolicy.evidence_polarity).toBe("negative");
-    expect(negativePolicy.skill_eligible).toBe(false);
-    expect(negativePolicy.source_feedback_ids).toEqual([avoid.feedbackId]);
-    expect(negativePolicy.decision_guidance?.anti_pattern?.join("\n")).toContain("filename");
-    expect(negativePolicy.decision_guidance?.preference?.join("\n")).toContain("issuer and CUSIP");
+    const isolatedAvoidCount = db.db.prepare(
+      `SELECT COUNT(*) AS count
+       FROM evolution_jobs
+       WHERE user_id = 'user-feedback-experience'
+         AND job_type = 'negative_experience'`
+    ).get() as { count: number };
+    expect(isolatedAvoidCount.count).toBe(0);
     db.close();
   });
 
@@ -258,6 +253,13 @@ describe("MemoryService / feedback / experience", () => {
       episodeId: "episode-feedback-refiner",
       query: "Parse a SEC 13F filing and extract issuer CUSIP holdings.",
       answer: "I parsed the filename as the issuer name."
+    });
+    setL2ClusterFieldsForTest(db, complete.l1MemoryId, {
+      intent: "解析 SEC 13F 并提取 issuer CUSIP",
+      taskSummary: "解析 13F",
+      intentVec: [1, 0],
+      taskVec: [0, 1],
+      value: -1
     });
 
     const feedbackResponse = await service.feedback({

@@ -3,6 +3,7 @@ import {
   DEFAULT_MEMMY_CONFIG,
   type LlmClient
 } from "../../../src/index.js";
+import { setL2ClusterFieldsForTest } from "../../fixtures/evolution-fixture.js";
 import {
   createCapturingEmbedder,
   createMemoryServiceFixture
@@ -51,7 +52,18 @@ function createCountingLlm(
             summary: "completed task turn",
             evidence: [{ quote: userQuote, role: "user", kind: "task_outcome" }]
           },
+          turn_role: "local_subproblem",
+          task_summary: "completed task turn",
+          intent: "local step — completed task turn",
           user: null
+        } as unknown as T;
+      }
+      if (options.operation === "decision.repair.v1") {
+        return {
+          preference: "Verify the secure endpoint before reporting completion.",
+          anti_pattern: "Do not report TLS completion while the requested port or verification remains wrong.",
+          severity: "warn",
+          confidence: 0.8
         } as unknown as T;
       }
       if (options.operation === "failure.experience.sink.v5") {
@@ -141,6 +153,13 @@ describe("MemoryService / evolution / negative experience", () => {
       query: "Configure TLS and verify the service port.",
       answer: "I configured port 80 and skipped TLS verification."
     });
+    setL2ClusterFieldsForTest(db, turn.l1MemoryId, {
+      intent: "配置 TLS 并校验端口",
+      taskSummary: "配置 TLS",
+      intentVec: [1, 0],
+      taskVec: [0, 1],
+      value: -1
+    });
 
     const feedback = await service.feedback({
       sessionId: session.sessionId,
@@ -169,16 +188,16 @@ describe("MemoryService / evolution / negative experience", () => {
     await service.runWorkerOnce(50);
     expect(service.panelJobs({ namespace, status: "queued" }).items).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ jobType: "negative_experience" })
+        expect.objectContaining({ jobType: "l2_induction" })
       ])
     );
-    const negativeJobCount = db.db.prepare(
+    const isolatedAvoidCount = db.db.prepare(
       `SELECT COUNT(*) AS count
        FROM evolution_jobs
        WHERE job_type = 'negative_experience'
          AND user_id = ?`
     ).get(namespace.userId) as { count: number };
-    expect(negativeJobCount.count).toBe(1);
+    expect(isolatedAvoidCount.count).toBe(0);
 
     await service.runWorkerOnce(50);
     const policies = service.panelItems({ namespace, layer: "L2" }).items;
@@ -290,6 +309,13 @@ describe("MemoryService / evolution / negative experience", () => {
       query: "Configure TLS on the correct port and verify it.",
       answer: "Configured port 80 without verification."
     });
+    setL2ClusterFieldsForTest(db, turn.l1MemoryId, {
+      intent: "配置 TLS 并校验端口",
+      taskSummary: "配置 TLS",
+      intentVec: [1, 0],
+      taskVec: [0, 1],
+      value: -1
+    });
     await service.feedback({
       sessionId: session.sessionId,
       episodeId: turn.episodeId,
@@ -310,7 +336,7 @@ describe("MemoryService / evolution / negative experience", () => {
     await service.runWorkerOnce(50);
     expect(service.panelJobs({ namespace, status: "queued" }).items).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ jobType: "negative_experience" })
+        expect.objectContaining({ jobType: "l2_induction" })
       ])
     );
     await service.runWorkerOnce(50);
@@ -369,6 +395,13 @@ describe("MemoryService / evolution / negative experience", () => {
         query: "Configure TLS and verify the service port.",
         answer: "I configured port 80 and skipped TLS verification."
       });
+      setL2ClusterFieldsForTest(db, turn.l1MemoryId, {
+        intent: "配置 TLS 并校验端口",
+        taskSummary: "配置 TLS",
+        intentVec: [1, 0],
+        taskVec: [0, 1],
+        value: -1
+      });
       await service.feedback({
         sessionId: session.sessionId,
         episodeId: turn.episodeId,
@@ -420,6 +453,13 @@ describe("MemoryService / evolution / negative experience", () => {
       query: "Configure TLS and verify the service port.",
       answer: "I configured port 80 and skipped TLS verification."
     });
+    setL2ClusterFieldsForTest(db, otherTurn.l1MemoryId, {
+      intent: "配置 TLS 并校验端口",
+      taskSummary: "配置 TLS",
+      intentVec: [1, 0],
+      taskVec: [0, 1],
+      value: -1
+    });
     await service.feedback({
       sessionId: otherSession.sessionId,
       episodeId: otherTurn.episodeId,
@@ -434,24 +474,21 @@ describe("MemoryService / evolution / negative experience", () => {
     await service.runWorkerOnce(50);
     await service.runWorkerOnce(50);
     await service.runWorkerOnce(50);
-    const otherRecall = await service.search({
-      sessionId: otherSession.sessionId,
-      query: "TLS port verification",
-      layers: ["L2"]
-    });
-    const otherPolicy = otherRecall.hits.find((hit) => hit.memoryLayer === "L2");
-    expect(otherPolicy?.id).toBe(policyIds[0]);
-    expect(service.getMemory(otherPolicy!.id, { namespace: otherNamespace }).metadata).toMatchObject({
-      properties: {
-        internal_info: {
-          policy: {
-            support: 3,
-            source_episode_ids: [
-              "negative-support-episode-one",
-              "negative-support-episode-two",
-              "negative-support-other-episode"
-            ]
-          }
+    const otherRow = db.db.prepare(
+      `SELECT id, properties_json
+       FROM memories
+       WHERE user_id = ? AND memory_layer = 'L2'
+       LIMIT 1`
+    ).get(otherNamespace.userId) as { id: string; properties_json: string } | undefined;
+    expect(otherRow?.id).toBeTruthy();
+    expect(otherRow?.id).not.toBe(policyIds[0]);
+    expect(JSON.parse(otherRow!.properties_json)).toMatchObject({
+      internal_info: {
+        policy: {
+          support: 1,
+          source_episode_ids: [
+            "negative-support-other-episode"
+          ]
         }
       }
     });
@@ -548,6 +585,13 @@ describe("MemoryService / evolution / negative experience", () => {
         query: "Verify TLS certificate rotation.",
         answer: "Skipped TLS certificate verification."
       });
+      setL2ClusterFieldsForTest(db, turn.l1MemoryId, {
+        intent: "校验 TLS 证书轮换",
+        taskSummary: "TLS 证书轮换",
+        intentVec: [1, 0],
+        taskVec: [0, 1],
+        value: -1
+      });
       await service.feedback({
         sessionId: session.sessionId,
         episodeId: turn.episodeId,
@@ -568,6 +612,7 @@ describe("MemoryService / evolution / negative experience", () => {
       `SELECT id
        FROM memories
        WHERE memory_layer = 'L2'
+         AND user_id = 'negative-target-user'
          AND deleted_at IS NULL
        LIMIT 1`
     ).get() as { id: string } | undefined;
@@ -582,7 +627,7 @@ describe("MemoryService / evolution / negative experience", () => {
       sessionId: reader.sessionId,
       query: "TLS port verification",
       layers: ["L2"],
-      limit: 5
+      limit: 25
     });
     expect(result.hits.some((hit) => hit.id === crossUserPolicy?.id)).toBe(true);
     db.close();

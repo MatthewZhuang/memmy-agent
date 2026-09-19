@@ -93,8 +93,9 @@ describe("decideL2ClusterJoin", () => {
 });
 
 describe("L2 lesson kind and evolve branch", () => {
-  it("does not infer a lesson without a positive member", () => {
-    expect(inferL2LessonKind(0, 2)).toBeNull();
+  it("infers error_correction from a pure-negative cluster", () => {
+    expect(inferL2LessonKind(0, 0)).toBeNull();
+    expect(inferL2LessonKind(0, 2)).toBe("error_correction");
     expect(inferL2LessonKind(1, 0)).toBe("path_compression");
     expect(inferL2LessonKind(1, 1)).toBe("both");
   });
@@ -105,13 +106,21 @@ describe("L2 lesson kind and evolve branch", () => {
     expect(resolveL2LessonKind("both", "path_compression")).toBe("both");
   });
 
-  it("requires a positive member before create or evolve", () => {
+  it("creates or evolves from negative members without a positive anchor", () => {
     expect(decideL2EvolveBranch({
       hasPolicy: false,
       positiveCount: 0,
+      negativeCount: 2,
       newPositiveCount: 0,
       newNegativeCount: 2
-    })).toEqual({ action: "skip_no_positive" });
+    })).toEqual({ action: "create" });
+    expect(decideL2EvolveBranch({
+      hasPolicy: true,
+      positiveCount: 0,
+      negativeCount: 2,
+      newPositiveCount: 0,
+      newNegativeCount: 1
+    })).toEqual({ action: "evolve", incrementKind: "error_correction" });
     expect(decideL2EvolveBranch({
       hasPolicy: false,
       positiveCount: 1,
@@ -213,12 +222,21 @@ describe("L2 lesson kind and evolve branch", () => {
       negativeCount: 1
     })).toEqual({ ok: false, reason: "admission-declined:missing-error-correction" });
     expect(admitL2PolicyDraft({
-      title: "Use focused pytest",
-      trigger: "pytest migration failed",
-      procedure: "Run the focused pytest path that already passed.",
-      lessonKind: "path_compression",
+      title: "Avoid full-suite retry",
+      trigger: "focused pytest failed",
+      procedure: "Inspect the failing test output, then rerun only that test.",
+      caveats: ["Do not retry the whole suite first."],
+      lessonKind: "error_correction",
       positiveCount: 0,
       negativeCount: 1
-    })).toEqual({ ok: false, reason: "admission-declined:no-positive-anchor" });
+    }).ok).toBe(true);
+    expect(admitL2PolicyDraft({
+      title: "Avoid full-suite retry",
+      trigger: "focused pytest failed",
+      procedure: "",
+      lessonKind: "error_correction",
+      positiveCount: 0,
+      negativeCount: 1
+    })).toEqual({ ok: false, reason: "admission-declined:missing-error-correction" });
   });
 });

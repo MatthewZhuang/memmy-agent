@@ -241,7 +241,7 @@ describe("positive L2 clustering", () => {
     db.close();
   });
 
-  it("does not induce a positive L2 from only negative local_subproblem turns", async () => {
+  it("writes a cluster failure L2 from only negative local_subproblem turns", async () => {
     const { db, service } = clusterService();
     const session = service.openSession({
       namespace: { source: "codex", profileId: "jiang", userId: "cluster-pure-neg" },
@@ -275,6 +275,33 @@ describe("positive L2 clustering", () => {
          AND instr(properties_json, '"experience_type":"success_pattern"') > 0`
     ).get("cluster-pure-neg") as { count: number };
     expect(positiveL2.count).toBe(0);
+    const row = db.db.prepare(
+      `SELECT id, memory_key, properties_json
+       FROM memories
+       WHERE user_id = ? AND memory_layer = 'L2'
+       LIMIT 1`
+    ).get("cluster-pure-neg") as { id: string; memory_key: string; properties_json: string } | undefined;
+    expect(row?.memory_key.startsWith("policy:")).toBe(true);
+    expect(row?.memory_key.startsWith("policy:avoid:")).toBe(false);
+    const properties = JSON.parse(row!.properties_json) as {
+      internal_info?: {
+        source_repair_ids?: string[];
+        policy?: {
+          experience_type?: string;
+          lesson_kind?: string;
+          skill_eligible?: boolean;
+          evidence_polarity?: string;
+        };
+      };
+    };
+    expect(properties.internal_info?.policy).toMatchObject({
+      experience_type: "failure_avoidance",
+      lesson_kind: "error_correction",
+      skill_eligible: false,
+      evidence_polarity: "negative"
+    });
+    expect(properties.internal_info?.source_repair_ids?.length).toBeGreaterThan(0);
+    expect(listClusters(db, "cluster-pure-neg")[0]?.l2_memory_id).toBe(row!.id);
     db.close();
   });
 
@@ -381,7 +408,7 @@ describe("positive L2 clustering", () => {
     db.close();
   });
 
-  it("merges a later positive L1 into a new L2 and archives the old failure L2", async () => {
+  it("upgrades the same cluster L2 when a later positive L1 arrives", async () => {
     const { db, service, calls } = clusterService();
     const session = service.openSession({
       namespace: { source: "codex", profileId: "jiang", userId: "cluster-neg-upgrade" },
@@ -409,14 +436,14 @@ describe("positive L2 clustering", () => {
     await runWorkerRounds(service, 8, 50);
 
     const afterNeg = db.db.prepare(
-      `SELECT
-         SUM(CASE WHEN instr(properties_json, '"experience_type":"success_pattern"') > 0 THEN 1 ELSE 0 END) AS positive_count,
-         SUM(CASE WHEN instr(properties_json, '"evidence_polarity":"negative"') > 0 THEN 1 ELSE 0 END) AS negative_count
+      `SELECT id, memory_key, properties_json
        FROM memories
        WHERE user_id = ? AND memory_layer = 'L2'`
-    ).get("cluster-neg-upgrade") as { positive_count: number; negative_count: number };
-    expect(afterNeg.positive_count).toBe(0);
-    expect(afterNeg.negative_count).toBeGreaterThan(0);
+    ).all("cluster-neg-upgrade") as Array<{ id: string; memory_key: string; properties_json: string }>;
+    expect(afterNeg).toHaveLength(1);
+    expect(afterNeg[0]!.memory_key.startsWith("policy:avoid:")).toBe(false);
+    expect(afterNeg[0]!.properties_json).toContain('"evidence_polarity":"negative"');
+    const failurePolicyId = afterNeg[0]!.id;
 
     await captureEligibleTurns(service, db, "cluster-neg-upgrade", [{
       suffix: "ok",
@@ -431,16 +458,18 @@ describe("positive L2 clustering", () => {
        FROM memories
        WHERE user_id = ? AND memory_layer = 'L2'`
     ).all("cluster-neg-upgrade") as Array<{ id: string; status: string; properties_json: string }>;
-    const positives = layers.filter((row) => row.properties_json.includes('"experience_type":"success_pattern"'));
-    const negatives = layers.filter((row) => row.properties_json.includes('"evidence_polarity":"negative"'));
-    expect(positives).toHaveLength(1);
-    expect(negatives.length).toBeGreaterThan(0);
-    expect(negatives.every((row) => row.status === "archived")).toBe(true);
-    expect(negatives.some((row) => row.properties_json.includes(`"superseded_by":"${positives[0]!.id}"`))).toBe(true);
+    expect(layers).toHaveLength(1);
+    expect(layers[0]!.id).toBe(failurePolicyId);
+    const properties = JSON.parse(layers[0]!.properties_json) as {
+      internal_info?: { policy?: { lesson_kind?: string; evidence_polarity?: string; skill_eligible?: boolean } };
+    };
+    expect(properties.internal_info?.policy?.lesson_kind).toBe("both");
+    expect(properties.internal_info?.policy?.evidence_polarity).toBe("mixed");
+    expect(properties.internal_info?.policy?.skill_eligible).toBe(true);
     expect(listClusters(db, "cluster-neg-upgrade")).toHaveLength(1);
     expect(calls.some((call) =>
       call.options.operation === "l2.induction.v6"
-      && call.messages.some((message) => message.content.includes("EXISTING_FAILURE_POLICY"))
+      && call.messages.some((message) => message.content.includes("EXISTING_POLICY"))
     )).toBe(true);
     expect(calls.some((call) =>
       call.options.operation === "l2.induction.v6"

@@ -166,6 +166,7 @@ export class EvolutionJobProcessor {
       decisionRepairTraceSources: deps.decisionRepairTraceSources,
       synthesizeDecisionRepairDraft: deps.synthesizeDecisionRepairDraft,
       isTraceEligibleForL2: this.policy.isTraceEligibleForL2.bind(this.policy),
+      isTraceNegativeForL2: this.policy.isTraceNegativeForL2.bind(this.policy),
       repairEvidenceValueDiff: deps.repairEvidenceValueDiff
     });
     this.negativeExperience = new NegativeExperiencePipeline({
